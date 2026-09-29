@@ -181,6 +181,71 @@ def test_bigint_nested_and_memoryview():
     assert fastsimdjson.loads(memoryview(big.encode())) == int(big)
 
 
+def test_error_position_matches_json():
+    docs = [
+        "", " ", "[", "[1,", "[1,]", "{", '{"a"}', '{"a":}', "nul", "01",
+        '"abc', "[1] x", '{"a":1,}', "\n\n  [1,",
+    ]
+    for doc in docs:
+        with pytest.raises(json.JSONDecodeError) as std:
+            json.loads(doc)
+        raw = doc.encode()
+        for arg in (doc, raw, bytearray(raw), memoryview(raw)):
+            with pytest.raises(fastsimdjson.JSONDecodeError) as got:
+                fastsimdjson.loads(arg)
+            assert got.value.pos == std.value.pos
+            assert got.value.lineno == std.value.lineno
+            assert got.value.colno == std.value.colno
+            assert got.value.msg == std.value.msg
+            assert isinstance(got.value, json.JSONDecodeError)
+
+
+def test_values_json_accepts_stay_rejected():
+    # json.loads turns these into floats. The fallback must not return them.
+    for doc in ("NaN", "Infinity", "-Infinity", "1e309", "-1e309"):
+        json.loads(doc)
+        with pytest.raises(fastsimdjson.JSONDecodeError) as got:
+            fastsimdjson.loads(doc)
+        assert got.value.pos == 0
+        with pytest.raises(fastsimdjson.JSONDecodeError) as got:
+            fastsimdjson.loads(doc.encode())
+        assert got.value.pos == 0
+
+
+def test_release():
+    assert fastsimdjson.release() is None
+    assert fastsimdjson.loads(b'{"a": 1}') == {"a": 1}
+    assert fastsimdjson.release() is None
+    assert fastsimdjson.loads("[1, 2]") == [1, 2]
+    assert fastsimdjson.release() is None
+
+
+def test_release_is_per_thread():
+    import threading
+
+    seen = []
+    errors = []
+
+    def worker(n):
+        try:
+            doc = ("[%d]" % n).encode()
+            for _ in range(30):
+                assert fastsimdjson.loads(doc) == [n]
+            assert fastsimdjson.release() is None
+            assert fastsimdjson.loads(doc) == [n]
+            seen.append(n)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert sorted(seen) == [0, 1, 2, 3]
+
+
 def test_bigint_does_not_accept_surrogates():
     big = "1" * 40
     docs = [

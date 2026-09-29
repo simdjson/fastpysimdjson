@@ -20,8 +20,20 @@ namespace {
 using simdjson::dom::parser;
 
 PyObject *JSONDecodeError = nullptr;
-parser *g_parser = nullptr;
+PyObject *json_JSONDecodeError = nullptr;
+PyObject *json_loads = nullptr;
 size_t g_page_size = 4096;
+
+// One simdjson parser per thread. The object is large once a document has
+// been parsed, so it is a pointer and release() can delete it.
+struct ThreadParser {
+  parser *ptr = nullptr;
+  ~ThreadParser() {
+    delete ptr;
+    ptr = nullptr;
+  }
+};
+thread_local ThreadParser g_thread_parser;
 
 // ---------------------------------------------------------------------------
 // Key cache: direct-mapped cache of short ASCII keys. Keys in JSON documents
@@ -396,8 +408,8 @@ struct Builder {
   }
 };
 
-// json.JSONDecodeError takes (msg, doc, pos); simdjson does not report an
-// error position, so pos is 0.
+// json.JSONDecodeError takes (msg, doc, pos). Used when json.loads cannot
+// supply a position: it accepted the text, or it raised some other exception.
 void raise_decode_error(const char *msg, PyObject *original) {
   PyObject *exc =
       PyUnicode_Check(original)
@@ -407,6 +419,73 @@ void raise_decode_error(const char *msg, PyObject *original) {
     PyErr_SetObject(JSONDecodeError, exc);
     Py_DECREF(exc);
   }
+}
+
+// simdjson reports no byte offset. Reparse with json.loads and re-raise its
+// JSONDecodeError (message, document, and position) as our subclass. Do not
+// return a successful json.loads result: json accepts NaN, Infinity, and
+// doubles that overflow, which simdjson rejects.
+PyObject *raise_error_with_position(const char *simd_msg, PyObject *original) {
+  PyObject *arg = original;
+  PyObject *bytes_copy = nullptr;
+  if (PyMemoryView_Check(original)) {
+    bytes_copy = PyBytes_FromObject(original);
+    if (bytes_copy == nullptr) {
+      PyErr_Clear();
+      raise_decode_error(simd_msg, original);
+      return nullptr;
+    }
+    arg = bytes_copy;
+  }
+  PyObject *parsed = PyObject_CallFunctionObjArgs(json_loads, arg, nullptr);
+  Py_XDECREF(bytes_copy);
+  if (parsed != nullptr) {
+    Py_DECREF(parsed);
+    raise_decode_error(simd_msg, original);
+    return nullptr;
+  }
+  if (!PyErr_ExceptionMatches(json_JSONDecodeError)) {
+    PyErr_Clear();
+    raise_decode_error(simd_msg, original);
+    return nullptr;
+  }
+  PyObject *typ = nullptr;
+  PyObject *val = nullptr;
+  PyObject *tb = nullptr;
+  PyErr_Fetch(&typ, &val, &tb);
+  PyErr_NormalizeException(&typ, &val, &tb);
+  PyObject *msg = PyObject_GetAttrString(val, "msg");
+  PyObject *doc = PyObject_GetAttrString(val, "doc");
+  PyObject *pos_obj = PyObject_GetAttrString(val, "pos");
+  Py_XDECREF(typ);
+  Py_XDECREF(tb);
+  Py_DECREF(val);
+  if (msg == nullptr || doc == nullptr || pos_obj == nullptr) {
+    PyErr_Clear();
+    Py_XDECREF(msg);
+    Py_XDECREF(doc);
+    Py_XDECREF(pos_obj);
+    raise_decode_error(simd_msg, original);
+    return nullptr;
+  }
+  Py_ssize_t pos = PyLong_AsSsize_t(pos_obj);
+  Py_DECREF(pos_obj);
+  if (pos == -1 && PyErr_Occurred()) {
+    PyErr_Clear();
+    Py_DECREF(msg);
+    Py_DECREF(doc);
+    raise_decode_error(simd_msg, original);
+    return nullptr;
+  }
+  PyObject *exc = PyObject_CallFunction(JSONDecodeError, "OOn", msg, doc, pos);
+  Py_DECREF(msg);
+  Py_DECREF(doc);
+  if (exc == nullptr) {
+    return nullptr;
+  }
+  PyErr_SetObject(JSONDecodeError, exc);
+  Py_DECREF(exc);
+  return nullptr;
 }
 
 // Documents larger than this are parsed with a parser that is then released,
@@ -422,24 +501,29 @@ bool input_needs_copy(const char *buf, size_t len) {
 }
 
 bool ensure_parser() {
-  if (g_parser != nullptr) {
+  if (g_thread_parser.ptr != nullptr) {
     return true;
   }
-  g_parser = new (std::nothrow) parser();
-  if (g_parser == nullptr) {
+  g_thread_parser.ptr = new (std::nothrow) parser();
+  if (g_thread_parser.ptr == nullptr) {
     PyErr_NoMemory();
     return false;
   }
   // Keep integers that do not fit in 64 bits on the tape as digit strings,
   // instead of failing the parse and reprocessing the document.
-  g_parser->number_as_string(true);
+  g_thread_parser.ptr->number_as_string(true);
   return true;
 }
 
+void release_parser() {
+  delete g_thread_parser.ptr;
+  g_thread_parser.ptr = nullptr;
+}
+
 void release_large_parser() {
-  if (g_parser != nullptr && g_parser->capacity() > MAX_RETAINED_CAPACITY) {
-    delete g_parser;
-    g_parser = nullptr;
+  if (g_thread_parser.ptr != nullptr &&
+      g_thread_parser.ptr->capacity() > MAX_RETAINED_CAPACITY) {
+    release_parser();
   }
 }
 
@@ -447,23 +531,24 @@ PyObject *parse_buffer(const char *buf, size_t len, PyObject *original) {
   if (!ensure_parser()) {
     return nullptr;
   }
-  auto result = g_parser->parse(buf, len, input_needs_copy(buf, len));
+  auto result = g_thread_parser.ptr->parse(buf, len, input_needs_copy(buf, len));
   simdjson::error_code err = result.error();
-  PyObject *res = nullptr;
   if (err) {
-    raise_decode_error(simdjson::error_message(err), original);
-  } else {
-    Builder b{g_parser->doc.tape.get(), g_parser->doc.string_buf.get()};
-    size_t i = 1; // skip the root entry
-    // Suspend the cyclic GC while building: the new containers cannot form
-    // cycles, and collections triggered by the many allocations are wasted work.
-    int gc_was_enabled = PyGC_Disable();
-    res = b.build(i);
-    if (gc_was_enabled) {
-      PyGC_Enable();
-    }
+    // Drop a huge parser before the json.loads rescan allocates again.
+    const char *msg = simdjson::error_message(err);
+    release_large_parser();
+    return raise_error_with_position(msg, original);
   }
-  // Also after a failed parse: a huge invalid document must not pin the tape.
+  Builder b{g_thread_parser.ptr->doc.tape.get(),
+            g_thread_parser.ptr->doc.string_buf.get()};
+  size_t i = 1; // skip the root entry
+  // Suspend the cyclic GC while building: the new containers cannot form
+  // cycles, and collections triggered by the many allocations are wasted work.
+  int gc_was_enabled = PyGC_Disable();
+  PyObject *res = b.build(i);
+  if (gc_was_enabled) {
+    PyGC_Enable();
+  }
   release_large_parser();
   return res;
 }
@@ -511,14 +596,22 @@ PyObject *parse_only(PyObject *, PyObject *arg) {
   }
   const char *buf = PyBytes_AS_STRING(arg);
   size_t len = size_t(PyBytes_GET_SIZE(arg));
-  auto err = g_parser->parse(buf, len, input_needs_copy(buf, len)).error();
+  auto err =
+      g_thread_parser.ptr->parse(buf, len, input_needs_copy(buf, len)).error();
   release_large_parser();
   return PyLong_FromLong(long(err));
+}
+
+PyObject *release(PyObject *, PyObject *) {
+  release_parser();
+  Py_RETURN_NONE;
 }
 
 PyMethodDef methods[] = {
     {"_parse_only", parse_only, METH_O, "Parse without building objects."},
     {"loads", loads, METH_O, "Deserialize JSON to Python objects."},
+    {"release", release, METH_NOARGS,
+     "Release the simdjson parser retained by this thread."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -543,16 +636,21 @@ PyMODINIT_FUNC PyInit_fastsimdjson(void) {
     Py_DECREF(m);
     return nullptr;
   }
-  PyObject *base = PyObject_GetAttrString(json, "JSONDecodeError");
+  json_JSONDecodeError = PyObject_GetAttrString(json, "JSONDecodeError");
+  if (json_JSONDecodeError == nullptr) {
+    Py_DECREF(json);
+    Py_DECREF(m);
+    return nullptr;
+  }
+  json_loads = PyObject_GetAttrString(json, "loads");
   Py_DECREF(json);
-  if (base == nullptr) {
+  if (json_loads == nullptr) {
     Py_DECREF(m);
     return nullptr;
   }
   // Subclass json.JSONDecodeError (itself a ValueError) for drop-in use.
-  JSONDecodeError =
-      PyErr_NewException("fastsimdjson.JSONDecodeError", base, nullptr);
-  Py_DECREF(base);
+  JSONDecodeError = PyErr_NewException("fastsimdjson.JSONDecodeError",
+                                       json_JSONDecodeError, nullptr);
   if (JSONDecodeError == nullptr) {
     Py_DECREF(m);
     return nullptr;

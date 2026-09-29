@@ -12,12 +12,16 @@ fastsimdjson.loads(b'{"a": [1, 2.5, "x", true, null]}')
 
 `loads` accepts `bytes`, `bytearray`, `memoryview` and `str`. Invalid input
 raises `fastsimdjson.JSONDecodeError`, a subclass of `json.JSONDecodeError`.
+When simdjson rejects a document, the same input is parsed with `json.loads`
+so the exception carries Python's message and byte position. `release()`
+frees the simdjson parser kept by the calling thread.
 
 ## How it works
 
 1. simdjson's DOM parser (with runtime CPU dispatch: AVX-512, AVX2, SSE4.2, ...)
-   validates the document and builds its tape. The parser is reused across
-   calls. Input is copied only when the missing padding would cross a page
+   validates the document and builds its tape. Each thread keeps its own
+   parser and reuses it across calls; `release()` deletes that parser.
+   Input is copied only when the missing padding would cross a page
    boundary.
 2. A tape walker creates the Python objects directly:
    * lists are allocated at their final size (simdjson records element counts);
@@ -42,6 +46,8 @@ a leading UTF-8 BOM is accepted.
 Python 3.10 or newer, and a C++17 compiler (clang or GCC). The simdjson 5.0.1
 and simdutf 9.2.1 amalgamations are already in `vendor/`.
 
+pip:
+
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
@@ -50,11 +56,30 @@ python -m pip install -e ".[test]"
 pytest tests
 ```
 
-That builds the extension and makes `import fastsimdjson` work in the
-virtualenv. To compile it in the tree instead:
+uv:
+
+```sh
+uv venv
+. .venv/bin/activate
+uv pip install -e ".[test]"
+pytest tests
+```
+
+Either one builds the extension and makes `import fastsimdjson` work in the
+virtualenv. uv uses the `setuptools` build requirement from `pyproject.toml`,
+so it does not need a separate setuptools install for this path.
+
+To compile the extension in the tree instead, install setuptools and pytest
+into the same virtualenv, then:
 
 ```sh
 python -m pip install setuptools pytest
+python setup.py build_ext --inplace
+PYTHONPATH=src python -m pytest tests
+```
+
+```sh
+uv pip install setuptools pytest
 python setup.py build_ext --inplace
 PYTHONPATH=src python -m pytest tests
 ```
@@ -85,46 +110,71 @@ python -m pip install -e ".[bench]"
 python bench.py
 ```
 
+```sh
+uv pip install -e ".[bench]"
+python bench.py
+```
+
 ## Benchmarks
 
-`loads(bytes)` on Intel Xeon Gold 6548N (Emerald Rapids), Python 3.12.13,
-GCC 14, orjson 3.12.0. Times are the best of several runs. Speedup is
-orjson time / fastsimdjson time.
+Full materialization of `simdjson-data` on an Intel Xeon Gold 6548N, pinned
+to one core. Python 3.12.13, GCC, orjson 3.12.0, yyjson 4.0.6, cysimdjson
+26.27 (simdjson 3.8.0, AVX-512), pysimdjson 7.0.2 (icelake, AVX-512). Times
+are microseconds, the best of several runs. Speedup is orjson time /
+fastsimdjson time.
 
-| file | KB | orjson µs | fastsimdjson µs | speedup |
-|---|---:|---:|---:|---:|
-| apache_builds.json | 124 | 182.1 | 153.0 | 1.19 |
-| canada.json | 2198 | 7133.4 | 5619.5 | 1.27 |
-| citm_catalog.json | 1687 | 2833.7 | 1777.7 | 1.59 |
-| github_events.json | 64 | 69.3 | 55.4 | 1.25 |
-| google_maps_api_compact_response.json | 12 | 39.7 | 32.9 | 1.21 |
-| google_maps_api_response.json | 25 | 44.0 | 34.7 | 1.27 |
-| gsoc-2018.json | 3250 | 3831.6 | 2234.3 | 1.71 |
-| instruments.json | 215 | 317.3 | 232.7 | 1.36 |
-| marine_ik.json | 2914 | 10655.6 | 7915.5 | 1.35 |
-| mesh.json | 707 | 1673.6 | 1464.8 | 1.14 |
-| mesh.pretty.json | 1540 | 2291.9 | 1638.4 | 1.40 |
-| numbers.json | 147 | 220.3 | 229.7 | 0.96 |
-| random.json | 499 | 1499.0 | 1297.9 | 1.15 |
-| repeat.json | 11 | 15.4 | 13.0 | 1.18 |
-| semanticscholar-corpus.json | 8392 | 23044.4 | 15055.0 | 1.53 |
-| tree-pretty.json | 34 | 42.4 | 35.8 | 1.19 |
-| twitter.json | 617 | 1008.3 | 721.4 | 1.40 |
-| twitter_api_compact_response.json | 10 | 14.5 | 12.1 | 1.20 |
-| twitter_api_response.json | 15 | 17.1 | 14.3 | 1.19 |
-| twitter_timeline.json | 41 | 60.8 | 52.4 | 1.16 |
-| twitterescaped.json | 549 | 1024.4 | 801.4 | 1.28 |
-| update-center.json | 521 | 1353.3 | 1114.5 | 1.21 |
+cysimdjson is `JSONParser.parse(data).export()` and pysimdjson is
+`Parser.parse(data, recursive=True)`. `yyjson.loads` is `Document.as_obj`.
+fastsimdjson, cysimdjson, and pysimdjson matched orjson on every file,
+including types and key order.
 
-On Python 3.14 the results are similar (1.13×–1.86×; numbers.json 0.99×).
-numbers.json, a flat array of floats, is limited by simdjson's float parsing
-(about 10 ns per number here) plus CPython's float allocation, which orjson
-pays too.
+Geomean speedup of fastsimdjson: 1.28× over orjson, 1.41× over yyjson, 1.83×
+over cysimdjson, and 1.83× over pysimdjson. It was the fastest on 21 files.
+`numbers.json`, a flat array of floats, is the loss against orjson (0.99×):
+the time is simdjson's float parser plus allocating Python floats.
+
+yyjson 4.0.6 returns non-ASCII strings as the raw UTF-8 bytes stored in a
+Latin-1 `str`. Twelve files therefore do not match orjson (the twitter
+files, `citm_catalog`, `gsoc-2018`, `github_events`, `random`, `repeat`,
+`semanticscholar-corpus`, and `update-center`). Those yyjson times skip a
+real UTF-8 decode. fastsimdjson is still ahead on the ten files where the
+values match.
+
+| file | KB | orjson | fast | yyjson | cys | psy | speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| apache_builds.json | 124 | 180.8 | 148.9 | 207.1 | 262.2 | 268.1 | 1.21 |
+| canada.json | 2198 | 6539.6 | 5294.2 | 5728.7 | 7833.3 | 7363.5 | 1.24 |
+| citm_catalog.json | 1687 | 2915.1 | 1772.2 | 2569.4 | 4308.2 | 4215.6 | 1.64 |
+| github_events.json | 64 | 68.7 | 54.1 | 83.5 | 109.1 | 105.1 | 1.27 |
+| google_maps_api_compact_response.json | 12 | 40.3 | 34.1 | 48.0 | 56.9 | 57.2 | 1.18 |
+| google_maps_api_response.json | 25 | 43.7 | 35.0 | 52.7 | 57.7 | 58.5 | 1.25 |
+| gsoc-2018.json | 3250 | 3887.6 | 2279.7 | 2983.5 | 3538.0 | 3613.0 | 1.71 |
+| instruments.json | 215 | 323.0 | 237.5 | 410.0 | 502.8 | 504.2 | 1.36 |
+| marine_ik.json | 2914 | 9593.7 | 6680.2 | 8308.6 | 11567.4 | 11210.5 | 1.44 |
+| mesh.json | 707 | 1709.2 | 1473.8 | 1680.5 | 2275.3 | 2291.4 | 1.16 |
+| mesh.pretty.json | 1540 | 2438.1 | 1651.8 | 2187.1 | 2550.9 | 2530.8 | 1.48 |
+| numbers.json | 147 | 222.7 | 224.3 | 259.2 | 299.8 | 276.2 | 0.99 |
+| random.json | 499 | 1548.7 | 1290.7 | 1688.1 | 2435.7 | 2459.8 | 1.20 |
+| repeat.json | 11 | 15.2 | 12.9 | 16.9 | 24.3 | 24.6 | 1.18 |
+| semanticscholar-corpus.json | 8392 | 19783.5 | 13340.7 | 18140.7 | 26555.3 | 26659.4 | 1.48 |
+| tree-pretty.json | 34 | 42.7 | 35.2 | 61.3 | 62.3 | 65.3 | 1.21 |
+| twitter.json | 617 | 1012.8 | 727.1 | 1183.8 | 1789.8 | 1838.3 | 1.39 |
+| twitter_api_compact_response.json | 10 | 14.7 | 12.1 | 19.5 | 22.4 | 22.6 | 1.21 |
+| twitter_api_response.json | 15 | 17.6 | 14.3 | 23.9 | 26.5 | 26.6 | 1.23 |
+| twitter_timeline.json | 41 | 60.7 | 51.9 | 82.4 | 112.9 | 112.6 | 1.17 |
+| twitterescaped.json | 549 | 1016.6 | 839.6 | 1191.0 | 2003.6 | 2049.4 | 1.21 |
+| update-center.json | 521 | 1395.4 | 1134.2 | 1536.4 | 2030.1 | 2062.9 | 1.23 |
 
 ## Limitations
 
 * Only `loads` is implemented; there is no `dumps`.
-* A global parser and caches are used under the GIL. The module does not
-  declare free-threading support, so free-threaded builds re-enable the GIL
-  when it is imported.
-* Error messages come from simdjson and carry no position (`pos` is 0).
+* The simdjson parser is thread-local. `release()` frees the one retained by
+  the calling thread. A parser that grows past 64 MB is freed on its own at
+  the end of that call. Key and short-string caches are process-global and
+  updated under the GIL. The module does not declare free-threading support,
+  so free-threaded builds re-enable the GIL when it is imported.
+* `json.loads` accepts some documents simdjson rejects (`NaN`, `Infinity`,
+  and floats that overflow to infinity). Those still raise
+  `JSONDecodeError`, with `pos` 0, because there is no Python error to copy.
+  The same `pos` 0 fallback is used when `json.loads` raises something other
+  than `JSONDecodeError`.
