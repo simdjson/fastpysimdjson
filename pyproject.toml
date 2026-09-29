@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,9 +7,49 @@ name = "fastsimdjson"
 version = "0.1.0"
 description = "Fast JSON parsing for Python, built on simdjson"
 readme = "README.md"
+authors = [
+    {name = "Daniel Lemire", email = "daniel@lemire.me"}
+]
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+keywords = ["json", "simdjson", "parser", "simd", "performance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/simdjson/fastpysimdjson"
+Repository = "https://github.com/simdjson/fastpysimdjson"
+Issues = "https://github.com/simdjson/fastpysimdjson/issues"
 
 [project.optional-dependencies]
 test = ["pytest"]
 bench = ["orjson"]
+
+[tool.cibuildwheel]
+skip = ["pp*"]
+test-requires = ["pytest"]
+test-command = "pytest {project}/tests -q"
+
+[tool.cibuildwheel.macos]
+# Build for Intel, Apple Silicon, and Universal2 binaries
+archs = ["x86_64", "universal2", "arm64"]
+
+[tool.cibuildwheel.linux]
+# Build for the runner's native architecture (x86_64 and aarch64 runners
+# are provided separately in the CI matrix, so each builds natively).
+archs = ["native"]
+
+[tool.cibuildwheel.windows]
+# Build for 64-bit Windows (32-bit is rarely needed nowadays)
+archs = ["AMD64"]

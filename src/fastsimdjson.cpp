@@ -4,7 +4,15 @@
 
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "simdjson.h"
 #include "simdutf.h"
@@ -13,6 +21,14 @@
 // No longer declared in the public headers since 3.13, but still exported.
 extern "C" int _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key,
                                          PyObject *item, Py_hash_t hash);
+#endif
+
+#ifdef _MSC_VER
+#define FSJ_ALWAYS_INLINE __forceinline
+#define FSJ_NOINLINE __declspec(noinline)
+#else
+#define FSJ_ALWAYS_INLINE __attribute__((always_inline)) inline
+#define FSJ_NOINLINE __attribute__((noinline))
 #endif
 
 namespace {
@@ -305,7 +321,7 @@ struct Builder {
 
   // Converts the value at tape[i]; on return, i points past it. Scalars are
   // handled inline so that array/object loops avoid a call per element.
-  __attribute__((always_inline)) inline PyObject *build(size_t &i) {
+  FSJ_ALWAYS_INLINE PyObject *build(size_t &i) {
     uint64_t word = tape[i];
     uint8_t type = uint8_t(word >> 56);
     switch (type) {
@@ -357,7 +373,7 @@ struct Builder {
     }
   }
 
-  __attribute__((noinline)) PyObject *build_array(size_t &i, uint64_t word) {
+  FSJ_NOINLINE PyObject *build_array(size_t &i, uint64_t word) {
     {
       size_t end = size_t(word & 0xFFFFFFFF); // index after the matching ']'
       size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
@@ -397,7 +413,7 @@ struct Builder {
     }
   }
 
-  __attribute__((noinline)) PyObject *build_object(size_t &i, uint64_t word) {
+  FSJ_NOINLINE PyObject *build_object(size_t &i, uint64_t word) {
     {
       size_t end = size_t(word & 0xFFFFFFFF);
       size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
@@ -706,7 +722,13 @@ PyModuleDef module_def = {
 } // namespace
 
 PyMODINIT_FUNC PyInit_fastsimdjson(void) {
+#ifdef _WIN32
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  long ps = long(si.dwPageSize);
+#else
   long ps = sysconf(_SC_PAGESIZE);
+#endif
   if (ps > 0) {
     g_page_size = size_t(ps);
   }
