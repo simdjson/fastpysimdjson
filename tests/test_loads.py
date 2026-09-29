@@ -109,7 +109,7 @@ def test_input_types():
 
 @pytest.mark.parametrize("doc", ["", " ", "[", "]", "{", '{"a"}', '{"a":}', "[1,]", "[1 2]",
                                  '{"a":1,}', "nul", "tru", "01", "1.", ".1", "-", '"abc',
-                                 '"\\x"', "[1] x", '"\x01"', b'"\xff"', b'"\xc3"', "NaN", "{1:2}"])
+                                 '"\\x"', "[1] x", '"\x01"', b'"\xff"', b'"\xc3"', "{1:2}"])
 def test_errors(doc):
     with pytest.raises(ValueError):
         fastsimdjson.loads(doc)
@@ -123,16 +123,41 @@ def test_deep_nesting():
         assert type(v) is list and len(v) == 1
         v = v[0]
     assert v == []
-    with pytest.raises(ValueError):
-        fastsimdjson.loads("[" * 5000 + "]" * 5000)
+    # simdjson's default depth is 1024. Past that, loads follows json.loads:
+    # the value if Python accepts it, otherwise the same exception class.
+    deep = "[" * 5000 + "]" * 5000
+    try:
+        expected = json.loads(deep)
+    except json.JSONDecodeError as err:
+        with pytest.raises(fastsimdjson.JSONDecodeError) as got:
+            fastsimdjson.loads(deep)
+        assert got.value.pos == err.pos
+        assert got.value.msg == err.msg
+    except RecursionError:
+        with pytest.raises(RecursionError):
+            fastsimdjson.loads(deep)
+    else:
+        got = fastsimdjson.loads(deep)
+        # Walk, so the comparison does not recurse 5000 frames.
+        for _ in range(4999):
+            assert type(got) is list and type(expected) is list
+            assert len(got) == 1 and len(expected) == 1
+            got = got[0]
+            expected = expected[0]
+        assert got == [] and expected == []
 
 
 def test_page_boundary():
-    # Parse many sizes so that some buffers end near a page boundary.
+    # Parse many sizes so that some buffers end near a page boundary, where
+    # the unpadded parser handles the tail instead of a full copy.
+    big = 123456789012345678901234567890
     for n in range(4000, 4200):
         doc = json.dumps(["x" * n]).encode()
         assert fastsimdjson._parse_only(doc) == 0
         assert fastsimdjson.loads(doc) == ["x" * n]
+        # A number, a big integer, and atoms in the last 64 bytes.
+        doc = json.dumps(["x" * n, big, 1.5, True, None]).encode()
+        assert fastsimdjson.loads(doc) == ["x" * n, big, 1.5, True, None]
 
 
 def test_large_array():
@@ -200,16 +225,66 @@ def test_error_position_matches_json():
             assert isinstance(got.value, json.JSONDecodeError)
 
 
-def test_values_json_accepts_stay_rejected():
-    # json.loads turns these into floats. The fallback must not return them.
-    for doc in ("NaN", "Infinity", "-Infinity", "1e309", "-1e309"):
+def test_nan_infinity_and_overflow_match_json():
+    # NaN and Infinity are parsed by simdjson (SIMDJSON_ENABLE_NAN_INF).
+    # Overflow to infinity is rejected by simdjson and returned by the
+    # json.loads fallback. Either way the result matches json.loads.
+    docs = [
+        "NaN", "Infinity", "-Infinity", "1e309", "-1e309",
+        "[NaN, Infinity, -Infinity]", '{"a": 1, "b": 1e309}',
+    ]
+    for doc in docs:
+        expected = json.loads(doc)
+        raw = doc.encode()
+        for arg in (doc, raw, bytearray(raw), memoryview(raw)):
+            assert same(fastsimdjson.loads(arg), expected)
+
+
+@pytest.mark.parametrize(
+    "doc",
+    ["nan", "NAN", "inf", "Inf", "INF", "infinity", "iNFINITY",
+     "-inf", "-INF", "-infinity", "-InFiNiTy", "[nan, -infinity, INF]"],
+)
+def test_nan_inf_spellings_beyond_json(doc):
+    # simdjson accepts any capitalization of nan, inf, and infinity.
+    with pytest.raises(json.JSONDecodeError):
         json.loads(doc)
+    got = fastsimdjson.loads(doc)
+    if doc.startswith("["):
+        assert [math.isnan(got[0]), math.isinf(got[1]) and got[1] < 0,
+                math.isinf(got[2]) and got[2] > 0] == [True, True, True]
+        return
+    negative = doc.startswith("-")
+    body = doc[1:] if negative else doc
+    if body.lower() == "nan":
+        assert type(got) is float and math.isnan(got)
+    else:
+        assert type(got) is float and math.isinf(got)
+        assert (got < 0) == negative
+
+
+@pytest.mark.parametrize("doc", ["+inf", "+Infinity", "+NaN", "nanx", "infinityy"])
+def test_nan_inf_still_rejected(doc):
+    with pytest.raises(json.JSONDecodeError) as std:
+        json.loads(doc)
+    raw = doc.encode()
+    for arg in (doc, raw, bytearray(raw), memoryview(raw)):
         with pytest.raises(fastsimdjson.JSONDecodeError) as got:
-            fastsimdjson.loads(doc)
-        assert got.value.pos == 0
-        with pytest.raises(fastsimdjson.JSONDecodeError) as got:
-            fastsimdjson.loads(doc.encode())
-        assert got.value.pos == 0
+            fastsimdjson.loads(arg)
+        assert got.value.pos == std.value.pos
+        assert got.value.msg == std.value.msg
+
+
+def test_non_json_errors_propagate():
+    # simdjson rejects the bytes, json.loads raises UnicodeDecodeError, and
+    # that exception is the one loads reports.
+    raw = b'"\xff"'
+    with pytest.raises(UnicodeDecodeError):
+        json.loads(raw)
+    with pytest.raises(UnicodeDecodeError):
+        fastsimdjson.loads(raw)
+    with pytest.raises(UnicodeDecodeError):
+        fastsimdjson.loads(memoryview(raw))
 
 
 def test_release():
@@ -218,6 +293,16 @@ def test_release():
     assert fastsimdjson.release() is None
     assert fastsimdjson.loads("[1, 2]") == [1, 2]
     assert fastsimdjson.release() is None
+
+
+def test_release_drops_key_cache():
+    a = fastsimdjson.loads(b'{"hello": 1}')
+    b = fastsimdjson.loads(b'{"hello": 2}')
+    assert next(iter(a)) is next(iter(b))
+    fastsimdjson.release()
+    c = fastsimdjson.loads(b'{"hello": 3}')
+    assert next(iter(c)) == "hello"
+    assert next(iter(a)) is not next(iter(c))
 
 
 def test_release_is_per_thread():
@@ -246,15 +331,19 @@ def test_release_is_per_thread():
     assert sorted(seen) == [0, 1, 2, 3]
 
 
-def test_bigint_does_not_accept_surrogates():
+def test_lone_surrogate_follows_json():
+    # simdjson rejects an unpaired surrogate. json.loads accepts the escape
+    # and returns a str that contains it, including next to a big integer,
+    # so loads returns that value.
     big = "1" * 40
     docs = [
+        '"\\ud800"',
         f'[{big}, "\\ud800"]',
         f'["\\ud800", {big}]',
         f'{{"a": {big}, "b": "\\ud800"}}',
     ]
     for doc in docs:
+        expected = json.loads(doc)
         raw = doc.encode()
-        for arg in [doc, raw, memoryview(raw)]:
-            with pytest.raises(fastsimdjson.JSONDecodeError):
-                fastsimdjson.loads(arg)
+        for arg in (doc, raw, memoryview(raw)):
+            assert fastsimdjson.loads(arg) == expected

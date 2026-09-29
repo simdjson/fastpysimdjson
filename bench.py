@@ -30,7 +30,7 @@ def bench(fn, data, min_time=0.3):
     return best
 
 if __name__ == "__main__":
-  print(f"{'file':38s} {'KB':>7s} {'orjson us':>10s} {'fast us':>10s} {'speedup':>8s}")
+  print(f"{'file':38s} {'KB':>7s} {'json us':>10s} {'orjson us':>10s} {'fast us':>10s} {'speedup':>8s}")
   for f in FILES:
       data = open(f, "rb").read()
       try:
@@ -40,6 +40,7 @@ if __name__ == "__main__":
       got = fastsimdjson.loads(data)
       if got != ref:
           print("MISMATCH", f)
+      tj = bench(json.loads, data)
       to = bench(orjson.loads, data)
       tf = bench(fastsimdjson.loads, data)
-      print(f"{os.path.basename(f):38s} {len(data)/1024:7.0f} {to*1e6:10.1f} {tf*1e6:10.1f} {to/tf:8.2f}")
+      print(f"{os.path.basename(f):38s} {len(data)/1024:7.0f} {tj*1e6:10.1f} {to*1e6:10.1f} {tf*1e6:10.1f} {to/tf:8.2f}")

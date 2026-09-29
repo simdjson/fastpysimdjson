@@ -24,21 +24,11 @@ PyObject *json_JSONDecodeError = nullptr;
 PyObject *json_loads = nullptr;
 size_t g_page_size = 4096;
 
-// One simdjson parser per thread. The object is large once a document has
-// been parsed, so it is a pointer and release() can delete it.
-struct ThreadParser {
-  parser *ptr = nullptr;
-  ~ThreadParser() {
-    delete ptr;
-    ptr = nullptr;
-  }
-};
-thread_local ThreadParser g_thread_parser;
-
 // ---------------------------------------------------------------------------
 // Key cache: direct-mapped cache of short ASCII keys. Keys in JSON documents
 // repeat a lot; reusing the same str object (with its cached hash) avoids an
-// allocation and a hash computation per key.
+// allocation and a hash computation per key. The cache is per thread: a
+// process-global cache would race once the GIL is off.
 // ---------------------------------------------------------------------------
 constexpr size_t KEY_CACHE_SIZE = 2048; // power of two
 constexpr size_t KEY_CACHE_MAX_LEN = 64;
@@ -46,12 +36,48 @@ constexpr size_t KEY_CACHE_MAX_LEN = 64;
 // For keys of up to 16 bytes, (len, head, tail) identifies the key exactly;
 // longer keys also compare the middle bytes.
 struct KeyCacheEntry {
-  PyObject *key;
-  uint64_t len;
-  uint64_t head; // first 8 bytes (zero-padded)
-  uint64_t tail; // last 8 bytes (0 if len <= 8)
+  PyObject *key = nullptr;
+  uint64_t len = 0;
+  uint64_t head = 0; // first 8 bytes (zero-padded)
+  uint64_t tail = 0; // last 8 bytes (0 if len <= 8)
 };
-KeyCacheEntry key_cache[KEY_CACHE_SIZE];
+
+void clear_cache(KeyCacheEntry *cache) {
+  for (size_t i = 0; i < KEY_CACHE_SIZE; i++) {
+    Py_XDECREF(cache[i].key);
+    cache[i] = KeyCacheEntry{};
+  }
+}
+
+// True when this thread may DECREF. A thread-local destructor can run after
+// the thread state is gone, or during interpreter finalization; leaking the
+// cached strings is safer than touching them then.
+bool caches_can_decref() {
+#if PY_VERSION_HEX >= 0x030D0000
+  return Py_IsInitialized() && !Py_IsFinalizing() &&
+         PyThreadState_GetUnchecked() != nullptr;
+#else
+  return Py_IsInitialized() && PyGILState_GetThisThreadState() != nullptr;
+#endif
+}
+
+// One simdjson parser per thread, plus that thread's key and string caches.
+// The parser is large once a document has been parsed, so it is a pointer
+// and release() can delete it.
+struct ThreadParser {
+  parser *ptr = nullptr;
+  KeyCacheEntry key_cache[KEY_CACHE_SIZE]{};
+  KeyCacheEntry value_cache[KEY_CACHE_SIZE]{};
+  ~ThreadParser() {
+    delete ptr;
+    ptr = nullptr;
+    if (caches_can_decref()) {
+      clear_cache(key_cache);
+      clear_cache(value_cache);
+    }
+  }
+};
+thread_local ThreadParser g_thread_parser;
 
 inline uint64_t load_u64(const char *p) {
   uint64_t v;
@@ -165,7 +191,7 @@ inline PyObject *make_str(const char *s, size_t len) {
   return decode_utf8(s, len);
 }
 
-inline PyObject *make_key(const char *s, size_t len) {
+inline PyObject *make_key(KeyCacheEntry *cache, const char *s, size_t len) {
   if (len > KEY_CACHE_MAX_LEN) {
     PyObject *u = make_str(s, len);
     if (u != nullptr && PyObject_Hash(u) == -1) {
@@ -175,7 +201,9 @@ inline PyObject *make_key(const char *s, size_t len) {
     return u;
   }
   KeyWords w(s, len);
-  KeyCacheEntry &entry = key_cache[w.slot(len)];
+  // `cache` is this thread's table. A thread_local load per key is visible
+  // on documents that are mostly objects.
+  KeyCacheEntry &entry = cache[w.slot(len)];
   if (entry.len == len && entry.head == w.head && entry.tail == w.tail &&
       entry.key != nullptr &&
       (len <= 16 ||
@@ -213,10 +241,8 @@ inline PyObject *make_key(const char *s, size_t len) {
   return u;
 }
 
-KeyCacheEntry value_cache[KEY_CACHE_SIZE];
-
 // Short ASCII string values repeat often ("en", "false", ...): cache them.
-inline PyObject *make_value_str(const char *s, size_t len) {
+inline PyObject *make_value_str(KeyCacheEntry *cache, const char *s, size_t len) {
   if (len > 16) {
     return make_str(s, len);
   }
@@ -224,7 +250,7 @@ inline PyObject *make_value_str(const char *s, size_t len) {
   if (((w.head | w.tail) & 0x8080808080808080ULL) != 0) {
     return make_str(s, len);
   }
-  KeyCacheEntry &entry = value_cache[w.slot(len)];
+  KeyCacheEntry &entry = cache[w.slot(len)];
   if (entry.len == len && entry.head == w.head && entry.tail == w.tail &&
       entry.key != nullptr) {
     Py_INCREF(entry.key);
@@ -266,6 +292,8 @@ PyObject *make_bigint(const char *s, size_t len) {
 struct Builder {
   const uint64_t *tape;
   const uint8_t *strings;
+  KeyCacheEntry *keys;
+  KeyCacheEntry *values;
 
   inline const char *str_at(uint64_t word, size_t *len) const {
     size_t idx = size_t(word & simdjson::internal::JSON_VALUE_MASK);
@@ -289,7 +317,7 @@ struct Builder {
       size_t len;
       const char *s = str_at(word, &len);
       i++;
-      return make_value_str(s, len);
+      return make_value_str(values, s, len);
     }
     case 'l': {
       int64_t v;
@@ -382,7 +410,7 @@ struct Builder {
         size_t len;
         const char *s = str_at(tape[i], &len);
         i++;
-        PyObject *key = make_key(s, len);
+        PyObject *key = make_key(keys, s, len);
         if (key == nullptr) {
           Py_DECREF(dict);
           return nullptr;
@@ -408,64 +436,45 @@ struct Builder {
   }
 };
 
-// json.JSONDecodeError takes (msg, doc, pos). Used when json.loads cannot
-// supply a position: it accepted the text, or it raised some other exception.
-void raise_decode_error(const char *msg, PyObject *original) {
-  PyObject *exc =
-      PyUnicode_Check(original)
-          ? PyObject_CallFunction(JSONDecodeError, "sOi", msg, original, 0)
-          : PyObject_CallFunction(JSONDecodeError, "ssi", msg, "", 0);
-  if (exc != nullptr) {
-    PyErr_SetObject(JSONDecodeError, exc);
-    Py_DECREF(exc);
-  }
-}
-
-// simdjson reports no byte offset. Reparse with json.loads and re-raise its
-// JSONDecodeError (message, document, and position) as our subclass. Do not
-// return a successful json.loads result: json accepts NaN, Infinity, and
-// doubles that overflow, which simdjson rejects.
-PyObject *raise_error_with_position(const char *simd_msg, PyObject *original) {
+// simdjson rejected the document. json.loads decides the outcome: return its
+// value when it accepts the text. Raise only when it also fails.
+// JSONDecodeError is re-raised as our subclass so the message, document, and
+// byte offset match. Any other exception (UnicodeDecodeError, RecursionError)
+// propagates unchanged.
+PyObject *fallback_loads(PyObject *original) {
   PyObject *arg = original;
   PyObject *bytes_copy = nullptr;
   if (PyMemoryView_Check(original)) {
+    // json.loads does not accept memoryview.
     bytes_copy = PyBytes_FromObject(original);
     if (bytes_copy == nullptr) {
-      PyErr_Clear();
-      raise_decode_error(simd_msg, original);
       return nullptr;
     }
     arg = bytes_copy;
   }
   PyObject *parsed = PyObject_CallFunctionObjArgs(json_loads, arg, nullptr);
   Py_XDECREF(bytes_copy);
-  if (parsed != nullptr) {
-    Py_DECREF(parsed);
-    raise_decode_error(simd_msg, original);
-    return nullptr;
-  }
-  if (!PyErr_ExceptionMatches(json_JSONDecodeError)) {
-    PyErr_Clear();
-    raise_decode_error(simd_msg, original);
-    return nullptr;
+  if (parsed != nullptr || !PyErr_ExceptionMatches(json_JSONDecodeError)) {
+    return parsed;
   }
   PyObject *typ = nullptr;
   PyObject *val = nullptr;
   PyObject *tb = nullptr;
   PyErr_Fetch(&typ, &val, &tb);
   PyErr_NormalizeException(&typ, &val, &tb);
+  if (val == nullptr) {
+    PyErr_Restore(typ, val, tb);
+    return nullptr;
+  }
   PyObject *msg = PyObject_GetAttrString(val, "msg");
   PyObject *doc = PyObject_GetAttrString(val, "doc");
   PyObject *pos_obj = PyObject_GetAttrString(val, "pos");
-  Py_XDECREF(typ);
-  Py_XDECREF(tb);
-  Py_DECREF(val);
   if (msg == nullptr || doc == nullptr || pos_obj == nullptr) {
     PyErr_Clear();
     Py_XDECREF(msg);
     Py_XDECREF(doc);
     Py_XDECREF(pos_obj);
-    raise_decode_error(simd_msg, original);
+    PyErr_Restore(typ, val, tb);
     return nullptr;
   }
   Py_ssize_t pos = PyLong_AsSsize_t(pos_obj);
@@ -474,12 +483,15 @@ PyObject *raise_error_with_position(const char *simd_msg, PyObject *original) {
     PyErr_Clear();
     Py_DECREF(msg);
     Py_DECREF(doc);
-    raise_decode_error(simd_msg, original);
+    PyErr_Restore(typ, val, tb);
     return nullptr;
   }
   PyObject *exc = PyObject_CallFunction(JSONDecodeError, "OOn", msg, doc, pos);
   Py_DECREF(msg);
   Py_DECREF(doc);
+  Py_XDECREF(typ);
+  Py_XDECREF(tb);
+  Py_DECREF(val);
   if (exc == nullptr) {
     return nullptr;
   }
@@ -492,12 +504,21 @@ PyObject *raise_error_with_position(const char *simd_msg, PyObject *original) {
 // so that one huge document does not pin its buffers for the process lifetime.
 constexpr size_t MAX_RETAINED_CAPACITY = size_t(64) << 20;
 
-// True when the SIMDJSON_PADDING bytes after buf are not known to be readable.
-bool input_needs_copy(const char *buf, size_t len) {
+// The padded parse reads SIMDJSON_PADDING bytes past the last byte. That is
+// safe when the read stays on the same page. Otherwise the unpadded DOM entry
+// point is used: it does not copy the document and does not read past len.
+bool needs_unpadded(const char *buf, size_t len) {
   return len == 0 ||
          ((reinterpret_cast<uintptr_t>(buf + len - 1) % g_page_size) +
               simdjson::SIMDJSON_PADDING >=
           g_page_size);
+}
+
+simdjson::error_code parse_input(const char *buf, size_t len) {
+  if (needs_unpadded(buf, len)) {
+    return g_thread_parser.ptr->parse_unpadded(buf, len).error();
+  }
+  return g_thread_parser.ptr->parse(buf, len, false).error();
 }
 
 bool ensure_parser() {
@@ -520,6 +541,11 @@ void release_parser() {
   g_thread_parser.ptr = nullptr;
 }
 
+void release_caches() {
+  clear_cache(g_thread_parser.key_cache);
+  clear_cache(g_thread_parser.value_cache);
+}
+
 void release_large_parser() {
   if (g_thread_parser.ptr != nullptr &&
       g_thread_parser.ptr->capacity() > MAX_RETAINED_CAPACITY) {
@@ -531,24 +557,28 @@ PyObject *parse_buffer(const char *buf, size_t len, PyObject *original) {
   if (!ensure_parser()) {
     return nullptr;
   }
-  auto result = g_thread_parser.ptr->parse(buf, len, input_needs_copy(buf, len));
-  simdjson::error_code err = result.error();
+  simdjson::error_code err = parse_input(buf, len);
   if (err) {
     // Drop a huge parser before the json.loads rescan allocates again.
-    const char *msg = simdjson::error_message(err);
     release_large_parser();
-    return raise_error_with_position(msg, original);
+    return fallback_loads(original);
   }
   Builder b{g_thread_parser.ptr->doc.tape.get(),
-            g_thread_parser.ptr->doc.string_buf.get()};
+            g_thread_parser.ptr->doc.string_buf.get(),
+            g_thread_parser.key_cache, g_thread_parser.value_cache};
   size_t i = 1; // skip the root entry
   // Suspend the cyclic GC while building: the new containers cannot form
   // cycles, and collections triggered by the many allocations are wasted work.
+  // PyGC_Disable is process-global, so free-threaded builds leave GC alone.
+#ifndef Py_GIL_DISABLED
   int gc_was_enabled = PyGC_Disable();
+#endif
   PyObject *res = b.build(i);
+#ifndef Py_GIL_DISABLED
   if (gc_was_enabled) {
     PyGC_Enable();
   }
+#endif
   release_large_parser();
   return res;
 }
@@ -566,18 +596,32 @@ PyObject *loads(PyObject *, PyObject *arg) {
     }
     return parse_buffer(s, size_t(len), arg);
   }
-  if (PyByteArray_Check(arg)) {
-    return parse_buffer(PyByteArray_AS_STRING(arg),
-                        size_t(PyByteArray_GET_SIZE(arg)), arg);
-  }
-  if (PyMemoryView_Check(arg)) {
-    Py_buffer *view = PyMemoryView_GET_BUFFER(arg);
-    if (!PyBuffer_IsContiguous(view, 'C')) {
+  if (PyByteArray_Check(arg) || PyMemoryView_Check(arg)) {
+    if (PyMemoryView_Check(arg) &&
+        !PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(arg), 'C')) {
       PyErr_SetString(PyExc_TypeError, "memoryview must be contiguous");
       return nullptr;
     }
+#ifdef Py_GIL_DISABLED
+    // No GIL: another thread can resize the bytearray or retarget the view
+    // while it is read. Copy, then parse the copy. bytes and str are immutable.
+    PyObject *copy = PyBytes_FromObject(arg);
+    if (copy == nullptr) {
+      return nullptr;
+    }
+    PyObject *res = parse_buffer(PyBytes_AS_STRING(copy),
+                                 size_t(PyBytes_GET_SIZE(copy)), arg);
+    Py_DECREF(copy);
+    return res;
+#else
+    if (PyByteArray_Check(arg)) {
+      return parse_buffer(PyByteArray_AS_STRING(arg),
+                          size_t(PyByteArray_GET_SIZE(arg)), arg);
+    }
+    Py_buffer *view = PyMemoryView_GET_BUFFER(arg);
     return parse_buffer(static_cast<const char *>(view->buf),
                         size_t(view->len), arg);
+#endif
   }
   PyErr_Format(PyExc_TypeError,
                "Input must be bytes, bytearray, memoryview, or str, not %.200s",
@@ -596,14 +640,14 @@ PyObject *parse_only(PyObject *, PyObject *arg) {
   }
   const char *buf = PyBytes_AS_STRING(arg);
   size_t len = size_t(PyBytes_GET_SIZE(arg));
-  auto err =
-      g_thread_parser.ptr->parse(buf, len, input_needs_copy(buf, len)).error();
+  auto err = parse_input(buf, len);
   release_large_parser();
   return PyLong_FromLong(long(err));
 }
 
 PyObject *release(PyObject *, PyObject *) {
   release_parser();
+  release_caches();
   Py_RETURN_NONE;
 }
 
@@ -611,13 +655,52 @@ PyMethodDef methods[] = {
     {"_parse_only", parse_only, METH_O, "Parse without building objects."},
     {"loads", loads, METH_O, "Deserialize JSON to Python objects."},
     {"release", release, METH_NOARGS,
-     "Release the simdjson parser retained by this thread."},
+     "Release the simdjson parser and string caches retained by this thread."},
     {nullptr, nullptr, 0, nullptr},
+};
+
+// Multi-phase init so the module can declare that it does not need the GIL.
+// Exception types are process-global, so subinterpreters stay unsupported.
+int exec_fastsimdjson(PyObject *module) {
+  if (json_loads == nullptr) {
+    PyObject *json = PyImport_ImportModule("json");
+    if (json == nullptr) {
+      return -1;
+    }
+    json_JSONDecodeError = PyObject_GetAttrString(json, "JSONDecodeError");
+    json_loads = PyObject_GetAttrString(json, "loads");
+    Py_DECREF(json);
+    if (json_JSONDecodeError == nullptr || json_loads == nullptr) {
+      Py_CLEAR(json_JSONDecodeError);
+      Py_CLEAR(json_loads);
+      return -1;
+    }
+  }
+  if (JSONDecodeError == nullptr) {
+    // Subclass json.JSONDecodeError (itself a ValueError) for drop-in use.
+    JSONDecodeError = PyErr_NewException("fastsimdjson.JSONDecodeError",
+                                         json_JSONDecodeError, nullptr);
+    if (JSONDecodeError == nullptr) {
+      return -1;
+    }
+  }
+  return PyModule_AddObjectRef(module, "JSONDecodeError", JSONDecodeError);
+}
+
+PyModuleDef_Slot module_slots[] = {
+    {Py_mod_exec, reinterpret_cast<void *>(exec_fastsimdjson)},
+#if PY_VERSION_HEX >= 0x030C0000
+    {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
+#if PY_VERSION_HEX >= 0x030D0000
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
+    {0, nullptr},
 };
 
 PyModuleDef module_def = {
     PyModuleDef_HEAD_INIT, "fastsimdjson", "Fast JSON parsing with simdjson.",
-    -1, methods,
+    0, methods, module_slots,
 };
 
 } // namespace
@@ -627,39 +710,5 @@ PyMODINIT_FUNC PyInit_fastsimdjson(void) {
   if (ps > 0) {
     g_page_size = size_t(ps);
   }
-  PyObject *m = PyModule_Create(&module_def);
-  if (m == nullptr) {
-    return nullptr;
-  }
-  PyObject *json = PyImport_ImportModule("json");
-  if (json == nullptr) {
-    Py_DECREF(m);
-    return nullptr;
-  }
-  json_JSONDecodeError = PyObject_GetAttrString(json, "JSONDecodeError");
-  if (json_JSONDecodeError == nullptr) {
-    Py_DECREF(json);
-    Py_DECREF(m);
-    return nullptr;
-  }
-  json_loads = PyObject_GetAttrString(json, "loads");
-  Py_DECREF(json);
-  if (json_loads == nullptr) {
-    Py_DECREF(m);
-    return nullptr;
-  }
-  // Subclass json.JSONDecodeError (itself a ValueError) for drop-in use.
-  JSONDecodeError = PyErr_NewException("fastsimdjson.JSONDecodeError",
-                                       json_JSONDecodeError, nullptr);
-  if (JSONDecodeError == nullptr) {
-    Py_DECREF(m);
-    return nullptr;
-  }
-  Py_INCREF(JSONDecodeError);
-  if (PyModule_AddObject(m, "JSONDecodeError", JSONDecodeError) < 0) {
-    Py_DECREF(JSONDecodeError);
-    Py_DECREF(m);
-    return nullptr;
-  }
-  return m;
+  return PyModuleDef_Init(&module_def);
 }
