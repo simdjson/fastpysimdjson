@@ -2,9 +2,12 @@
 
 A Python binding for [simdjson](https://github.com/simdjson/simdjson) that
 parses JSON into native Python objects (`dict`, `list`, `str`, `int`,
-`float`, `bool`, `None`). It is a drop-in replacement for `json.loads`, and
-it can be over 3 times faster than the standard `json.loads`. When you only
-need part of a document, its lazy `parse` function is faster still.
+`float`, `bool`, `None`) and serializes them back. It is a drop-in
+replacement for the `json` module's `loads`, `load`, `dumps` and `dump`, and
+it can be over 3 times faster than the standard `json.loads` and
+`json.dumps`. When you only need part of a document, its lazy `parse`
+function is faster still. It also reads streams of documents (NDJSON, JSON
+Lines).
 
 ```sh
 pip install fastsimdjson
@@ -65,6 +68,67 @@ doc["search_metadata"].as_dict()          # convert a subtree, like loads
   `json.loads` accepts (an overflowing number, an unpaired surrogate) is
   returned as plain Python objects, as `loads` would return it.
 
+### `dumps` and `dump`: writing JSON
+
+```python
+fastsimdjson.dumps({"a": [1, 2.5, None]})            # '{"a": [1, 2.5, null]}'
+fastsimdjson.dumps(obj, indent=2, sort_keys=True)
+fastsimdjson.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+with open("out.json", "w", encoding="utf-8") as f:
+    fastsimdjson.dump(obj, f)
+```
+
+`dumps(obj, **kw)` takes the arguments of `json.dumps` and returns the same
+`str`, character for character, including the float format (`repr`), the
+escapes and the default separators. `ensure_ascii`, `indent`, `separators`,
+`sort_keys`, `allow_nan` and `default` are handled in C. Everything else is
+passed to `json.dumps` itself, which produces the result or raises its usual
+exception: a `cls` argument or other encoder options, `skipkeys`, a circular
+reference, `NaN` with `allow_nan=False`, a key or a value that `json` cannot
+serialize. `dump(obj, fp, **kw)` writes `dumps(obj, **kw)` to `fp`.
+
+### Files
+
+```python
+with open("data.json", "rb") as f:
+    doc = fastsimdjson.load(f)          # like json.load: f.read(), then loads
+doc = fastsimdjson.load_file("data.json")
+view = fastsimdjson.parse_file("data.json")   # lazy, like parse
+```
+
+`load_file(path)` and `parse_file(path)` accept a `str`, `bytes` or
+`os.PathLike` path and raise `OSError` (e.g. `FileNotFoundError`) when the
+file cannot be read.
+
+### `loads_many` and `parse_many`: streams of documents
+
+```python
+for record in fastsimdjson.loads_many(open("log.ndjson", "rb").read()):
+    ...
+for view in fastsimdjson.parse_many(data):    # lazy views, like parse
+    ...
+```
+
+Both return an iterator over the documents of `data` (`bytes`, `bytearray`,
+`memoryview` or `str`). The `format` keyword selects how documents are
+separated:
+
+| `format` | input |
+|---|---|
+| `"whitespace"` (default) | documents separated by white space, including NDJSON and JSON Lines |
+| `"lines"` | one document per line (NDJSON, JSON Lines) |
+| `"json_seq"` | RFC 7464 JSON text sequences (each document preceded by `\x1e`) |
+| `"comma"` | documents separated by commas: `{...}, {...}` |
+| `"array"` | the elements of one array: `[{...}, {...}]` |
+
+simdjson parses the input in batches (`batch_size`, 1 MB by default); a
+larger document is handled automatically. With `"whitespace"` and `"lines"`,
+documents that simdjson rejects are handled as in `loads`: a document that
+`json` accepts is returned, otherwise `JSONDecodeError` reports `json`'s
+message and the position in the whole input. A truncated last document is an
+error. The views returned by `parse_many` remain valid after the iterator
+moves on.
+
 ### `release`
 
 `release()` frees the simdjson parser and the string caches kept by the
@@ -117,7 +181,10 @@ Recent setuptools copies the `.so` next to `src/fastsimdjson.cpp`, which is
 why `PYTHONPATH=src` is required for the in-place build.
 
 `tests/test_loads.py` compares `loads` with `json.loads` on types and key
-order; `tests/test_lazy.py` checks the views returned by `parse` the same way. It covers scalars, integers past 64 bits, UTF-8 strings at every
+order; `tests/test_lazy.py` checks the views returned by `parse` the same way,
+`tests/test_dumps.py` compares `dumps` with `json.dumps` (output and
+exceptions), and `tests/test_stream.py` and `tests/test_files.py` cover
+streams and files. It covers scalars, integers past 64 bits, UTF-8 strings at every
 length from 0 to 199, the key cache, random documents, rejected input, deep
 nesting, padding at a page boundary, a saturated array count, reference
 counts, and release of a parser that has grown past 64 MB. The corpus test
@@ -133,7 +200,8 @@ The suite builds an ~80 MB document and a list of 16,777,221 integers, so
 give it some RAM.
 
 To time `loads` against `json.loads` and orjson on those files
-(`bench_lazy.py` times `parse` against pysimdjson and cysimdjson):
+(`bench_lazy.py` times `parse` against pysimdjson and cysimdjson,
+`bench_dumps.py` times `dumps`, and `bench_many.py` times `loads_many`):
 
 ```sh
 python -m pip install -e ".[bench]"
@@ -219,9 +287,50 @@ views (with `loads`: through the dict). When you visit everything, `parse`
 is about as fast as `loads`. On very small documents (15 KB), pysimdjson's
 `parse` is marginally faster.
 
+### Writing JSON with `dumps`
+
+Same machine, fastsimdjson 0.3.0, the objects of the 22 files. With the
+default arguments, `dumps` returns exactly what `json.dumps` returns and is
+3.4 times faster (geometric mean; from 2.5 times on text-heavy files to 8
+times on files full of numbers). Microseconds:
+
+| file | `json.dumps` | fastsimdjson `dumps` | orjson | msgspec |
+|---|---:|---:|---:|---:|
+| twitter | 1482 | 529 | 199 | 347 |
+| citm_catalog | 2702 | 1071 | 427 | 494 |
+| github_events | 158 | 43 | 19 | 30 |
+| canada | 38622 | 4843 | 2923 | 3653 |
+| numbers | 2515 | 349 | 198 | 332 |
+
+orjson and msgspec are faster still, but they produce something else: they
+return `bytes`, without spaces after separators and without escaping
+non-ASCII characters. Compared with `separators=(",", ":")` and
+`ensure_ascii=False`, the closest `dumps` settings, orjson is 2.9 times
+faster and msgspec 1.8 times faster (geometric means).
+
+### Streams with `loads_many`
+
+20 MB of NDJSON (5268 objects and arrays, one per line), made from the same
+files:
+
+| method | ms | GB/s |
+|---|---:|---:|
+| `json.loads` on each line | 167 | 0.12 |
+| orjson on each line | 81 | 0.24 |
+| fastsimdjson `loads` on each line | 61 | 0.32 |
+| fastsimdjson `loads_many` | 52 | 0.38 |
+| fastsimdjson `parse_many` (views only) | 20 | 0.96 |
+
 ## Limitations
 
-* There is no `dumps`: fastsimdjson only parses JSON.
+* `dumps` returns a `str`, like `json.dumps`; there is no option to return
+  `bytes`.
+* In streams, a document that is a bare number (`3.14` alone on its line)
+  is slow to parse: simdjson copies the rest of the batch for each one. Streams
+  of objects and arrays are not affected.
+* With the `"json_seq"`, `"comma"` and `"array"` stream formats, documents
+  that simdjson rejects raise `JSONDecodeError` with simdjson's message;
+  there is no fallback to `json`.
 * The simdjson parser and the key and string caches are thread-local.
   `release()` frees the parser and the cached strings retained by the calling
   thread. A parser that grows past 64 MB is freed on its own at the end of
