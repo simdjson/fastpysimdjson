@@ -1,3 +1,4 @@
+import gc
 import glob
 import json
 import math
@@ -347,3 +348,29 @@ def test_lone_surrogate_follows_json():
         raw = doc.encode()
         for arg in (doc, raw, memoryview(raw)):
             assert fastsimdjson.loads(arg) == expected
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_gc_state_is_preserved(enabled):
+    # loads pauses the cyclic GC while it builds objects (GIL builds only).
+    # Whatever the caller chose must hold afterwards, on every path: a
+    # normal parse, a json.loads fallback that succeeds, and an error.
+    big = "[" + ",".join('{"k": [1, 2.5, "s"]}' for _ in range(10000)) + "]"
+    was = gc.isenabled()
+    try:
+        if enabled:
+            gc.enable()
+        else:
+            gc.disable()
+        assert len(fastsimdjson.loads(big)) == 10000
+        assert gc.isenabled() == enabled
+        assert fastsimdjson.loads("1e400") == float("inf")
+        assert gc.isenabled() == enabled
+        with pytest.raises(fastsimdjson.JSONDecodeError):
+            fastsimdjson.loads(b'{"a": ')
+        assert gc.isenabled() == enabled
+    finally:
+        if was:
+            gc.enable()
+        else:
+            gc.disable()
