@@ -2,10 +2,15 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1291,6 +1296,1165 @@ int add_lazy_types(PyObject *module) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// dumps: Python objects to JSON text, with the output of json.dumps. The
+// encoder handles the usual types and options; anything else (a cls
+// argument, skipkeys, a circular reference, NaN with allow_nan=False, a key
+// or an object it cannot encode) is handed to json.dumps, which produces the
+// result or raises the same exception that json would raise.
+// ---------------------------------------------------------------------------
+enum EncodeStatus { ENCODE_OK = 0, ENCODE_ERROR = -1, ENCODE_FALLBACK = 1 };
+
+const char HEX_DIGITS[] = "0123456789abcdef";
+
+// Python's repr of a finite double. simdjson's to_chars produces the same
+// shortest digits as repr, in a different layout; repr writes fixed
+// notation when the decimal exponent is in (-4, 16], and e+XX otherwise.
+void append_float_repr(std::string &out, double v) {
+  char buf[simdjson::internal::to_chars_buffer_size];
+  char *end = simdjson::internal::to_chars(buf, nullptr, v);
+  const char *p = buf;
+  if (*p == '-') {
+    out.push_back('-');
+    p++;
+  }
+  char digits[32];
+  int n = 0;
+  int point = -1; // number of digits before the '.'
+  int exp10 = 0;
+  for (; p < end; p++) {
+    char c = *p;
+    if (c >= '0' && c <= '9') {
+      digits[n++] = c;
+    } else if (c == '.') {
+      point = n;
+    } else if (c == 'e' || c == 'E') {
+      // The buffer is not NUL-terminated: parse the exponent up to end.
+      const char *q = p + 1;
+      bool negative = q < end && *q == '-';
+      if (q < end && (*q == '-' || *q == '+')) {
+        q++;
+      }
+      for (; q < end && *q >= '0' && *q <= '9'; q++) {
+        exp10 = exp10 * 10 + (*q - '0');
+      }
+      if (negative) {
+        exp10 = -exp10;
+      }
+      break;
+    }
+  }
+  if (point < 0) {
+    point = n;
+  }
+  // Strip leading and trailing zeros: digits[lead, n) are significant.
+  int lead = 0;
+  while (lead < n - 1 && digits[lead] == '0') {
+    lead++;
+  }
+  while (n > lead + 1 && digits[n - 1] == '0') {
+    n--;
+  }
+  if (n - lead == 1 && digits[lead] == '0') {
+    out.append("0.0");
+    return;
+  }
+  const char *d = digits + lead;
+  int nd = n - lead;
+  int decpt = point - lead + exp10; // value = 0.d * 10^decpt
+  if (decpt > -4 && decpt <= 16) {
+    if (decpt <= 0) {
+      out.append("0.");
+      out.append(size_t(-decpt), '0');
+      out.append(d, size_t(nd));
+    } else if (decpt >= nd) {
+      out.append(d, size_t(nd));
+      out.append(size_t(decpt - nd), '0');
+      out.append(".0");
+    } else {
+      out.append(d, size_t(decpt));
+      out.push_back('.');
+      out.append(d + decpt, size_t(nd - decpt));
+    }
+    return;
+  }
+  out.push_back(d[0]);
+  if (nd > 1) {
+    out.push_back('.');
+    out.append(d + 1, size_t(nd - 1));
+  }
+  int e = decpt - 1;
+  out.push_back('e');
+  out.push_back(e < 0 ? '-' : '+');
+  if (e < 0) {
+    e = -e;
+  }
+  char eb[8];
+  int len = snprintf(eb, sizeof(eb), "%02d", e);
+  out.append(eb, size_t(len));
+}
+
+inline void append_u64(std::string &out, uint64_t v) {
+  char buf[24];
+  char *p = buf + sizeof(buf);
+  do {
+    *--p = char('0' + v % 10);
+    v /= 10;
+  } while (v != 0);
+  out.append(p, size_t(buf + sizeof(buf) - p));
+}
+
+struct Encoder {
+  std::string out;
+  bool ensure_ascii = true;
+  bool ascii_output = true; // ensure_ascii, and ASCII separators and indent
+  bool allow_nan = true;
+  bool sort_keys = false;
+  PyObject *default_fn = nullptr; // borrowed
+  std::string item_sep = ", ";
+  std::string key_sep = ": ";
+  bool has_indent = false;
+  std::string indent;
+  int level = 0;
+  std::vector<PyObject *> path; // containers being encoded
+
+  void newline_indent() {
+    out.push_back('\n');
+    for (int i = 0; i < level; i++) {
+      out.append(indent);
+    }
+  }
+
+  void append_escaped(uint32_t c) {
+    switch (c) {
+    case '"': out.append("\\\""); return;
+    case '\\': out.append("\\\\"); return;
+    case '\b': out.append("\\b"); return;
+    case '\f': out.append("\\f"); return;
+    case '\n': out.append("\\n"); return;
+    case '\r': out.append("\\r"); return;
+    case '\t': out.append("\\t"); return;
+    default: break;
+    }
+    if (c >= 0x10000) {
+      c -= 0x10000;
+      append_escaped(0xD800 | (c >> 10));
+      append_escaped(0xDC00 | (c & 0x3FF));
+      return;
+    }
+    char u[6] = {'\\', 'u', HEX_DIGITS[(c >> 12) & 0xF], HEX_DIGITS[(c >> 8) & 0xF],
+                 HEX_DIGITS[(c >> 4) & 0xF], HEX_DIGITS[c & 0xF]};
+    out.append(u, 6);
+  }
+
+  // ASCII characters that need an escape: control characters, '"' and '\',
+  // and with ensure_ascii, DEL (json escapes everything outside ' '..'~').
+  inline bool ascii_needs_escape(uint8_t c) const {
+    return c < 0x20 || c == '"' || c == '\\' || (c == 0x7F && ensure_ascii);
+  }
+
+  // True when one of the 8 ASCII bytes in w needs an escape.
+  inline bool word_needs_escape(uint64_t w) const {
+    const uint64_t ones = 0x0101010101010101ULL;
+    const uint64_t highs = 0x8080808080808080ULL;
+    uint64_t lt20 = (w - ones * 0x20) & ~w;
+    uint64_t q = w ^ (ones * '"');
+    uint64_t b = w ^ (ones * '\\');
+    uint64_t eq = ((q - ones) & ~q) | ((b - ones) & ~b);
+    if (ensure_ascii) {
+      uint64_t d = w ^ (ones * 0x7F);
+      eq |= (d - ones) & ~d;
+    }
+    return ((lt20 | eq) & highs) != 0;
+  }
+
+  void append_ascii(const char *s, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+      size_t start = i;
+      while (i + 8 <= len && !word_needs_escape(load_u64(s + i))) {
+        i += 8;
+      }
+      while (i < len && !ascii_needs_escape(uint8_t(s[i]))) {
+        i++;
+      }
+      out.append(s + start, i - start);
+      if (i < len) {
+        append_escaped(uint8_t(s[i]));
+        i++;
+      }
+    }
+  }
+
+  void append_utf8(uint32_t c) {
+    if (c < 0x800) {
+      out.push_back(char(0xC0 | (c >> 6)));
+      out.push_back(char(0x80 | (c & 0x3F)));
+    } else if (c < 0x10000) {
+      out.push_back(char(0xE0 | (c >> 12)));
+      out.push_back(char(0x80 | ((c >> 6) & 0x3F)));
+      out.push_back(char(0x80 | (c & 0x3F)));
+    } else {
+      out.push_back(char(0xF0 | (c >> 18)));
+      out.push_back(char(0x80 | ((c >> 12) & 0x3F)));
+      out.push_back(char(0x80 | ((c >> 6) & 0x3F)));
+      out.push_back(char(0x80 | (c & 0x3F)));
+    }
+  }
+
+  int encode_str(PyObject *s) {
+    out.push_back('"');
+    Py_ssize_t len = PyUnicode_GET_LENGTH(s);
+    if (PyUnicode_IS_ASCII(s)) {
+      append_ascii(static_cast<const char *>(PyUnicode_DATA(s)), size_t(len));
+    } else {
+      int kind = PyUnicode_KIND(s);
+      const void *data = PyUnicode_DATA(s);
+      for (Py_ssize_t i = 0; i < len; i++) {
+        uint32_t c = PyUnicode_READ(kind, data, i);
+        if (c < 0x80) {
+          if (ascii_needs_escape(uint8_t(c))) {
+            append_escaped(c);
+          } else {
+            out.push_back(char(c));
+          }
+        } else if (ensure_ascii) {
+          append_escaped(c);
+        } else if (c >= 0xD800 && c <= 0xDFFF) {
+          return ENCODE_FALLBACK; // a lone surrogate cannot be UTF-8
+        } else {
+          append_utf8(c);
+        }
+      }
+    }
+    out.push_back('"');
+    return ENCODE_OK;
+  }
+
+  int encode_int(PyObject *o) {
+    int overflow = 0;
+    long long v = PyLong_AsLongLongAndOverflow(o, &overflow);
+    if (overflow == 0) {
+      if (v == -1 && PyErr_Occurred()) {
+        return ENCODE_ERROR;
+      }
+      if (v < 0) {
+        out.push_back('-');
+        append_u64(out, uint64_t(0) - uint64_t(v));
+      } else {
+        append_u64(out, uint64_t(v));
+      }
+      return ENCODE_OK;
+    }
+    // int.__repr__, as json does (an int subclass may override __repr__).
+    PyObject *r = PyLong_Type.tp_repr(o);
+    if (r == nullptr) {
+      return ENCODE_ERROR;
+    }
+    Py_ssize_t n;
+    const char *p = PyUnicode_AsUTF8AndSize(r, &n);
+    if (p != nullptr) {
+      out.append(p, size_t(n));
+    }
+    Py_DECREF(r);
+    return p == nullptr ? ENCODE_ERROR : ENCODE_OK;
+  }
+
+  int encode_float(double v) {
+    if (std::isfinite(v)) {
+      append_float_repr(out, v);
+      return ENCODE_OK;
+    }
+    if (!allow_nan) {
+      return ENCODE_FALLBACK;
+    }
+    out.append(std::isnan(v) ? "NaN" : v > 0 ? "Infinity" : "-Infinity");
+    return ENCODE_OK;
+  }
+
+  bool on_path(PyObject *o) const {
+    for (PyObject *p : path) {
+      if (p == o) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  int encode_key(PyObject *key) {
+    if (PyUnicode_Check(key)) {
+      return encode_str(key);
+    }
+    if (PyFloat_Check(key)) {
+      out.push_back('"');
+      int rc = encode_float(PyFloat_AS_DOUBLE(key));
+      out.push_back('"');
+      return rc;
+    }
+    if (key == Py_True || key == Py_False || key == Py_None) {
+      out.append(key == Py_True ? "\"true\"" : key == Py_False ? "\"false\"" : "\"null\"");
+      return ENCODE_OK;
+    }
+    if (PyLong_Check(key)) {
+      out.push_back('"');
+      int rc = encode_int(key);
+      out.push_back('"');
+      return rc;
+    }
+    return ENCODE_FALLBACK; // json raises TypeError (or skips the key)
+  }
+
+  int encode_item(PyObject *key, PyObject *value, bool first) {
+    if (!first) {
+      out.append(item_sep);
+    }
+    if (has_indent) {
+      newline_indent();
+    }
+    int rc = encode_key(key);
+    if (rc != ENCODE_OK) {
+      return rc;
+    }
+    out.append(key_sep);
+    return encode(value);
+  }
+
+  int encode_dict(PyObject *o) {
+    if (PyDict_GET_SIZE(o) == 0) {
+      out.append("{}");
+      return ENCODE_OK;
+    }
+    out.push_back('{');
+    level++;
+    int rc = ENCODE_OK;
+#ifdef Py_GIL_DISABLED
+    bool snapshot = true; // another thread may change the dict
+#else
+    // Python code (default, key comparisons) may change the dict.
+    bool snapshot = sort_keys || default_fn != nullptr || !PyDict_CheckExact(o);
+#endif
+    if (snapshot) {
+      PyObject *items = PyDict_CheckExact(o) ? PyDict_Items(o) : PyMapping_Items(o);
+      if (items == nullptr || (sort_keys && PyList_Sort(items) < 0)) {
+        Py_XDECREF(items);
+        return ENCODE_ERROR;
+      }
+      for (Py_ssize_t i = 0; rc == ENCODE_OK && i < PyList_GET_SIZE(items); i++) {
+        PyObject *pair = PyList_GET_ITEM(items, i);
+        if (!PyTuple_Check(pair) || PyTuple_GET_SIZE(pair) != 2) {
+          rc = ENCODE_FALLBACK;
+          break;
+        }
+        rc = encode_item(PyTuple_GET_ITEM(pair, 0), PyTuple_GET_ITEM(pair, 1), i == 0);
+      }
+      Py_DECREF(items);
+    } else {
+      Py_ssize_t pos = 0;
+      PyObject *key, *value;
+      bool first = true;
+      while (rc == ENCODE_OK && PyDict_Next(o, &pos, &key, &value)) {
+        Py_INCREF(key);
+        Py_INCREF(value);
+        rc = encode_item(key, value, first);
+        Py_DECREF(key);
+        Py_DECREF(value);
+        first = false;
+      }
+    }
+    if (rc != ENCODE_OK) {
+      return rc;
+    }
+    level--;
+    if (has_indent) {
+      newline_indent();
+    }
+    out.push_back('}');
+    return ENCODE_OK;
+  }
+
+  int encode_list(PyObject *o) {
+    bool is_list = PyList_Check(o);
+    Py_ssize_t n = is_list ? PyList_GET_SIZE(o) : PyTuple_GET_SIZE(o);
+    if (n == 0) {
+      out.append("[]");
+      return ENCODE_OK;
+    }
+    out.push_back('[');
+    level++;
+    for (Py_ssize_t i = 0;; i++) {
+      PyObject *item;
+      if (is_list) {
+        // The list may shrink while we encode it (default, other threads).
+#if PY_VERSION_HEX >= 0x030D0000
+        item = PyList_GetItemRef(o, i);
+        if (item == nullptr) {
+          PyErr_Clear();
+          break;
+        }
+#else
+        if (i >= PyList_GET_SIZE(o)) {
+          break;
+        }
+        item = PyList_GET_ITEM(o, i);
+        Py_INCREF(item);
+#endif
+      } else {
+        if (i >= n) {
+          break;
+        }
+        item = PyTuple_GET_ITEM(o, i);
+        Py_INCREF(item);
+      }
+      if (i > 0) {
+        out.append(item_sep);
+      }
+      if (has_indent) {
+        newline_indent();
+      }
+      int rc = encode(item);
+      Py_DECREF(item);
+      if (rc != ENCODE_OK) {
+        return rc;
+      }
+    }
+    level--;
+    if (has_indent) {
+      newline_indent();
+    }
+    out.push_back(']');
+    return ENCODE_OK;
+  }
+
+  int encode(PyObject *o) {
+    if (o == Py_None) {
+      out.append("null");
+      return ENCODE_OK;
+    }
+    if (o == Py_True) {
+      out.append("true");
+      return ENCODE_OK;
+    }
+    if (o == Py_False) {
+      out.append("false");
+      return ENCODE_OK;
+    }
+    if (PyUnicode_Check(o)) {
+      return encode_str(o);
+    }
+    if (PyLong_Check(o)) {
+      return encode_int(o);
+    }
+    if (PyFloat_Check(o)) {
+      return encode_float(PyFloat_AS_DOUBLE(o));
+    }
+    bool container = PyList_Check(o) || PyTuple_Check(o) || PyDict_Check(o);
+    if (!container && default_fn == nullptr) {
+      return ENCODE_FALLBACK; // json raises TypeError
+    }
+    if (on_path(o)) {
+      return ENCODE_FALLBACK; // json raises "Circular reference detected"
+    }
+    if (Py_EnterRecursiveCall(" while encoding a JSON object")) {
+      return ENCODE_ERROR;
+    }
+    path.push_back(o);
+    int rc;
+    if (PyDict_Check(o)) {
+      rc = encode_dict(o);
+    } else if (container) {
+      rc = encode_list(o);
+    } else {
+      PyObject *r = PyObject_CallOneArg(default_fn, o);
+      rc = r == nullptr ? ENCODE_ERROR : encode(r);
+      Py_XDECREF(r);
+    }
+    path.pop_back();
+    Py_LeaveRecursiveCall();
+    return rc;
+  }
+};
+
+PyObject *json_dumps = nullptr;
+
+PyObject *fallback_dumps(PyObject *args, PyObject *kwargs) {
+  return PyObject_Call(json_dumps, args, kwargs);
+}
+
+// Reads the json.dumps keywords. Returns false when the call should go to
+// json.dumps (unknown or unusual arguments); sets an error and returns false
+// with *error set on failure.
+bool configure(Encoder &e, PyObject *kwargs, bool *error) {
+  *error = false;
+  if (kwargs == nullptr) {
+    return true;
+  }
+  PyObject *separators = Py_None;
+  PyObject *indent = Py_None;
+  Py_ssize_t pos = 0;
+  PyObject *k, *v;
+  while (PyDict_Next(kwargs, &pos, &k, &v)) {
+    const char *name = PyUnicode_AsUTF8(k);
+    if (name == nullptr) {
+      *error = true;
+      return false;
+    }
+    int truth = -2;
+    if (strcmp(name, "ensure_ascii") == 0 || strcmp(name, "allow_nan") == 0 ||
+        strcmp(name, "sort_keys") == 0 || strcmp(name, "skipkeys") == 0 ||
+        strcmp(name, "check_circular") == 0) {
+      truth = PyObject_IsTrue(v);
+      if (truth < 0) {
+        *error = true;
+        return false;
+      }
+    }
+    if (strcmp(name, "ensure_ascii") == 0) {
+      e.ensure_ascii = truth;
+    } else if (strcmp(name, "allow_nan") == 0) {
+      e.allow_nan = truth;
+    } else if (strcmp(name, "sort_keys") == 0) {
+      e.sort_keys = truth;
+    } else if (strcmp(name, "skipkeys") == 0) {
+      if (truth) {
+        return false;
+      }
+    } else if (strcmp(name, "check_circular") == 0) {
+      // Cycles go to json.dumps, which honors the flag.
+    } else if (strcmp(name, "default") == 0) {
+      if (v != Py_None) {
+        e.default_fn = v;
+      }
+    } else if (strcmp(name, "cls") == 0) {
+      if (v != Py_None) {
+        return false;
+      }
+    } else if (strcmp(name, "indent") == 0) {
+      indent = v;
+    } else if (strcmp(name, "separators") == 0) {
+      separators = v;
+    } else {
+      return false; // json.dumps passes other keywords to cls
+    }
+  }
+  if (indent != Py_None) {
+    e.has_indent = true;
+    e.item_sep = ",";
+    if (PyLong_Check(indent)) {
+      long n = PyLong_AsLong(indent);
+      if (n == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        return false;
+      }
+      e.indent.assign(n > 0 ? size_t(n) : 0, ' ');
+    } else if (PyUnicode_Check(indent)) {
+      Py_ssize_t n;
+      const char *s = PyUnicode_AsUTF8AndSize(indent, &n);
+      if (s == nullptr) {
+        PyErr_Clear();
+        return false;
+      }
+      e.indent.assign(s, size_t(n));
+    } else {
+      return false;
+    }
+  }
+  if (separators != Py_None) {
+    if (!(PyTuple_Check(separators) || PyList_Check(separators)) ||
+        PySequence_Fast_GET_SIZE(separators) != 2) {
+      return false;
+    }
+    PyObject *a = PySequence_Fast_GET_ITEM(separators, 0);
+    PyObject *b = PySequence_Fast_GET_ITEM(separators, 1);
+    if (!PyUnicode_Check(a) || !PyUnicode_Check(b)) {
+      return false;
+    }
+    Py_ssize_t na, nb;
+    const char *sa = PyUnicode_AsUTF8AndSize(a, &na);
+    const char *sb = PyUnicode_AsUTF8AndSize(b, &nb);
+    if (sa == nullptr || sb == nullptr) {
+      PyErr_Clear();
+      return false;
+    }
+    e.item_sep.assign(sa, size_t(na));
+    e.key_sep.assign(sb, size_t(nb));
+  }
+  // Separators and indentation are copied as UTF-8, so they decide whether
+  // the output can be built as an ASCII string.
+  e.ascii_output = e.ensure_ascii;
+  for (const std::string *s : {&e.item_sep, &e.key_sep, &e.indent}) {
+    for (char c : *s) {
+      if (uint8_t(c) >= 0x80) {
+        e.ascii_output = false;
+      }
+    }
+  }
+  return true;
+}
+
+PyObject *dumps_impl(PyObject *args, PyObject *kwargs) {
+  if (PyTuple_GET_SIZE(args) != 1) {
+    return fallback_dumps(args, kwargs);
+  }
+  Encoder e;
+  bool error;
+  if (!configure(e, kwargs, &error)) {
+    return error ? nullptr : fallback_dumps(args, kwargs);
+  }
+  e.out.reserve(256);
+  int rc = e.encode(PyTuple_GET_ITEM(args, 0));
+  if (rc == ENCODE_ERROR) {
+    return nullptr;
+  }
+  if (rc == ENCODE_FALLBACK) {
+    return fallback_dumps(args, kwargs);
+  }
+  if (e.ascii_output) {
+    PyObject *s = PyUnicode_New(Py_ssize_t(e.out.size()), 127);
+    if (s != nullptr) {
+      memcpy(PyUnicode_DATA(s), e.out.data(), e.out.size());
+    }
+    return s;
+  }
+  return PyUnicode_DecodeUTF8(e.out.data(), Py_ssize_t(e.out.size()), nullptr);
+}
+
+PyObject *dumps(PyObject *, PyObject *args, PyObject *kwargs) {
+  return dumps_impl(args, kwargs);
+}
+
+// dump(obj, fp, **kw): fp.write(dumps(obj, **kw)).
+PyObject *dump(PyObject *, PyObject *args, PyObject *kwargs) {
+  if (PyTuple_GET_SIZE(args) != 2) {
+    PyErr_SetString(PyExc_TypeError, "dump() takes exactly 2 positional arguments (obj, fp)");
+    return nullptr;
+  }
+  PyObject *obj_only = PyTuple_GetSlice(args, 0, 1);
+  if (obj_only == nullptr) {
+    return nullptr;
+  }
+  PyObject *s = dumps_impl(obj_only, kwargs);
+  Py_DECREF(obj_only);
+  if (s == nullptr) {
+    return nullptr;
+  }
+  PyObject *r = PyObject_CallMethod(PyTuple_GET_ITEM(args, 1), "write", "O", s);
+  Py_DECREF(s);
+  if (r == nullptr) {
+    return nullptr;
+  }
+  Py_DECREF(r);
+  Py_RETURN_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Files: load(fp), load_file(path), parse_file(path).
+// ---------------------------------------------------------------------------
+PyObject *load(PyObject *, PyObject *fp) {
+  PyObject *data = PyObject_CallMethod(fp, "read", nullptr);
+  if (data == nullptr) {
+    return nullptr;
+  }
+  PyObject *r = with_input<parse_buffer>(data);
+  Py_DECREF(data);
+  return r;
+}
+
+PyObject *io_open = nullptr;
+
+// The bytes of the file at path.
+PyObject *read_file(PyObject *path) {
+  PyObject *f = PyObject_CallFunction(io_open, "Os", path, "rb");
+  if (f == nullptr) {
+    return nullptr;
+  }
+  PyObject *data = PyObject_CallMethod(f, "read", nullptr);
+  PyObject *r = PyObject_CallMethod(f, "close", nullptr);
+  Py_DECREF(f);
+  if (r == nullptr) {
+    Py_XDECREF(data);
+    return nullptr;
+  }
+  Py_DECREF(r);
+  return data;
+}
+
+PyObject *load_file(PyObject *, PyObject *path) {
+  PyObject *data = read_file(path);
+  if (data == nullptr) {
+    return nullptr;
+  }
+  PyObject *r = with_input<parse_buffer>(data);
+  Py_DECREF(data);
+  return r;
+}
+
+PyObject *parse_file(PyObject *, PyObject *path) {
+  PyObject *data = read_file(path);
+  if (data == nullptr) {
+    return nullptr;
+  }
+  PyObject *r = with_input<parse_lazy_buffer>(data);
+  Py_DECREF(data);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Streams: loads_many(data) and parse_many(data) iterate over the documents
+// of a buffer: whitespace-separated documents (including NDJSON / JSON
+// Lines), one document per line, RFC 7464 sequences, comma-separated
+// documents, or the elements of one array.
+// ---------------------------------------------------------------------------
+using simdjson::dom::document_stream;
+
+PyTypeObject *StreamType = nullptr;
+PyObject *json_raw_decode = nullptr; // json._default_decoder.raw_decode
+
+struct StreamObject {
+  PyObject_HEAD
+  PyObject *source;               // the input object
+  simdjson::padded_string *copy;  // padded copy of the input, if needed
+  const char *buf;
+  size_t len;
+  size_t batch_size;
+  simdjson::stream_format format;
+  bool lazy;
+  bool done;
+  bool active;     // a simdjson stream is running from `base`
+  size_t base;     // offset of the running stream in buf
+  size_t last_end; // offset just past the last document returned
+  PyObject *text;  // the input as str, built on the error path
+  parser *p;
+  document_stream *stream;
+  document_stream::iterator it;
+};
+
+inline bool json_space(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+// Offset of the first byte at or after `at` that is neither white space nor
+// a separator of the stream format.
+size_t skip_separators(const char *buf, size_t len, size_t at,
+                       simdjson::stream_format fmt) {
+  using simdjson::stream_format;
+  for (; at < len; at++) {
+    char c = buf[at];
+    bool sep = json_space(c) ||
+               (fmt == stream_format::json_sequence && c == '\x1e') ||
+               ((fmt == stream_format::comma_delimited ||
+                 fmt == stream_format::comma_delimited_array) && c == ',') ||
+               (fmt == stream_format::comma_delimited_array && (c == '[' || c == ']'));
+    if (!sep) {
+      break;
+    }
+  }
+  return at;
+}
+
+// Number of code points in the UTF-8 bytes [0, n).
+Py_ssize_t char_index(const char *s, size_t n) {
+  Py_ssize_t count = 0;
+  for (size_t i = 0; i < n; i++) {
+    count += (uint8_t(s[i]) & 0xC0) != 0x80;
+  }
+  return count;
+}
+
+// Byte offset of the code point that follows `chars` code points from
+// byte offset `from`.
+size_t byte_offset(const char *s, size_t len, size_t from, Py_ssize_t chars) {
+  size_t i = from;
+  while (chars > 0 && i < len) {
+    i++;
+    while (i < len && (uint8_t(s[i]) & 0xC0) == 0x80) {
+      i++;
+    }
+    chars--;
+  }
+  return i;
+}
+
+PyObject *stream_text(StreamObject *s) {
+  if (s->text == nullptr) {
+    s->text = PyUnicode_Check(s->source)
+                  ? Py_NewRef(s->source)
+                  : PyUnicode_DecodeUTF8(s->buf, Py_ssize_t(s->len), nullptr);
+  }
+  return s->text;
+}
+
+// Raises JSONDecodeError at byte offset pos of the input.
+void stream_error(StreamObject *s, const char *msg, size_t pos) {
+  PyObject *text = stream_text(s);
+  if (text == nullptr) {
+    return;
+  }
+  PyObject *exc = PyObject_CallFunction(JSONDecodeError, "sOn", msg, text,
+                                        char_index(s->buf, pos));
+  if (exc != nullptr) {
+    PyErr_SetObject(JSONDecodeError, exc);
+    Py_DECREF(exc);
+  }
+}
+
+// Number of bytes that parse_many skips at the start of buf: a UTF-8 byte
+// order mark, and for the array format, white space and the '['. The
+// offsets that the stream reports are relative to what follows.
+size_t stripped_prefix(const char *buf, size_t len, simdjson::stream_format fmt) {
+  size_t i = 0;
+  if (len >= 3 && memcmp(buf, "\xEF\xBB\xBF", 3) == 0) {
+    i = 3;
+  }
+  if (fmt == simdjson::stream_format::comma_delimited_array) {
+    while (i < len && json_space(buf[i])) {
+      i++;
+    }
+    if (i < len && buf[i] == '[') {
+      i++;
+    }
+  }
+  return i;
+}
+
+bool stream_start(StreamObject *s, size_t at) {
+  delete s->stream;
+  s->stream = new (std::nothrow) document_stream();
+  if (s->stream == nullptr) {
+    PyErr_NoMemory();
+    return false;
+  }
+  auto r = s->p->parse_many(reinterpret_cast<const uint8_t *>(s->buf) + at,
+                            s->len - at, s->batch_size, s->format);
+  simdjson::error_code err = std::move(r).get(*s->stream);
+  if (err) {
+    stream_error(s, simdjson::error_message(err), at);
+    return false;
+  }
+  s->it = s->stream->begin();
+  s->base = at + stripped_prefix(s->buf + at, s->len - at, s->format);
+  s->active = true;
+  return true;
+}
+
+// A copy of the parser's current document, owning its own buffers.
+document *copy_document(const document &src) {
+  const uint64_t *tape = src.tape.get();
+  // The root entry holds the index just past the last tape entry.
+  size_t n = size_t(tape[0] & simdjson::internal::JSON_VALUE_MASK);
+  size_t strings = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t type = uint8_t(tape[i] >> 56);
+    if (type == '"' || type == 'Z') {
+      size_t idx = size_t(tape[i] & simdjson::internal::JSON_VALUE_MASK);
+      uint32_t l;
+      memcpy(&l, src.string_buf.get() + idx, sizeof(l));
+      strings = std::max(strings, idx + sizeof(uint32_t) + l + 1);
+    } else if (type == 'l' || type == 'u' || type == 'd') {
+      i++;
+    }
+  }
+  document *d = new (std::nothrow) document();
+  if (d == nullptr) {
+    return nullptr;
+  }
+  d->tape.reset(new (std::nothrow) uint64_t[n]);
+  d->string_buf.reset(new (std::nothrow) uint8_t[strings + simdjson::SIMDJSON_PADDING]());
+  if (!d->tape || !d->string_buf) {
+    delete d;
+    return nullptr;
+  }
+  memcpy(d->tape.get(), tape, n * sizeof(uint64_t));
+  memcpy(d->string_buf.get(), src.string_buf.get(), strings);
+  return d;
+}
+
+PyObject *stream_value(StreamObject *s) {
+  if (!s->lazy) {
+    Builder b{s->p->doc.tape.get(), s->p->doc.string_buf.get(),
+              g_thread_parser.key_cache, g_thread_parser.value_cache};
+    return build_with_gc_paused(b, 1);
+  }
+  document *d = copy_document(s->p->doc);
+  if (d == nullptr) {
+    return PyErr_NoMemory();
+  }
+  DocumentObject *owner = PyObject_New(DocumentObject, DocumentType);
+  if (owner == nullptr) {
+    delete d;
+    return nullptr;
+  }
+  owner->doc = d;
+  PyObject *root = value_at(owner, 1);
+  Py_DECREF(owner);
+  return root;
+}
+
+// simdjson rejected the document after last_end. For whitespace-separated
+// documents, json decides, as in loads: return the value it accepts and
+// resume after it, or raise its error.
+PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
+  size_t at = s->last_end;
+  while (at < s->len && json_space(s->buf[at])) {
+    at++;
+  }
+  if (s->format != simdjson::stream_format::whitespace_delimited &&
+      s->format != simdjson::stream_format::newline_delimited) {
+    stream_error(s, simdjson::error_message(err), at);
+    return nullptr;
+  }
+  PyObject *text = stream_text(s);
+  if (text == nullptr) {
+    return nullptr;
+  }
+  Py_ssize_t start = char_index(s->buf, at);
+  PyObject *r = PyObject_CallFunction(json_raw_decode, "On", text, start);
+  if (r == nullptr) {
+    if (PyErr_ExceptionMatches(json_JSONDecodeError)) {
+      // Re-raise as fastsimdjson.JSONDecodeError, like loads.
+      PyObject *typ, *val, *tb;
+      PyErr_Fetch(&typ, &val, &tb);
+      PyErr_NormalizeException(&typ, &val, &tb);
+      PyObject *msg = PyObject_GetAttrString(val, "msg");
+      PyObject *pos = PyObject_GetAttrString(val, "pos");
+      if (msg != nullptr && pos != nullptr) {
+        PyObject *exc = PyObject_CallFunction(JSONDecodeError, "OOO", msg, text, pos);
+        if (exc != nullptr) {
+          Py_XDECREF(typ);
+          Py_XDECREF(val);
+          Py_XDECREF(tb);
+          typ = Py_NewRef(JSONDecodeError);
+          val = exc;
+          tb = nullptr;
+        }
+      }
+      Py_XDECREF(msg);
+      Py_XDECREF(pos);
+      PyErr_Restore(typ, val, tb);
+    }
+    return nullptr;
+  }
+  PyObject *value = Py_NewRef(PyTuple_GET_ITEM(r, 0));
+  Py_ssize_t end = PyLong_AsSsize_t(PyTuple_GET_ITEM(r, 1));
+  Py_DECREF(r);
+  if (end < 0) {
+    Py_DECREF(value);
+    return nullptr;
+  }
+  s->last_end = byte_offset(s->buf, s->len, at, end - start);
+  s->active = false; // resume with simdjson after this document
+  // As with parse(), a document that only json accepts is returned as plain
+  // Python objects.
+  return value;
+}
+
+PyObject *stream_next_locked(StreamObject *s) {
+  for (;;) {
+    if (s->done) {
+      return nullptr;
+    }
+    if (!s->active) {
+      size_t at = s->last_end;
+      while (at < s->len && json_space(s->buf[at])) {
+        at++;
+      }
+      if (skip_separators(s->buf, s->len, at, s->format) >= s->len) {
+        s->done = true;
+        return nullptr;
+      }
+      if (!stream_start(s, s->last_end)) {
+        s->done = true;
+        return nullptr;
+      }
+    }
+    if (!(s->it != s->stream->end())) {
+      s->done = true;
+      // truncated_bytes() is not reliable for every format: look at what
+      // follows the last document instead.
+      if (skip_separators(s->buf, s->len, s->last_end, s->format) < s->len) {
+        // An incomplete document at the end: let json report it.
+        s->active = false;
+        s->done = false;
+        PyObject *v = stream_fallback(s, simdjson::TAPE_ERROR);
+        if (v == nullptr) {
+          s->done = true;
+        }
+        return v;
+      }
+      return nullptr;
+    }
+    simdjson::dom::element el;
+    simdjson::error_code err = (*s->it).get(el);
+    if (!err) {
+      size_t end = s->base + s->it.current_index() + s->it.source().size();
+      PyObject *v = stream_value(s);
+      if (v == nullptr) {
+        s->done = true;
+        return nullptr;
+      }
+      s->last_end = end;
+      ++s->it;
+      return v;
+    }
+    if (err == simdjson::CAPACITY && s->batch_size < s->len) {
+      // A document larger than the batch: restart there with larger batches.
+      s->batch_size = std::min(s->len, s->batch_size * 4);
+      s->active = false;
+      continue;
+    }
+    PyObject *v = stream_fallback(s, err);
+    if (v == nullptr) {
+      s->done = true;
+    }
+    return v;
+  }
+}
+
+PyObject *stream_next(PyObject *self) {
+  PyObject *r;
+  Py_BEGIN_CRITICAL_SECTION(self);
+  r = stream_next_locked(reinterpret_cast<StreamObject *>(self));
+  Py_END_CRITICAL_SECTION();
+  return r;
+}
+
+void stream_dealloc(PyObject *self) {
+  StreamObject *s = reinterpret_cast<StreamObject *>(self);
+  PyTypeObject *tp = Py_TYPE(self);
+  s->it.~iterator();
+  delete s->stream;
+  delete s->p;
+  delete s->copy;
+  Py_XDECREF(s->source);
+  Py_XDECREF(s->text);
+  PyObject_Free(self);
+  Py_DECREF(tp);
+}
+
+PyType_Slot stream_slots[] = {
+    {Py_tp_dealloc, reinterpret_cast<void *>(stream_dealloc)},
+    {Py_tp_iter, reinterpret_cast<void *>(PyObject_SelfIter)},
+    {Py_tp_iternext, reinterpret_cast<void *>(stream_next)},
+    {0, nullptr},
+};
+
+PyType_Spec stream_spec = {
+    "fastsimdjson._Stream", sizeof(StreamObject), 0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION, stream_slots,
+};
+
+PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
+  static const char *kwlist[] = {"data", "format", "batch_size", nullptr};
+  PyObject *data;
+  const char *format = "whitespace";
+  Py_ssize_t batch_size = Py_ssize_t(simdjson::dom::DEFAULT_BATCH_SIZE);
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|$sn",
+                                   const_cast<char **>(kwlist), &data, &format,
+                                   &batch_size)) {
+    return nullptr;
+  }
+  simdjson::stream_format fmt;
+  if (strcmp(format, "whitespace") == 0) {
+    fmt = simdjson::stream_format::whitespace_delimited;
+  } else if (strcmp(format, "lines") == 0) {
+    fmt = simdjson::stream_format::newline_delimited;
+  } else if (strcmp(format, "json_seq") == 0) {
+    fmt = simdjson::stream_format::json_sequence;
+  } else if (strcmp(format, "comma") == 0) {
+    fmt = simdjson::stream_format::comma_delimited;
+  } else if (strcmp(format, "array") == 0) {
+    fmt = simdjson::stream_format::comma_delimited_array;
+  } else {
+    PyErr_Format(PyExc_ValueError,
+                 "format must be 'whitespace', 'lines', 'json_seq', 'comma' or "
+                 "'array', not '%s'", format);
+    return nullptr;
+  }
+  if (batch_size < 64) {
+    PyErr_SetString(PyExc_ValueError, "batch_size must be at least 64");
+    return nullptr;
+  }
+  const char *buf = nullptr;
+  Py_ssize_t len = 0;
+  bool must_copy = false;
+  if (PyBytes_Check(data)) {
+    buf = PyBytes_AS_STRING(data);
+    len = PyBytes_GET_SIZE(data);
+  } else if (PyUnicode_Check(data)) {
+    buf = PyUnicode_AsUTF8AndSize(data, &len);
+    if (buf == nullptr) {
+      return nullptr;
+    }
+  } else if (PyByteArray_Check(data) || PyMemoryView_Check(data)) {
+    must_copy = true; // mutable: parse a copy
+  } else {
+    PyErr_Format(PyExc_TypeError,
+                 "Input must be bytes, bytearray, memoryview, or str, not %.200s",
+                 Py_TYPE(data)->tp_name);
+    return nullptr;
+  }
+  StreamObject *s = PyObject_New(StreamObject, StreamType);
+  if (s == nullptr) {
+    return nullptr;
+  }
+  s->source = nullptr;
+  s->copy = nullptr;
+  s->text = nullptr;
+  s->stream = nullptr;
+  s->p = nullptr;
+  new (&s->it) document_stream::iterator();
+  s->format = fmt;
+  s->batch_size = size_t(batch_size);
+  s->lazy = lazy;
+  s->done = false;
+  s->active = false;
+  s->base = 0;
+  s->last_end = 0;
+  PyObject *self = reinterpret_cast<PyObject *>(s);
+  if (must_copy) {
+    PyObject *b = PyBytes_FromObject(data);
+    if (b == nullptr) {
+      Py_DECREF(self);
+      return nullptr;
+    }
+    s->source = b;
+    buf = PyBytes_AS_STRING(b);
+    len = PyBytes_GET_SIZE(b);
+  } else {
+    s->source = Py_NewRef(data);
+  }
+  if (needs_unpadded(buf, size_t(len))) {
+    s->copy = new (std::nothrow) simdjson::padded_string(buf, size_t(len));
+    if (s->copy == nullptr) {
+      Py_DECREF(self);
+      return PyErr_NoMemory();
+    }
+    buf = s->copy->data();
+  }
+  s->buf = buf;
+  s->len = size_t(len);
+  if (fmt != simdjson::stream_format::whitespace_delimited &&
+      fmt != simdjson::stream_format::newline_delimited && s->batch_size < s->len) {
+    // A restart in the middle of the input would miss a separator, so one
+    // batch covers the whole input.
+    s->batch_size = s->len;
+  }
+  s->p = new (std::nothrow) parser();
+  if (s->p == nullptr) {
+    Py_DECREF(self);
+    return PyErr_NoMemory();
+  }
+  s->p->number_as_string(true);
+  return self;
+}
+
+PyObject *loads_many(PyObject *, PyObject *args, PyObject *kwargs) {
+  return make_stream(args, kwargs, false);
+}
+
+PyObject *parse_many(PyObject *, PyObject *args, PyObject *kwargs) {
+  return make_stream(args, kwargs, true);
+}
+
 // Benchmarking helper: run simdjson without building Python objects.
 PyObject *parse_only(PyObject *, PyObject *arg) {
   if (!PyBytes_Check(arg)) {
@@ -1318,6 +2482,21 @@ PyObject *release(PyObject *, PyObject *) {
 PyMethodDef methods[] = {
     {"_parse_only", parse_only, METH_O, "Parse without building objects."},
     {"loads", loads, METH_O, "Deserialize JSON to Python objects."},
+    {"dumps", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumps)),
+     METH_VARARGS | METH_KEYWORDS,
+     "Serialize obj to a JSON str. Same arguments and output as json.dumps."},
+    {"dump", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dump)),
+     METH_VARARGS | METH_KEYWORDS,
+     "Serialize obj as JSON to fp (a file with a write method), like json.dump."},
+    {"load", load, METH_O, "Deserialize JSON from fp (a file with a read method), like json.load."},
+    {"load_file", load_file, METH_O, "Deserialize the JSON file at path, like loads."},
+    {"parse_file", parse_file, METH_O, "Parse the JSON file at path lazily, like parse."},
+    {"loads_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(loads_many)),
+     METH_VARARGS | METH_KEYWORDS,
+     "Iterate over the JSON documents of data (NDJSON, JSON Lines, ...), like loads."},
+    {"parse_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(parse_many)),
+     METH_VARARGS | METH_KEYWORDS,
+     "Iterate over the JSON documents of data lazily, like parse."},
     {"parse", parse, METH_O,
      "Parse JSON lazily: objects and arrays are returned as read-only views "
      "(Object, Array) whose values are converted on access."},
@@ -1336,10 +2515,25 @@ int exec_fastsimdjson(PyObject *module) {
     }
     json_JSONDecodeError = PyObject_GetAttrString(json, "JSONDecodeError");
     json_loads = PyObject_GetAttrString(json, "loads");
+    json_dumps = PyObject_GetAttrString(json, "dumps");
+    PyObject *decoder = PyObject_GetAttrString(json, "_default_decoder");
+    if (decoder != nullptr) {
+      json_raw_decode = PyObject_GetAttrString(decoder, "raw_decode");
+      Py_DECREF(decoder);
+    }
+    PyObject *io = PyImport_ImportModule("io");
+    if (io != nullptr) {
+      io_open = PyObject_GetAttrString(io, "open");
+      Py_DECREF(io);
+    }
     Py_DECREF(json);
-    if (json_JSONDecodeError == nullptr || json_loads == nullptr) {
+    if (json_JSONDecodeError == nullptr || json_loads == nullptr ||
+        json_dumps == nullptr || json_raw_decode == nullptr || io_open == nullptr) {
       Py_CLEAR(json_JSONDecodeError);
       Py_CLEAR(json_loads);
+      Py_CLEAR(json_dumps);
+      Py_CLEAR(json_raw_decode);
+      Py_CLEAR(io_open);
       return -1;
     }
   }
@@ -1353,6 +2547,12 @@ int exec_fastsimdjson(PyObject *module) {
   }
   if (PyModule_AddObjectRef(module, "JSONDecodeError", JSONDecodeError) < 0) {
     return -1;
+  }
+  if (StreamType == nullptr) {
+    StreamType = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(&stream_spec));
+    if (StreamType == nullptr) {
+      return -1;
+    }
   }
   return add_lazy_types(module);
 }
