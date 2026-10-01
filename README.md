@@ -18,6 +18,36 @@ the exception is re-raised with Python's message and byte position. Any other
 exception from `json.loads` propagates. `release()` frees the simdjson parser
 and the string caches kept by the calling thread.
 
+## Lazy parsing
+
+When you need only part of a document, `parse` avoids building the rest.
+It accepts the same inputs as `loads` and returns read-only views:
+`fastsimdjson.Object` (a `Mapping`) and `fastsimdjson.Array` (a
+`Sequence`). Values are converted when you access them; nested objects and
+arrays are returned as views. A scalar root is returned as a plain value.
+
+```python
+doc = fastsimdjson.parse(open("twitter.json", "rb").read())
+ids = [(s["id"], s["user"]["screen_name"]) for s in doc["statuses"]]
+doc.at_pointer("/statuses/0/user/name")   # JSON Pointer (RFC 6901)
+doc["search_metadata"].as_dict()          # convert a subtree, like loads
+```
+
+`Object` supports `obj[key]`, `get`, `in`, `len`, iteration over the keys,
+`keys()`, `values()`, `items()` (iterators), `at_pointer` and `as_dict()`.
+`Array` supports `arr[i]` (negative indexes and slices), `len`, iteration,
+`at_pointer` and `as_list()`. Both work with `match` statements.
+
+* A view keeps its document alive; the document owns its own buffers, so
+  it remains valid while other documents are parsed.
+* A key lookup scans the object. With duplicate keys, lookups return the
+  first value, whereas `as_dict()` (like `json.loads`) keeps the last.
+* Indexing an array walks it from the last index reached, so a loop over
+  `arr[i]` is linear; iteration is the fastest way to visit an array.
+* A document that simdjson rejects but `json.loads` accepts (an overflowing
+  number, an unpaired surrogate) is returned as plain Python objects, as
+  `loads` would return it.
+
 ## How it works
 
 1. simdjson's DOM parser (with runtime CPU dispatch: AVX-512, AVX2, SSE4.2, ...)
