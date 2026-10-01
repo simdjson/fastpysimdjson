@@ -81,7 +81,7 @@ accepts it, so `loads` returns that string. A leading UTF-8 BOM is accepted.
 
 ## Build and test
 
-Python 3.10 or newer, and a C++17 compiler (clang or GCC). The simdjson 5.0.1
+Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson 5.0.2
 and simdutf 9.2.1 amalgamations are already in `vendor/`.
 
 pip:
