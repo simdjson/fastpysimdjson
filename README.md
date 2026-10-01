@@ -1,24 +1,41 @@
 # fastsimdjson
 
 A Python binding for [simdjson](https://github.com/simdjson/simdjson) that
-parses JSON into native Python objects (`dict`, `list`, `str`, `int`, `float`,
-`bool`, `None`). It is intended as a faster drop-in for `orjson.loads` /
-`json.loads`.
+parses JSON into native Python objects (`dict`, `list`, `str`, `int`,
+`float`, `bool`, `None`). It is a drop-in replacement for `json.loads`, and
+it can be over 3 times faster than the standard `json.loads`. When you only
+need part of a document, its lazy `parse` function is faster still.
+
+```sh
+pip install fastsimdjson
+```
+
+Wheels are available for Linux, macOS and Windows, for Python 3.10 to 3.14,
+including free-threaded Python 3.14.
+
+## Usage
+
+### `loads`: the whole document
 
 ```python
 import fastsimdjson
 fastsimdjson.loads(b'{"a": [1, 2.5, "x", true, null]}')
+# {'a': [1, 2.5, 'x', True, None]}
 ```
 
-`loads` accepts `bytes`, `bytearray`, `memoryview` and `str`. Invalid input
-raises `fastsimdjson.JSONDecodeError`, a subclass of `json.JSONDecodeError`.
-When simdjson rejects a document, the same input is parsed with `json.loads`.
-If that succeeds, `loads` returns its value. If it raises `JSONDecodeError`,
-the exception is re-raised with Python's message and byte position. Any other
-exception from `json.loads` propagates. `release()` frees the simdjson parser
-and the string caches kept by the calling thread.
+`loads(data)` accepts `bytes`, `bytearray`, `memoryview` and `str`, and
+returns the same value as `json.loads`, with the same types and key order.
+Integers that do not fit in 64 bits become exact Python ints. `NaN`,
+`Infinity` and `-Infinity` are accepted, in any capitalization.
 
-## Lazy parsing
+Invalid input raises `fastsimdjson.JSONDecodeError`, a subclass of
+`json.JSONDecodeError`. When simdjson rejects a document, the same input is
+parsed with `json.loads`. If that succeeds, `loads` returns its value (this
+is how a number that overflows a double becomes `inf`). If it raises
+`JSONDecodeError`, the exception is re-raised with Python's message and byte
+position. Any other exception from `json.loads` propagates.
+
+### `parse`: lazy views
 
 When you need only part of a document, `parse` avoids building the rest.
 It accepts the same inputs as `loads` and returns read-only views:
@@ -44,40 +61,14 @@ doc["search_metadata"].as_dict()          # convert a subtree, like loads
   first value, whereas `as_dict()` (like `json.loads`) keeps the last.
 * Indexing an array walks it from the last index reached, so a loop over
   `arr[i]` is linear; iteration is the fastest way to visit an array.
-* A document that simdjson rejects but `json.loads` accepts (an overflowing
-  number, an unpaired surrogate) is returned as plain Python objects, as
-  `loads` would return it.
+* Errors are handled as in `loads`. A document that simdjson rejects but
+  `json.loads` accepts (an overflowing number, an unpaired surrogate) is
+  returned as plain Python objects, as `loads` would return it.
 
-## How it works
+### `release`
 
-1. simdjson's DOM parser (with runtime CPU dispatch: AVX-512, AVX2, SSE4.2, ...)
-   validates the document and builds its tape. Each thread keeps its own
-   parser and reuses it across calls; `release()` deletes that parser and
-   drops the thread's cached strings. The document is parsed in place. When
-   the 64 bytes simdjson would read past the end cross a page boundary, the
-   unpadded DOM parser is used instead of copying the buffer.
-2. A tape walker creates the Python objects directly:
-   * lists are allocated at their final size (simdjson records element counts);
-     scalars are handled inline in the array/object loops;
-   * dicts are presized and filled with `_PyDict_SetItem_KnownHash`;
-   * object keys go through a direct-mapped cache (ASCII keys of up to 64
-     bytes), so repeated keys reuse one `str` object whose hash is already
-     computed. Short ASCII string values (up to 16 bytes) have their own cache.
-     Both caches belong to the calling thread;
-   * strings are built with `PyUnicode_New` plus a copy. Non-ASCII UTF-8,
-     which simdjson has already validated, is transcoded without
-     revalidation: scalar code for short strings, simdutf for long ones;
-   * on builds that use the GIL, the cyclic GC is paused while objects are built.
-3. Integers that do not fit in 64 bits stay on the tape as digit strings and
-   become exact Python ints (orjson turns them into floats).
-
-`NaN`, `Infinity`, and `-Infinity` parse as floats, matching `json.loads`.
-simdjson is built with `SIMDJSON_ENABLE_NAN_INF`, so any capitalization of
-`nan`, `inf`, and `infinity` is also accepted (Python's parser only allows
-the three spellings above). A number that overflows a double becomes
-`inf`, via `json.loads`, because simdjson still rejects it. An unpaired
-surrogate escape (`"\ud800"`) is also rejected by simdjson; `json.loads`
-accepts it, so `loads` returns that string. A leading UTF-8 BOM is accepted.
+`release()` frees the simdjson parser and the string caches kept by the
+calling thread. Views returned by `parse` remain valid.
 
 ## Build and test
 
@@ -126,7 +117,7 @@ Recent setuptools copies the `.so` next to `src/fastsimdjson.cpp`, which is
 why `PYTHONPATH=src` is required for the in-place build.
 
 `tests/test_loads.py` compares `loads` with `json.loads` on types and key
-order. It covers scalars, integers past 64 bits, UTF-8 strings at every
+order; `tests/test_lazy.py` checks the views returned by `parse` the same way. It covers scalars, integers past 64 bits, UTF-8 strings at every
 length from 0 to 199, the key cache, random documents, rejected input, deep
 nesting, padding at a page boundary, a saturated array count, reference
 counts, and release of a parser that has grown past 64 MB. The corpus test
@@ -141,7 +132,8 @@ pytest tests
 The suite builds an ~80 MB document and a list of 16,777,221 integers, so
 give it some RAM.
 
-To time `loads` against `json.loads` and orjson on those files:
+To time `loads` against `json.loads` and orjson on those files
+(`bench_lazy.py` times `parse` against pysimdjson and cysimdjson):
 
 ```sh
 python -m pip install -e ".[bench]"
@@ -155,59 +147,81 @@ python bench.py
 
 ## Benchmarks
 
-Full materialization of `simdjson-data` on an Intel Xeon Gold 6548N, pinned
-to one core. Python 3.12.13, GCC, `json.loads`, orjson 3.12.0, yyjson 4.0.6,
-cysimdjson 26.27 (simdjson 3.8.0, AVX-512), pysimdjson 7.0.2 (icelake,
-AVX-512). Times are microseconds, the best of several runs. Speedup is
-orjson time / fastsimdjson time.
+Intel Xeon Gold 6548N (Emerald Rapids), one core, Python 3.14.6,
+fastsimdjson 0.2.0, the 22 files of
+[simdjson-data](https://github.com/simdjson/simdjson-data). The scripts and
+the full results are in
+[the blog repository](https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/tree/master/2026/09/pysimdjson).
 
-cysimdjson is `JSONParser.parse(data).export()` and pysimdjson is
-`Parser.parse(data, recursive=True)`. `yyjson.loads` is `Document.as_obj`.
-fastsimdjson, `json.loads`, cysimdjson, and pysimdjson matched orjson on
-every file, including types and key order.
+### Whole documents
 
-Geomean speedup of fastsimdjson: 3.38× over `json.loads`, 1.27× over orjson,
-1.39× over yyjson, 1.83× over cysimdjson, and 1.79× over pysimdjson. It was
-the fastest on 21 files. `numbers.json`, a flat array of floats, is the loss
-against orjson (0.95×): the time is simdjson's float parser plus allocating
-Python floats. `json.loads` is slowest on every file; the gap is largest on
-`canada.json` (about 5.8×).
+Each parser produces the whole document as Python objects. Speed is the
+geometric mean over the 22 files (higher is better).
 
-yyjson 4.0.6 returns non-ASCII strings as the raw UTF-8 bytes stored in a
-Latin-1 `str`. Twelve files therefore do not match orjson (the twitter
-files, `citm_catalog`, `gsoc-2018`, `github_events`, `random`, `repeat`,
-`semanticscholar-corpus`, and `update-center`). Those yyjson times skip a
-real UTF-8 decode. fastsimdjson is still ahead on the ten files where the
-values match.
+| parser | GB/s | vs `json.loads` |
+|---|---:|---:|
+| json (standard library) | 0.22 | 1.00× |
+| simplejson 4.1.2 | 0.23 | 1.05× |
+| python-rapidjson 1.25 | 0.24 | 1.10× |
+| ujson 6.0.0 | 0.36 | 1.65× |
+| cysimdjson 26.27 | 0.43 | 1.94× |
+| pysimdjson 7.0.2 | 0.44 | 1.98× |
+| msgspec 0.22.0 | 0.53 | 2.41× |
+| orjson 3.12.0 | 0.60 | 2.73× |
+| **fastsimdjson `loads`** | **0.77** | **3.49×** |
 
-| file | KB | json | orjson | fast | yyjson | cys | psy | speedup |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| apache_builds.json | 124 | 383.2 | 180.7 | 153.9 | 205.9 | 263.1 | 264.8 | 1.17 |
-| canada.json | 2198 | 30404.4 | 6518.2 | 5248.1 | 5552.2 | 7894.4 | 7348.4 | 1.24 |
-| citm_catalog.json | 1687 | 7295.1 | 2934.6 | 1775.7 | 2554.0 | 4321.0 | 4206.3 | 1.65 |
-| github_events.json | 64 | 216.1 | 68.5 | 55.6 | 82.8 | 98.5 | 97.7 | 1.23 |
-| google_maps_api_compact_response.json | 12 | 80.3 | 39.7 | 33.6 | 47.3 | 55.6 | 56.5 | 1.18 |
-| google_maps_api_response.json | 25 | 93.6 | 43.4 | 34.8 | 52.1 | 56.9 | 57.7 | 1.25 |
-| gsoc-2018.json | 3250 | 7039.9 | 3889.8 | 2280.5 | 2968.0 | 3569.8 | 3611.0 | 1.71 |
-| instruments.json | 215 | 848.4 | 319.3 | 239.1 | 405.1 | 478.6 | 500.7 | 1.34 |
-| marine_ik.json | 2914 | 23662.6 | 9301.2 | 7272.7 | 8548.5 | 12315.3 | 11046.9 | 1.28 |
-| mesh.json | 707 | 5093.0 | 1712.2 | 1493.1 | 1685.6 | 2269.3 | 2074.4 | 1.15 |
-| mesh.pretty.json | 1540 | 8382.9 | 2435.5 | 1674.3 | 2185.0 | 2548.5 | 2309.9 | 1.45 |
-| numbers.json | 147 | 914.3 | 221.4 | 232.3 | 260.4 | 299.2 | 276.2 | 0.95 |
-| random.json | 499 | 3107.1 | 1522.5 | 1292.4 | 1632.5 | 2571.5 | 2390.8 | 1.18 |
-| repeat.json | 11 | 43.9 | 15.3 | 13.0 | 16.7 | 30.5 | 24.1 | 1.18 |
-| semanticscholar-corpus.json | 8392 | 45587.1 | 20634.5 | 14113.1 | 18832.2 | 28079.0 | 26477.3 | 1.46 |
-| tree-pretty.json | 34 | 117.5 | 43.5 | 36.3 | 62.5 | 63.5 | 65.4 | 1.20 |
-| twitter.json | 617 | 2798.4 | 1017.4 | 715.4 | 1168.0 | 1771.2 | 1825.1 | 1.42 |
-| twitter_api_compact_response.json | 10 | 45.0 | 14.8 | 12.1 | 19.3 | 22.6 | 22.7 | 1.22 |
-| twitter_api_response.json | 15 | 60.3 | 17.4 | 13.9 | 23.4 | 26.2 | 26.4 | 1.25 |
-| twitter_timeline.json | 41 | 176.7 | 61.2 | 52.6 | 82.8 | 110.9 | 114.6 | 1.16 |
-| twitterescaped.json | 549 | 2308.5 | 1021.7 | 801.4 | 1184.0 | 1961.0 | 2030.3 | 1.27 |
-| update-center.json | 521 | 2675.8 | 1363.6 | 1119.1 | 1509.2 | 1982.1 | 2057.0 | 1.22 |
+fastsimdjson is the fastest on 21 of the 22 files; orjson is slightly faster
+on `numbers.json`, an array of floating-point numbers. Part of the gain comes
+from pausing the garbage collector while the objects are built: if the
+collector is disabled for every parser, fastsimdjson's lead over orjson drops
+from 1.28× to 1.18×. yyjson 4.0.6 is left out: it returns wrong strings for
+non-ASCII text.
+
+Parsing is no longer the bottleneck. simdjson alone parses these files at
+3.0 GB/s. It accounts for about a third of the time of `loads`; the rest goes
+into creating Python objects. Freeing those objects later costs about a sixth
+of the total. Even if parsing took no time at all, `loads` would be less than
+1.5 times faster.
+
+### Parts of documents with `parse`
+
+If you only need a few values, `parse` creates only those. Extracting the id
+and the screen name of the 100 statuses of `twitter.json`:
+
+| method | µs |
+|---|---:|
+| `json.loads` | 3879 |
+| orjson | 1008 |
+| fastsimdjson `loads` | 860 |
+| msgspec (typed `Struct`) | 336 |
+| cysimdjson (lazy) | 235 |
+| pysimdjson (lazy) | 183 |
+| **fastsimdjson `parse`** | **155** |
+
+Here `parse` is 25 times faster than `json.loads` and 5.5 times faster than
+`loads`. Most of its time is the simdjson parse itself: reading the 200
+values takes less than 20 µs. Compared with pysimdjson on other tasks
+(µs, lower is better):
+
+| file | task | fastsimdjson `parse` | fastsimdjson `loads` | pysimdjson |
+|---|---|---:|---:|---:|
+| twitter | open | 140 | 676 | 156 |
+| citm_catalog | open | 369 | 1612 | 472 |
+| citm_catalog | extract | 394 | 2142 | 504 |
+| gsoc-2018 | open | 615 | 2206 | 813 |
+| twitter | visit all | 1985 | 2183 | 3033 |
+| canada | visit all | 17528 | 18998 | 19750 |
+| twitter_api_response | open | 3.6 | 13.6 | 3.4 |
+
+"open" parses the document and looks at its root; "extract" collects the
+start time of every performance; "visit all" walks every value through the
+views (with `loads`: through the dict). When you visit everything, `parse`
+is about as fast as `loads`. On very small documents (15 KB), pysimdjson's
+`parse` is marginally faster.
 
 ## Limitations
 
-* Only `loads` is implemented; there is no `dumps`.
+* There is no `dumps`: fastsimdjson only parses JSON.
 * The simdjson parser and the key and string caches are thread-local.
   `release()` frees the parser and the cached strings retained by the calling
   thread. A parser that grows past 64 MB is freed on its own at the end of
