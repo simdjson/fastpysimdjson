@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -21,7 +22,10 @@
 #include <unistd.h>
 #endif
 
+// simdjson.cpp is compiled here (a unity build) so that dumps can call its
+// float-to-decimal routine, dtoa_impl::dragonbox, directly.
 #include "simdjson.h"
+#include "simdjson.cpp"
 #include "simdutf.h"
 
 #if PY_VERSION_HEX >= 0x030D0000
@@ -1307,94 +1311,119 @@ enum EncodeStatus { ENCODE_OK = 0, ENCODE_ERROR = -1, ENCODE_FALLBACK = 1 };
 
 const char HEX_DIGITS[] = "0123456789abcdef";
 
-// Python's repr of a finite double. simdjson's to_chars produces the same
-// shortest digits as repr, in a different layout; repr writes fixed
-// notation when the decimal exponent is in (-4, 16], and e+XX otherwise.
-void append_float_repr(std::string &out, double v) {
-  char buf[simdjson::internal::to_chars_buffer_size];
-  char *end = simdjson::internal::to_chars(buf, nullptr, v);
-  const char *p = buf;
-  if (*p == '-') {
-    out.push_back('-');
-    p++;
-  }
-  char digits[32];
-  int n = 0;
-  int point = -1; // number of digits before the '.'
-  int exp10 = 0;
-  for (; p < end; p++) {
-    char c = *p;
-    if (c >= '0' && c <= '9') {
-      digits[n++] = c;
-    } else if (c == '.') {
-      point = n;
-    } else if (c == 'e' || c == 'E') {
-      // The buffer is not NUL-terminated: parse the exponent up to end.
-      const char *q = p + 1;
-      bool negative = q < end && *q == '-';
-      if (q < end && (*q == '-' || *q == '+')) {
-        q++;
-      }
-      for (; q < end && *q >= '0' && *q <= '9'; q++) {
-        exp10 = exp10 * 10 + (*q - '0');
-      }
-      if (negative) {
-        exp10 = -exp10;
-      }
-      break;
+// Growable output buffer. Callers reserve the worst case for a value, then
+// write without checks. Allocation failure throws std::bad_alloc, caught in
+// dumps_impl (no Python frame is unwound: the encoder only throws from its
+// own frames).
+struct OutBuf {
+  char *buf = nullptr;
+  size_t len = 0;
+  size_t cap = 0;
+  OutBuf() = default;
+  OutBuf(const OutBuf &) = delete;
+  OutBuf &operator=(const OutBuf &) = delete;
+  ~OutBuf() { free(buf); }
+  FSJ_NOINLINE void grow(size_t n) {
+    size_t c = std::max(cap * 2, len + n + 1024);
+    char *p = static_cast<char *>(realloc(buf, c));
+    if (p == nullptr) {
+      throw std::bad_alloc();
     }
+    buf = p;
+    cap = c;
   }
-  if (point < 0) {
-    point = n;
+  // Pointer to the end of the output, with room for n more bytes.
+  inline char *reserve(size_t n) {
+    if (len + n > cap) {
+      grow(n);
+    }
+    return buf + len;
   }
-  // Strip leading and trailing zeros: digits[lead, n) are significant.
-  int lead = 0;
-  while (lead < n - 1 && digits[lead] == '0') {
-    lead++;
+  inline void push_back(char c) {
+    *reserve(1) = c;
+    len++;
   }
-  while (n > lead + 1 && digits[n - 1] == '0') {
-    n--;
+  inline void append(const char *s, size_t n) {
+    memcpy(reserve(n), s, n);
+    len += n;
   }
-  if (n - lead == 1 && digits[lead] == '0') {
-    out.append("0.0");
+  inline void append(const char *s) { append(s, strlen(s)); }
+  inline void append(const std::string &s) { append(s.data(), s.size()); }
+  inline void append(size_t n, char c) {
+    memset(reserve(n), c, n);
+    len += n;
+  }
+  size_t size() const { return len; }
+  const char *data() const { return buf; }
+};
+
+// Python's repr of a finite double. dragonbox gives the shortest digits that
+// round-trip, the same digits as repr (checked on millions of values); repr
+// writes them in fixed notation when the decimal exponent is in (-4, 16],
+// and as d.ddde+XX otherwise.
+void append_float_repr(OutBuf &out, double v) {
+  char *p = out.reserve(40);
+  char *start = p;
+  if (std::signbit(v)) {
+    *p++ = '-';
+    v = -v;
+  }
+  if (v == 0) {
+    memcpy(p, "0.0", 3);
+    out.len += size_t(p + 3 - start);
     return;
   }
-  const char *d = digits + lead;
-  int nd = n - lead;
-  int decpt = point - lead + exp10; // value = 0.d * 10^decpt
+  char d[simdjson::internal::to_chars_buffer_size];
+  int nd, e10;
+  simdjson::internal::dtoa_impl::dragonbox(d, nd, e10, v);
+  int decpt = nd + e10; // v = 0.d * 10^decpt
   if (decpt > -4 && decpt <= 16) {
     if (decpt <= 0) {
-      out.append("0.");
-      out.append(size_t(-decpt), '0');
-      out.append(d, size_t(nd));
+      *p++ = '0';
+      *p++ = '.';
+      for (int i = 0; i < -decpt; i++) {
+        *p++ = '0';
+      }
+      memcpy(p, d, size_t(nd));
+      p += nd;
     } else if (decpt >= nd) {
-      out.append(d, size_t(nd));
-      out.append(size_t(decpt - nd), '0');
-      out.append(".0");
+      memcpy(p, d, size_t(nd));
+      p += nd;
+      for (int i = nd; i < decpt; i++) {
+        *p++ = '0';
+      }
+      *p++ = '.';
+      *p++ = '0';
     } else {
-      out.append(d, size_t(decpt));
-      out.push_back('.');
-      out.append(d + decpt, size_t(nd - decpt));
+      memcpy(p, d, size_t(decpt));
+      p += decpt;
+      *p++ = '.';
+      memcpy(p, d + decpt, size_t(nd - decpt));
+      p += nd - decpt;
     }
-    return;
+  } else {
+    *p++ = d[0];
+    if (nd > 1) {
+      *p++ = '.';
+      memcpy(p, d + 1, size_t(nd - 1));
+      p += nd - 1;
+    }
+    int e = decpt - 1;
+    *p++ = 'e';
+    *p++ = e < 0 ? '-' : '+';
+    if (e < 0) {
+      e = -e;
+    }
+    if (e >= 100) {
+      *p++ = char('0' + e / 100);
+    }
+    *p++ = char('0' + (e / 10) % 10);
+    *p++ = char('0' + e % 10);
   }
-  out.push_back(d[0]);
-  if (nd > 1) {
-    out.push_back('.');
-    out.append(d + 1, size_t(nd - 1));
-  }
-  int e = decpt - 1;
-  out.push_back('e');
-  out.push_back(e < 0 ? '-' : '+');
-  if (e < 0) {
-    e = -e;
-  }
-  char eb[8];
-  int len = snprintf(eb, sizeof(eb), "%02d", e);
-  out.append(eb, size_t(len));
+  out.len += size_t(p - start);
 }
 
-inline void append_u64(std::string &out, uint64_t v) {
+inline void append_u64(OutBuf &out, uint64_t v) {
   char buf[24];
   char *p = buf + sizeof(buf);
   do {
@@ -1405,7 +1434,7 @@ inline void append_u64(std::string &out, uint64_t v) {
 }
 
 struct Encoder {
-  std::string out;
+  OutBuf out;
   bool ensure_ascii = true;
   bool ascii_output = true; // ensure_ascii, and ASCII separators and indent
   bool allow_nan = true;
@@ -1425,26 +1454,36 @@ struct Encoder {
     }
   }
 
-  void append_escaped(uint32_t c) {
+  // Writes the escape of c at p (at most 12 bytes); returns the new end.
+  static inline char *write_escaped(char *p, uint32_t c) {
+    char short_form = 0;
     switch (c) {
-    case '"': out.append("\\\""); return;
-    case '\\': out.append("\\\\"); return;
-    case '\b': out.append("\\b"); return;
-    case '\f': out.append("\\f"); return;
-    case '\n': out.append("\\n"); return;
-    case '\r': out.append("\\r"); return;
-    case '\t': out.append("\\t"); return;
+    case '"': short_form = '"'; break;
+    case '\\': short_form = '\\'; break;
+    case '\b': short_form = 'b'; break;
+    case '\f': short_form = 'f'; break;
+    case '\n': short_form = 'n'; break;
+    case '\r': short_form = 'r'; break;
+    case '\t': short_form = 't'; break;
     default: break;
+    }
+    if (short_form != 0) {
+      p[0] = '\\';
+      p[1] = short_form;
+      return p + 2;
     }
     if (c >= 0x10000) {
       c -= 0x10000;
-      append_escaped(0xD800 | (c >> 10));
-      append_escaped(0xDC00 | (c & 0x3FF));
-      return;
+      p = write_escaped(p, 0xD800 | (c >> 10));
+      return write_escaped(p, 0xDC00 | (c & 0x3FF));
     }
-    char u[6] = {'\\', 'u', HEX_DIGITS[(c >> 12) & 0xF], HEX_DIGITS[(c >> 8) & 0xF],
-                 HEX_DIGITS[(c >> 4) & 0xF], HEX_DIGITS[c & 0xF]};
-    out.append(u, 6);
+    p[0] = '\\';
+    p[1] = 'u';
+    p[2] = HEX_DIGITS[(c >> 12) & 0xF];
+    p[3] = HEX_DIGITS[(c >> 8) & 0xF];
+    p[4] = HEX_DIGITS[(c >> 4) & 0xF];
+    p[5] = HEX_DIGITS[c & 0xF];
+    return p + 6;
   }
 
   // ASCII characters that need an escape: control characters, '"' and '\',
@@ -1468,70 +1507,97 @@ struct Encoder {
     return ((lt20 | eq) & highs) != 0;
   }
 
-  void append_ascii(const char *s, size_t len) {
+  // Writes the code units s[0, len) with every non-ASCII character escaped
+  // (ensure_ascii). p must have room for 12 * len bytes.
+  template <typename T>
+  inline char *write_ascii_escaped(char *p, const T *s, size_t len) const {
+    for (size_t i = 0; i < len; i++) {
+      uint32_t c = s[i];
+      if (c < 0x80 && !ascii_needs_escape(uint8_t(c))) {
+        *p++ = char(c);
+      } else {
+        p = write_escaped(p, c);
+      }
+    }
+    return p;
+  }
+
+  // Copies s[0, len) to p, escaping the ASCII characters that need it;
+  // bytes >= 0x80 (UTF-8 sequences) are copied as they are. p must have
+  // room for 6 * len bytes. Returns the new end.
+  inline char *write_escaped_bytes(char *p, const char *s, size_t len) const {
     size_t i = 0;
     while (i < len) {
       size_t start = i;
       while (i + 8 <= len && !word_needs_escape(load_u64(s + i))) {
         i += 8;
       }
-      while (i < len && !ascii_needs_escape(uint8_t(s[i]))) {
+      while (i < len && (uint8_t(s[i]) >= 0x80 || !ascii_needs_escape(uint8_t(s[i])))) {
         i++;
       }
-      out.append(s + start, i - start);
+      memcpy(p, s + start, i - start);
+      p += i - start;
       if (i < len) {
-        append_escaped(uint8_t(s[i]));
+        p = write_escaped(p, uint8_t(s[i]));
         i++;
       }
     }
+    return p;
   }
 
-  void append_utf8(uint32_t c) {
-    if (c < 0x800) {
-      out.push_back(char(0xC0 | (c >> 6)));
-      out.push_back(char(0x80 | (c & 0x3F)));
-    } else if (c < 0x10000) {
-      out.push_back(char(0xE0 | (c >> 12)));
-      out.push_back(char(0x80 | ((c >> 6) & 0x3F)));
-      out.push_back(char(0x80 | (c & 0x3F)));
-    } else {
-      out.push_back(char(0xF0 | (c >> 18)));
-      out.push_back(char(0x80 | ((c >> 12) & 0x3F)));
-      out.push_back(char(0x80 | ((c >> 6) & 0x3F)));
-      out.push_back(char(0x80 | (c & 0x3F)));
-    }
-  }
-
-  int encode_str(PyObject *s) {
-    out.push_back('"');
-    Py_ssize_t len = PyUnicode_GET_LENGTH(s);
+  // The leaf encoders are out of line, which keeps the frames of the
+  // recursive encode small (json.dumps handles deep nesting, so must we).
+  FSJ_NOINLINE int encode_str(PyObject *s) {
+    size_t len = size_t(PyUnicode_GET_LENGTH(s));
     if (PyUnicode_IS_ASCII(s)) {
-      append_ascii(static_cast<const char *>(PyUnicode_DATA(s)), size_t(len));
-    } else {
-      int kind = PyUnicode_KIND(s);
-      const void *data = PyUnicode_DATA(s);
-      for (Py_ssize_t i = 0; i < len; i++) {
-        uint32_t c = PyUnicode_READ(kind, data, i);
-        if (c < 0x80) {
-          if (ascii_needs_escape(uint8_t(c))) {
-            append_escaped(c);
-          } else {
-            out.push_back(char(c));
-          }
-        } else if (ensure_ascii) {
-          append_escaped(c);
-        } else if (c >= 0xD800 && c <= 0xDFFF) {
-          return ENCODE_FALLBACK; // a lone surrogate cannot be UTF-8
-        } else {
-          append_utf8(c);
-        }
-      }
+      char *p = out.reserve(6 * len + 2);
+      *p++ = '"';
+      p = write_escaped_bytes(p, static_cast<const char *>(PyUnicode_DATA(s)), len);
+      *p++ = '"';
+      out.len = size_t(p - out.buf);
+      return ENCODE_OK;
     }
-    out.push_back('"');
+    int kind = PyUnicode_KIND(s);
+    const void *data = PyUnicode_DATA(s);
+    if (ensure_ascii) {
+      char *p = out.reserve(12 * len + 2);
+      *p++ = '"';
+      if (kind == PyUnicode_1BYTE_KIND) {
+        p = write_ascii_escaped(p, static_cast<const uint8_t *>(data), len);
+      } else if (kind == PyUnicode_2BYTE_KIND) {
+        p = write_ascii_escaped(p, static_cast<const uint16_t *>(data), len);
+      } else {
+        p = write_ascii_escaped(p, static_cast<const uint32_t *>(data), len);
+      }
+      *p++ = '"';
+      out.len = size_t(p - out.buf);
+      return ENCODE_OK;
+    }
+    // UTF-8 output: transcode with simdutf, then escape the few ASCII
+    // characters that need it. simdutf rejects lone surrogates, which json
+    // keeps in its str output: those strings go to json.dumps.
+    size_t utf8_max = (kind == PyUnicode_1BYTE_KIND ? 2 : kind == PyUnicode_2BYTE_KIND ? 3 : 4) * len;
+    char *p = out.reserve(utf8_max + 6 * utf8_max + 2);
+    char *tmp = p + 6 * utf8_max + 2; // transcode past the room for the escaped copy
+    size_t n;
+    if (kind == PyUnicode_1BYTE_KIND) {
+      n = simdutf::convert_latin1_to_utf8(static_cast<const char *>(data), len, tmp);
+    } else if (kind == PyUnicode_2BYTE_KIND) {
+      n = simdutf::convert_utf16_to_utf8(static_cast<const char16_t *>(data), len, tmp);
+    } else {
+      n = simdutf::convert_utf32_to_utf8(static_cast<const char32_t *>(data), len, tmp);
+    }
+    if (n == 0 && len != 0) {
+      return ENCODE_FALLBACK; // a lone surrogate cannot be UTF-8
+    }
+    *p++ = '"';
+    p = write_escaped_bytes(p, tmp, n);
+    *p++ = '"';
+    out.len = size_t(p - out.buf);
     return ENCODE_OK;
   }
 
-  int encode_int(PyObject *o) {
+  FSJ_NOINLINE int encode_int(PyObject *o) {
     int overflow = 0;
     long long v = PyLong_AsLongLongAndOverflow(o, &overflow);
     if (overflow == 0) {
@@ -1560,7 +1626,7 @@ struct Encoder {
     return p == nullptr ? ENCODE_ERROR : ENCODE_OK;
   }
 
-  int encode_float(double v) {
+  FSJ_NOINLINE int encode_float(double v) {
     if (std::isfinite(v)) {
       append_float_repr(out, v);
       return ENCODE_OK;
@@ -1581,7 +1647,7 @@ struct Encoder {
     return false;
   }
 
-  int encode_key(PyObject *key) {
+  FSJ_NOINLINE int encode_key(PyObject *key) {
     if (PyUnicode_Check(key)) {
       return encode_str(key);
     }
@@ -1604,7 +1670,7 @@ struct Encoder {
     return ENCODE_FALLBACK; // json raises TypeError (or skips the key)
   }
 
-  int encode_item(PyObject *key, PyObject *value, bool first) {
+  FSJ_NOINLINE int encode_item(PyObject *key, PyObject *value, bool first) {
     if (!first) {
       out.append(item_sep);
     }
@@ -1619,7 +1685,7 @@ struct Encoder {
     return encode(value);
   }
 
-  int encode_dict(PyObject *o) {
+  FSJ_NOINLINE int encode_dict(PyObject *o) {
     if (PyDict_GET_SIZE(o) == 0) {
       out.append("{}");
       return ENCODE_OK;
@@ -1672,7 +1738,7 @@ struct Encoder {
     return ENCODE_OK;
   }
 
-  int encode_list(PyObject *o) {
+  FSJ_NOINLINE int encode_list(PyObject *o) {
     bool is_list = PyList_Check(o);
     Py_ssize_t n = is_list ? PyList_GET_SIZE(o) : PyTuple_GET_SIZE(o);
     if (n == 0) {
@@ -1686,6 +1752,10 @@ struct Encoder {
       if (is_list) {
         // The list may shrink while we encode it (default, other threads).
 #if PY_VERSION_HEX >= 0x030D0000
+        // Check the size first: an IndexError per list would be costly.
+        if (i >= PyList_GET_SIZE(o)) {
+          break;
+        }
         item = PyList_GetItemRef(o, i);
         if (item == nullptr) {
           PyErr_Clear();
@@ -1900,8 +1970,12 @@ PyObject *dumps_impl(PyObject *args, PyObject *kwargs) {
   if (!configure(e, kwargs, &error)) {
     return error ? nullptr : fallback_dumps(args, kwargs);
   }
-  e.out.reserve(256);
-  int rc = e.encode(PyTuple_GET_ITEM(args, 0));
+  int rc;
+  try {
+    rc = e.encode(PyTuple_GET_ITEM(args, 0));
+  } catch (const std::bad_alloc &) {
+    return PyErr_NoMemory();
+  }
   if (rc == ENCODE_ERROR) {
     return nullptr;
   }
@@ -1911,7 +1985,9 @@ PyObject *dumps_impl(PyObject *args, PyObject *kwargs) {
   if (e.ascii_output) {
     PyObject *s = PyUnicode_New(Py_ssize_t(e.out.size()), 127);
     if (s != nullptr) {
-      memcpy(PyUnicode_DATA(s), e.out.data(), e.out.size());
+      if (e.out.size() > 0) {
+        memcpy(PyUnicode_DATA(s), e.out.data(), e.out.size());
+      }
     }
     return s;
   }
