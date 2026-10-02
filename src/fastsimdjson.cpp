@@ -44,6 +44,7 @@ extern "C" int _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key,
 
 namespace {
 
+using simdjson::dom::document;
 using simdjson::dom::parser;
 
 PyObject *JSONDecodeError = nullptr;
@@ -209,17 +210,27 @@ PyObject *decode_utf8(const char *str, size_t len) {
   return u;
 }
 
+// A str from ASCII bytes.
+inline PyObject *new_ascii(const char *s, size_t len) {
+  PyObject *u = PyUnicode_New(Py_ssize_t(len), 127);
+  if (u != nullptr && len != 0) {
+    memcpy(PyUnicode_1BYTE_DATA(u), s, len);
+  }
+  return u;
+}
+
 // Create a str from UTF-8 (already validated by simdjson).
 inline PyObject *make_str(const char *s, size_t len) {
-  if (is_ascii(s, len)) {
-    PyObject *u = PyUnicode_New(Py_ssize_t(len), 127);
-    if (u == nullptr) {
-      return nullptr;
-    }
-    memcpy(PyUnicode_1BYTE_DATA(u), s, len);
-    return u;
-  }
-  return decode_utf8(s, len);
+  return is_ascii(s, len) ? new_ascii(s, len) : decode_utf8(s, len);
+}
+
+inline void cache_store(KeyCacheEntry &entry, PyObject *u, size_t len, const KeyWords &w) {
+  Py_INCREF(u);
+  Py_XDECREF(entry.key);
+  entry.key = u;
+  entry.len = len;
+  entry.head = w.head;
+  entry.tail = w.tail;
 }
 
 inline PyObject *make_key(KeyCacheEntry *cache, const char *s, size_t len) {
@@ -243,31 +254,14 @@ inline PyObject *make_key(KeyCacheEntry *cache, const char *s, size_t len) {
     return entry.key;
   }
   bool ascii = is_ascii(s, len);
-  PyObject *u;
-  if (ascii) {
-    u = PyUnicode_New(Py_ssize_t(len), 127);
-    if (u == nullptr) {
-      return nullptr;
-    }
-    memcpy(PyUnicode_1BYTE_DATA(u), s, len);
-  } else {
-    u = decode_utf8(s, len);
-    if (u == nullptr) {
-      return nullptr;
-    }
-  }
+  PyObject *u = ascii ? new_ascii(s, len) : decode_utf8(s, len);
   // Compute the hash now so that dict insertion (and later lookups) reuse it.
-  if (PyObject_Hash(u) == -1) {
-    Py_DECREF(u);
+  if (u == nullptr || PyObject_Hash(u) == -1) {
+    Py_XDECREF(u);
     return nullptr;
   }
   if (ascii) { // only ASCII keys are cached (their data is the UTF-8 bytes)
-    Py_XDECREF(entry.key);
-    Py_INCREF(u);
-    entry.key = u;
-    entry.len = len;
-    entry.head = w.head;
-    entry.tail = w.tail;
+    cache_store(entry, u, len, w);
   }
   return u;
 }
@@ -287,17 +281,10 @@ inline PyObject *make_value_str(KeyCacheEntry *cache, const char *s, size_t len)
     Py_INCREF(entry.key);
     return entry.key;
   }
-  PyObject *u = PyUnicode_New(Py_ssize_t(len), 127);
-  if (u == nullptr) {
-    return nullptr;
+  PyObject *u = new_ascii(s, len);
+  if (u != nullptr) {
+    cache_store(entry, u, len, w);
   }
-  memcpy(PyUnicode_1BYTE_DATA(u), s, len);
-  Py_XDECREF(entry.key);
-  Py_INCREF(u);
-  entry.key = u;
-  entry.len = len;
-  entry.head = w.head;
-  entry.tail = w.tail;
   return u;
 }
 
@@ -325,6 +312,11 @@ struct Builder {
   const uint8_t *strings;
   KeyCacheEntry *keys;
   KeyCacheEntry *values;
+
+  // Uses the calling thread's string caches.
+  explicit Builder(const document &doc)
+      : tape(doc.tape.get()), strings(doc.string_buf.get()),
+        keys(g_thread_parser.key_cache), values(g_thread_parser.value_cache) {}
 
   inline const char *str_at(uint64_t word, size_t *len) const {
     size_t idx = size_t(word & simdjson::internal::JSON_VALUE_MASK);
@@ -389,146 +381,126 @@ struct Builder {
   }
 
   FSJ_NOINLINE PyObject *build_array(size_t &i, uint64_t word) {
-    {
-      size_t end = size_t(word & 0xFFFFFFFF); // index after the matching ']'
-      size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
-      i++;
-      if (count < simdjson::internal::JSON_COUNT_MASK) {
-        PyObject *list = PyList_New(Py_ssize_t(count));
-        if (list == nullptr) {
-          return nullptr;
-        }
-        for (size_t k = 0; k < count; k++) {
-          PyObject *v = build(i);
-          if (v == nullptr) {
-            Py_DECREF(list);
-            return nullptr;
-          }
-          PyList_SET_ITEM(list, Py_ssize_t(k), v);
-        }
-        i = end;
-        return list;
-      }
-      // Saturated count: append until the closing bracket.
-      PyObject *list = PyList_New(0);
+    size_t end = size_t(word & 0xFFFFFFFF); // index after the matching ']'
+    size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
+    i++;
+    if (count < simdjson::internal::JSON_COUNT_MASK) {
+      PyObject *list = PyList_New(Py_ssize_t(count));
       if (list == nullptr) {
         return nullptr;
       }
-      while (i < end - 1) {
+      for (size_t k = 0; k < count; k++) {
         PyObject *v = build(i);
-        if (v == nullptr || PyList_Append(list, v) < 0) {
-          Py_XDECREF(v);
+        if (v == nullptr) {
           Py_DECREF(list);
           return nullptr;
         }
-        Py_DECREF(v);
+        PyList_SET_ITEM(list, Py_ssize_t(k), v);
       }
       i = end;
       return list;
     }
+    // Saturated count: append until the closing bracket.
+    PyObject *list = PyList_New(0);
+    if (list == nullptr) {
+      return nullptr;
+    }
+    while (i < end - 1) {
+      PyObject *v = build(i);
+      if (v == nullptr || PyList_Append(list, v) < 0) {
+        Py_XDECREF(v);
+        Py_DECREF(list);
+        return nullptr;
+      }
+      Py_DECREF(v);
+    }
+    i = end;
+    return list;
   }
 
   FSJ_NOINLINE PyObject *build_object(size_t &i, uint64_t word) {
-    {
-      size_t end = size_t(word & 0xFFFFFFFF);
-      size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
+    size_t end = size_t(word & 0xFFFFFFFF);
+    size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
+    i++;
+    PyObject *dict = count > 5 ? _PyDict_NewPresized(Py_ssize_t(count)) : PyDict_New();
+    if (dict == nullptr) {
+      return nullptr;
+    }
+    while (i < end - 1) {
+      size_t len;
+      const char *s = str_at(tape[i], &len);
       i++;
-      PyObject *dict = count > 5 ? _PyDict_NewPresized(Py_ssize_t(count)) : PyDict_New();
-      if (dict == nullptr) {
+      PyObject *key = make_key(keys, s, len);
+      if (key == nullptr) {
+        Py_DECREF(dict);
         return nullptr;
       }
-      while (i < end - 1) {
-        size_t len;
-        const char *s = str_at(tape[i], &len);
-        i++;
-        PyObject *key = make_key(keys, s, len);
-        if (key == nullptr) {
-          Py_DECREF(dict);
-          return nullptr;
-        }
-        PyObject *v = build(i);
-        if (v == nullptr) {
-          Py_DECREF(key);
-          Py_DECREF(dict);
-          return nullptr;
-        }
-        int rc = _PyDict_SetItem_KnownHash(
-            dict, key, v, reinterpret_cast<PyASCIIObject *>(key)->hash);
+      PyObject *v = build(i);
+      if (v == nullptr) {
         Py_DECREF(key);
-        Py_DECREF(v);
-        if (rc < 0) {
-          Py_DECREF(dict);
-          return nullptr;
-        }
+        Py_DECREF(dict);
+        return nullptr;
       }
-      i = end;
-      return dict;
+      int rc = _PyDict_SetItem_KnownHash(
+          dict, key, v, reinterpret_cast<PyASCIIObject *>(key)->hash);
+      Py_DECREF(key);
+      Py_DECREF(v);
+      if (rc < 0) {
+        Py_DECREF(dict);
+        return nullptr;
+      }
     }
+    i = end;
+    return dict;
   }
 };
 
-// simdjson rejected the document. json.loads decides the outcome: return its
-// value when it accepts the text. Raise only when it also fails.
-// JSONDecodeError is re-raised as our subclass so the message, document, and
-// byte offset match. Any other exception (UnicodeDecodeError, RecursionError)
-// propagates unchanged.
-PyObject *fallback_loads(PyObject *original) {
-  PyObject *arg = original;
-  PyObject *bytes_copy = nullptr;
-  if (PyMemoryView_Check(original)) {
-    // json.loads does not accept memoryview.
-    bytes_copy = PyBytes_FromObject(original);
-    if (bytes_copy == nullptr) {
-      return nullptr;
-    }
-    arg = bytes_copy;
+// Replaces a pending json.JSONDecodeError with our subclass, with the same
+// message, document and position. Other exceptions are left as they are.
+void reraise_decode_error() {
+  if (!PyErr_ExceptionMatches(json_JSONDecodeError)) {
+    return;
   }
-  PyObject *parsed = PyObject_CallFunctionObjArgs(json_loads, arg, nullptr);
-  Py_XDECREF(bytes_copy);
-  if (parsed != nullptr || !PyErr_ExceptionMatches(json_JSONDecodeError)) {
-    return parsed;
-  }
-  PyObject *typ = nullptr;
-  PyObject *val = nullptr;
-  PyObject *tb = nullptr;
+  PyObject *typ, *val, *tb;
   PyErr_Fetch(&typ, &val, &tb);
   PyErr_NormalizeException(&typ, &val, &tb);
-  if (val == nullptr) {
-    PyErr_Restore(typ, val, tb);
-    return nullptr;
-  }
   PyObject *msg = PyObject_GetAttrString(val, "msg");
   PyObject *doc = PyObject_GetAttrString(val, "doc");
-  PyObject *pos_obj = PyObject_GetAttrString(val, "pos");
-  if (msg == nullptr || doc == nullptr || pos_obj == nullptr) {
-    PyErr_Clear();
-    Py_XDECREF(msg);
-    Py_XDECREF(doc);
-    Py_XDECREF(pos_obj);
-    PyErr_Restore(typ, val, tb);
-    return nullptr;
-  }
-  Py_ssize_t pos = PyLong_AsSsize_t(pos_obj);
-  Py_DECREF(pos_obj);
-  if (pos == -1 && PyErr_Occurred()) {
-    PyErr_Clear();
-    Py_DECREF(msg);
-    Py_DECREF(doc);
-    PyErr_Restore(typ, val, tb);
-    return nullptr;
-  }
-  PyObject *exc = PyObject_CallFunction(JSONDecodeError, "OOn", msg, doc, pos);
-  Py_DECREF(msg);
-  Py_DECREF(doc);
-  Py_XDECREF(typ);
-  Py_XDECREF(tb);
-  Py_DECREF(val);
+  PyObject *pos = PyObject_GetAttrString(val, "pos");
+  PyObject *exc = msg && doc && pos
+                      ? PyObject_CallFunctionObjArgs(JSONDecodeError, msg, doc, pos, nullptr)
+                      : nullptr;
+  Py_XDECREF(msg);
+  Py_XDECREF(doc);
+  Py_XDECREF(pos);
   if (exc == nullptr) {
-    return nullptr;
+    PyErr_Clear();
+    PyErr_Restore(typ, val, tb);
+    return;
   }
+  Py_XDECREF(typ);
+  Py_XDECREF(val);
+  Py_XDECREF(tb);
   PyErr_SetObject(JSONDecodeError, exc);
   Py_DECREF(exc);
-  return nullptr;
+}
+
+// simdjson rejected the document. json.loads decides the outcome: return its
+// value when it accepts the text, or raise its error (JSONDecodeError as our
+// subclass; any other exception, such as UnicodeDecodeError, unchanged).
+PyObject *fallback_loads(PyObject *original) {
+  // json.loads does not accept memoryview.
+  PyObject *arg = PyMemoryView_Check(original) ? PyBytes_FromObject(original)
+                                               : Py_NewRef(original);
+  if (arg == nullptr) {
+    return nullptr;
+  }
+  PyObject *parsed = PyObject_CallOneArg(json_loads, arg);
+  Py_DECREF(arg);
+  if (parsed == nullptr) {
+    reraise_decode_error();
+  }
+  return parsed;
 }
 
 // Documents larger than this are parsed with a parser that is then released,
@@ -549,11 +521,13 @@ bool needs_unpadded(const char *buf, size_t len) {
           g_page_size);
 }
 
-simdjson::error_code parse_input(const char *buf, size_t len) {
-  if (needs_unpadded(buf, len)) {
-    return g_thread_parser.ptr->parse_unpadded(buf, len).error();
-  }
-  return g_thread_parser.ptr->parse(buf, len, false).error();
+// Parses buf with this thread's parser into d (the parser's own document
+// for loads, a document of its own for parse).
+simdjson::error_code parse_into(document &d, const char *buf, size_t len) {
+  const uint8_t *u = reinterpret_cast<const uint8_t *>(buf);
+  return needs_unpadded(buf, len)
+             ? g_thread_parser.ptr->parse_into_document_unpadded(d, u, len).error()
+             : g_thread_parser.ptr->parse_into_document(d, u, len, false).error();
 }
 
 bool ensure_parser() {
@@ -576,11 +550,6 @@ void release_parser() {
   g_thread_parser.ptr = nullptr;
 }
 
-void release_caches() {
-  clear_cache(g_thread_parser.key_cache);
-  clear_cache(g_thread_parser.value_cache);
-}
-
 void release_large_parser() {
   if (g_thread_parser.ptr != nullptr &&
       g_thread_parser.ptr->capacity() > MAX_RETAINED_CAPACITY) {
@@ -591,11 +560,11 @@ void release_large_parser() {
 // Suspend the cyclic GC while building: the new containers cannot form
 // cycles, and collections triggered by the many allocations are wasted work.
 // PyGC_Disable is process-global, so free-threaded builds leave GC alone.
-PyObject *build_with_gc_paused(Builder &b, size_t i) {
+PyObject *build_with_gc_paused(const document &doc, size_t i) {
 #ifndef Py_GIL_DISABLED
   int gc_was_enabled = PyGC_Disable();
 #endif
-  PyObject *res = b.build(i);
+  PyObject *res = Builder(doc).build(i);
 #ifndef Py_GIL_DISABLED
   if (gc_was_enabled) {
     PyGC_Enable();
@@ -608,16 +577,12 @@ PyObject *parse_buffer(const char *buf, size_t len, PyObject *original) {
   if (!ensure_parser()) {
     return nullptr;
   }
-  simdjson::error_code err = parse_input(buf, len);
-  if (err) {
+  if (parse_into(g_thread_parser.ptr->doc, buf, len)) {
     // Drop a huge parser before the json.loads rescan allocates again.
     release_large_parser();
     return fallback_loads(original);
   }
-  Builder b{g_thread_parser.ptr->doc.tape.get(),
-            g_thread_parser.ptr->doc.string_buf.get(),
-            g_thread_parser.key_cache, g_thread_parser.value_cache};
-  PyObject *res = build_with_gc_paused(b, 1); // skip the root entry
+  PyObject *res = build_with_gc_paused(g_thread_parser.ptr->doc, 1); // skip the root entry
   release_large_parser();
   return res;
 }
@@ -626,8 +591,7 @@ PyObject *parse_buffer(const char *buf, size_t len, PyObject *original) {
 template <PyObject *(*Parse)(const char *, size_t, PyObject *)>
 PyObject *with_input(PyObject *arg) {
   if (PyBytes_Check(arg)) {
-    return Parse(PyBytes_AS_STRING(arg), size_t(PyBytes_GET_SIZE(arg)),
-                        arg);
+    return Parse(PyBytes_AS_STRING(arg), size_t(PyBytes_GET_SIZE(arg)), arg);
   }
   if (PyUnicode_Check(arg)) {
     Py_ssize_t len;
@@ -650,18 +614,15 @@ PyObject *with_input(PyObject *arg) {
     if (copy == nullptr) {
       return nullptr;
     }
-    PyObject *res = Parse(PyBytes_AS_STRING(copy),
-                                 size_t(PyBytes_GET_SIZE(copy)), arg);
+    PyObject *res = Parse(PyBytes_AS_STRING(copy), size_t(PyBytes_GET_SIZE(copy)), arg);
     Py_DECREF(copy);
     return res;
 #else
     if (PyByteArray_Check(arg)) {
-      return Parse(PyByteArray_AS_STRING(arg),
-                          size_t(PyByteArray_GET_SIZE(arg)), arg);
+      return Parse(PyByteArray_AS_STRING(arg), size_t(PyByteArray_GET_SIZE(arg)), arg);
     }
     Py_buffer *view = PyMemoryView_GET_BUFFER(arg);
-    return Parse(static_cast<const char *>(view->buf),
-                        size_t(view->len), arg);
+    return Parse(static_cast<const char *>(view->buf), size_t(view->len), arg);
 #endif
   }
   PyErr_Format(PyExc_TypeError,
@@ -684,8 +645,6 @@ PyObject *loads(PyObject *, PyObject *arg) {
 #define Py_BEGIN_CRITICAL_SECTION(op) {
 #define Py_END_CRITICAL_SECTION() }
 #endif
-
-using simdjson::dom::document;
 
 PyTypeObject *DocumentType = nullptr;
 PyTypeObject *ObjectType = nullptr;
@@ -730,11 +689,6 @@ void give_back(document *d) {
 
 inline const uint64_t *tape_of(DocumentObject *owner) {
   return owner->doc->tape.get();
-}
-
-inline Builder builder_of(DocumentObject *owner) {
-  return Builder{owner->doc->tape.get(), owner->doc->string_buf.get(),
-                 g_thread_parser.key_cache, g_thread_parser.value_cache};
 }
 
 // Tape index of the value that follows the one at i.
@@ -794,10 +748,8 @@ PyObject *value_at(DocumentObject *owner, size_t i) {
     return new_proxy(ObjectType, owner, i);
   case '[':
     return new_proxy(ArrayType, owner, i);
-  default: {
-    Builder b = builder_of(owner);
-    return b.build(i);
-  }
+  default:
+    return Builder(*owner->doc).build(i);
   }
 }
 
@@ -818,30 +770,26 @@ size_t find_key(DocumentObject *owner, size_t start, const char *key,
   return 0;
 }
 
-// Tape index of element k of the array at start, or 0.
-size_t find_index(ProxyObject *a, size_t k) {
-  const uint64_t *tape = tape_of(a->owner);
-  size_t end = close_of(tape, a->start);
-  size_t i = a->start + 1;
-  size_t j = 0;
-  uint64_t c = a->cursor.load(std::memory_order_relaxed);
-  if (c != 0 && size_t(c >> 32) <= k) {
-    j = size_t(c >> 32);
-    i = size_t(c & 0xFFFFFFFF);
-  }
+// Tape index of element k of an array, starting from element j at tape
+// index i, or 0 when the array, which closes at `end`, is shorter.
+size_t walk_to(const uint64_t *tape, size_t i, size_t j, size_t k, size_t end) {
   for (; j < k && i < end; j++) {
     i = skip(tape, i);
   }
-  if (i >= end) {
-    return 0;
-  }
-  a->cursor.store((uint64_t(k) << 32) | i, std::memory_order_relaxed);
-  return i;
+  return i < end ? i : 0;
 }
 
-PyObject *materialize(DocumentObject *owner, size_t i) {
-  Builder b = builder_of(owner);
-  return build_with_gc_paused(b, i);
+// Tape index of element k of the array a, or 0.
+size_t find_index(ProxyObject *a, size_t k) {
+  const uint64_t *tape = tape_of(a->owner);
+  uint64_t c = a->cursor.load(std::memory_order_relaxed);
+  bool resume = c != 0 && size_t(c >> 32) <= k;
+  size_t i = walk_to(tape, resume ? size_t(c & 0xFFFFFFFF) : a->start + 1,
+                     resume ? size_t(c >> 32) : 0, k, close_of(tape, a->start));
+  if (i != 0) {
+    a->cursor.store((uint64_t(k) << 32) | i, std::memory_order_relaxed);
+  }
+  return i;
 }
 
 // Follows a JSON Pointer (RFC 6901) from the value at tape index i.
@@ -902,16 +850,11 @@ PyObject *at_pointer(DocumentObject *owner, size_t i, PyObject *arg) {
         PyErr_Format(PyExc_IndexError, "invalid array index in JSON pointer: %R", arg);
         return nullptr;
       }
-      size_t close = close_of(tape, i);
-      size_t e = i + 1;
-      for (size_t j = 0; j < k && e < close; j++) {
-        e = skip(tape, e);
-      }
-      if (e >= close) {
+      i = walk_to(tape, i + 1, 0, k, close_of(tape, i));
+      if (i == 0) {
         PyErr_Format(PyExc_IndexError, "array index out of range in JSON pointer: %R", arg);
         return nullptr;
       }
-      i = e;
     } else {
       PyErr_Format(PyExc_ValueError, "JSON pointer %R goes through a scalar", arg);
       return nullptr;
@@ -961,7 +904,7 @@ PyObject *proxy_at_pointer(PyObject *self, PyObject *arg) {
 }
 
 PyObject *proxy_materialize(PyObject *self, PyObject *) {
-  return materialize(proxy(self)->owner, proxy(self)->start);
+  return build_with_gc_paused(*proxy(self)->owner->doc, proxy(self)->start);
 }
 
 PyObject *new_iter(PyObject *self, IterKind kind) {
@@ -1185,8 +1128,7 @@ PyObject *iter_next(PyObject *self) {
     break;
   }
   size_t len;
-  Builder b = builder_of(it->owner);
-  const char *s = b.str_at(tape[pos], &len);
+  const char *s = Builder(*it->owner->doc).str_at(tape[pos], &len);
   PyObject *key = make_key(g_thread_parser.key_cache, s, len);
   if (key == nullptr || it->kind == ITER_KEYS) {
     return key;
@@ -1221,6 +1163,19 @@ PyType_Spec iter_spec = {
 
 // --- parse() ----------------------------------------------------------------
 
+// The root of document d, which the returned view takes over.
+PyObject *view_of(document *d) {
+  DocumentObject *owner = PyObject_New(DocumentObject, DocumentType);
+  if (owner == nullptr) {
+    give_back(d);
+    return nullptr;
+  }
+  owner->doc = d;
+  PyObject *root = value_at(owner, 1); // skip the root entry
+  Py_DECREF(owner);
+  return root;
+}
+
 PyObject *parse_lazy_buffer(const char *buf, size_t len, PyObject *original) {
   if (!ensure_parser()) {
     return nullptr;
@@ -1233,71 +1188,17 @@ PyObject *parse_lazy_buffer(const char *buf, size_t len, PyObject *original) {
       return PyErr_NoMemory();
     }
   }
-  const uint8_t *u = reinterpret_cast<const uint8_t *>(buf);
-  simdjson::error_code err =
-      needs_unpadded(buf, len)
-          ? g_thread_parser.ptr->parse_into_document_unpadded(*d, u, len).error()
-          : g_thread_parser.ptr->parse_into_document(*d, u, len, false).error();
+  simdjson::error_code err = parse_into(*d, buf, len);
   release_large_parser();
   if (err) {
     give_back(d);
     return fallback_loads(original);
   }
-  DocumentObject *owner = PyObject_New(DocumentObject, DocumentType);
-  if (owner == nullptr) {
-    give_back(d);
-    return nullptr;
-  }
-  owner->doc = d;
-  PyObject *root = value_at(owner, 1); // skip the root entry
-  Py_DECREF(owner);
-  return root;
+  return view_of(d);
 }
 
 PyObject *parse(PyObject *, PyObject *arg) {
   return with_input<parse_lazy_buffer>(arg);
-}
-
-// Creates the lazy types and adds them to the module.
-int add_lazy_types(PyObject *module) {
-  if (ObjectType == nullptr) {
-    DocumentType = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(&document_spec));
-    ObjectType = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(&object_spec));
-    ArrayType = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(&array_spec));
-    IterType = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(&iter_spec));
-    if (DocumentType == nullptr || ObjectType == nullptr || ArrayType == nullptr ||
-        IterType == nullptr) {
-      Py_CLEAR(DocumentType);
-      Py_CLEAR(ObjectType);
-      Py_CLEAR(ArrayType);
-      Py_CLEAR(IterType);
-      return -1;
-    }
-    // isinstance(x, Mapping) / isinstance(x, Sequence) hold for the views.
-    PyObject *abc = PyImport_ImportModule("collections.abc");
-    if (abc == nullptr) {
-      return -1;
-    }
-    PyObject *mapping = PyObject_GetAttrString(abc, "Mapping");
-    PyObject *sequence = PyObject_GetAttrString(abc, "Sequence");
-    Py_DECREF(abc);
-    PyObject *a = mapping ? PyObject_CallMethod(mapping, "register", "O", ObjectType) : nullptr;
-    PyObject *b = sequence ? PyObject_CallMethod(sequence, "register", "O", ArrayType) : nullptr;
-    Py_XDECREF(mapping);
-    Py_XDECREF(sequence);
-    if (a == nullptr || b == nullptr) {
-      Py_XDECREF(a);
-      Py_XDECREF(b);
-      return -1;
-    }
-    Py_DECREF(a);
-    Py_DECREF(b);
-  }
-  if (PyModule_AddObjectRef(module, "Object", reinterpret_cast<PyObject *>(ObjectType)) < 0 ||
-      PyModule_AddObjectRef(module, "Array", reinterpret_cast<PyObject *>(ArrayType)) < 0) {
-    return -1;
-  }
-  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,11 +1210,28 @@ int add_lazy_types(PyObject *module) {
 // ---------------------------------------------------------------------------
 enum EncodeStatus { ENCODE_OK = 0, ENCODE_ERROR = -1, ENCODE_FALLBACK = 1 };
 
+// A new reference to item i of a list, or nullptr past its end: the list may
+// shrink while we encode it (default may change it, or another thread).
+inline PyObject *list_item(PyObject *list, Py_ssize_t i) {
+  if (i >= PyList_GET_SIZE(list)) {
+    return nullptr; // checked first: an IndexError per list would be costly
+  }
+#if PY_VERSION_HEX >= 0x030D0000
+  PyObject *item = PyList_GetItemRef(list, i);
+  if (item == nullptr) {
+    PyErr_Clear();
+  }
+  return item;
+#else
+  return Py_NewRef(PyList_GET_ITEM(list, i));
+#endif
+}
+
 const char HEX_DIGITS[] = "0123456789abcdef";
 
 // Growable output buffer. Callers reserve the worst case for a value, then
 // write without checks. Allocation failure throws std::bad_alloc, caught in
-// dumps_impl (no Python frame is unwound: the encoder only throws from its
+// dumps (no Python frame is unwound: the encoder only throws from its
 // own frames).
 struct OutBuf {
   char *buf = nullptr;
@@ -1452,6 +1370,24 @@ struct Encoder {
     for (int i = 0; i < level; i++) {
       out.append(indent);
     }
+  }
+
+  // What precedes each element of a container, and what closes it.
+  void begin_item(bool first) {
+    if (!first) {
+      out.append(item_sep);
+    }
+    if (has_indent) {
+      newline_indent();
+    }
+  }
+
+  void close(char bracket) {
+    level--;
+    if (has_indent) {
+      newline_indent();
+    }
+    out.push_back(bracket);
   }
 
   // Writes the escape of c at p (at most 12 bytes); returns the new end.
@@ -1681,12 +1617,7 @@ struct Encoder {
   }
 
   FSJ_NOINLINE int encode_item(PyObject *key, PyObject *value, bool first) {
-    if (!first) {
-      out.append(item_sep);
-    }
-    if (has_indent) {
-      newline_indent();
-    }
+    begin_item(first);
     int rc = encode_key(key);
     if (rc != ENCODE_OK) {
       return rc;
@@ -1737,15 +1668,10 @@ struct Encoder {
         first = false;
       }
     }
-    if (rc != ENCODE_OK) {
-      return rc;
+    if (rc == ENCODE_OK) {
+      close('}');
     }
-    level--;
-    if (has_indent) {
-      newline_indent();
-    }
-    out.push_back('}');
-    return ENCODE_OK;
+    return rc;
   }
 
   FSJ_NOINLINE int encode_list(PyObject *o) {
@@ -1758,50 +1684,20 @@ struct Encoder {
     out.push_back('[');
     level++;
     for (Py_ssize_t i = 0;; i++) {
-      PyObject *item;
-      if (is_list) {
-        // The list may shrink while we encode it (default, other threads).
-#if PY_VERSION_HEX >= 0x030D0000
-        // Check the size first: an IndexError per list would be costly.
-        if (i >= PyList_GET_SIZE(o)) {
-          break;
-        }
-        item = PyList_GetItemRef(o, i);
-        if (item == nullptr) {
-          PyErr_Clear();
-          break;
-        }
-#else
-        if (i >= PyList_GET_SIZE(o)) {
-          break;
-        }
-        item = PyList_GET_ITEM(o, i);
-        Py_INCREF(item);
-#endif
-      } else {
-        if (i >= n) {
-          break;
-        }
-        item = PyTuple_GET_ITEM(o, i);
-        Py_INCREF(item);
+      PyObject *item = is_list ? list_item(o, i)
+                       : i < n ? Py_NewRef(PyTuple_GET_ITEM(o, i))
+                               : nullptr;
+      if (item == nullptr) {
+        break;
       }
-      if (i > 0) {
-        out.append(item_sep);
-      }
-      if (has_indent) {
-        newline_indent();
-      }
+      begin_item(i == 0);
       int rc = encode(item);
       Py_DECREF(item);
       if (rc != ENCODE_OK) {
         return rc;
       }
     }
-    level--;
-    if (has_indent) {
-      newline_indent();
-    }
-    out.push_back(']');
+    close(']');
     return ENCODE_OK;
   }
 
@@ -1855,10 +1751,6 @@ struct Encoder {
 };
 
 PyObject *json_dumps = nullptr;
-
-PyObject *fallback_dumps(PyObject *args, PyObject *kwargs) {
-  return PyObject_Call(json_dumps, args, kwargs);
-}
 
 // Reads the json.dumps keywords. Returns false when the call should go to
 // json.dumps (unknown or unusual arguments); sets an error and returns false
@@ -1971,14 +1863,11 @@ bool configure(Encoder &e, PyObject *kwargs, bool *error) {
   return true;
 }
 
-PyObject *dumps_impl(PyObject *args, PyObject *kwargs) {
-  if (PyTuple_GET_SIZE(args) != 1) {
-    return fallback_dumps(args, kwargs);
-  }
+PyObject *dumps(PyObject *, PyObject *args, PyObject *kwargs) {
   Encoder e;
-  bool error;
-  if (!configure(e, kwargs, &error)) {
-    return error ? nullptr : fallback_dumps(args, kwargs);
+  bool error = false;
+  if (PyTuple_GET_SIZE(args) != 1 || !configure(e, kwargs, &error)) {
+    return error ? nullptr : PyObject_Call(json_dumps, args, kwargs);
   }
   int rc;
   try {
@@ -1990,22 +1879,10 @@ PyObject *dumps_impl(PyObject *args, PyObject *kwargs) {
     return nullptr;
   }
   if (rc == ENCODE_FALLBACK) {
-    return fallback_dumps(args, kwargs);
+    return PyObject_Call(json_dumps, args, kwargs);
   }
-  if (e.ascii_output) {
-    PyObject *s = PyUnicode_New(Py_ssize_t(e.out.size()), 127);
-    if (s != nullptr) {
-      if (e.out.size() > 0) {
-        memcpy(PyUnicode_DATA(s), e.out.data(), e.out.size());
-      }
-    }
-    return s;
-  }
-  return PyUnicode_DecodeUTF8(e.out.data(), Py_ssize_t(e.out.size()), nullptr);
-}
-
-PyObject *dumps(PyObject *, PyObject *args, PyObject *kwargs) {
-  return dumps_impl(args, kwargs);
+  return e.ascii_output ? new_ascii(e.out.data(), e.out.size())
+                        : PyUnicode_DecodeUTF8(e.out.data(), Py_ssize_t(e.out.size()), nullptr);
 }
 
 // dump(obj, fp, **kw): fp.write(dumps(obj, **kw)).
@@ -2018,7 +1895,7 @@ PyObject *dump(PyObject *, PyObject *args, PyObject *kwargs) {
   if (obj_only == nullptr) {
     return nullptr;
   }
-  PyObject *s = dumps_impl(obj_only, kwargs);
+  PyObject *s = dumps(nullptr, obj_only, kwargs);
   Py_DECREF(obj_only);
   if (s == nullptr) {
     return nullptr;
@@ -2035,16 +1912,6 @@ PyObject *dump(PyObject *, PyObject *args, PyObject *kwargs) {
 // ---------------------------------------------------------------------------
 // Files: load(fp), load_file(path), parse_file(path).
 // ---------------------------------------------------------------------------
-PyObject *load(PyObject *, PyObject *fp) {
-  PyObject *data = PyObject_CallMethod(fp, "read", nullptr);
-  if (data == nullptr) {
-    return nullptr;
-  }
-  PyObject *r = with_input<parse_buffer>(data);
-  Py_DECREF(data);
-  return r;
-}
-
 PyObject *io_open = nullptr;
 
 // The bytes of the file at path.
@@ -2064,24 +1931,27 @@ PyObject *read_file(PyObject *path) {
   return data;
 }
 
-PyObject *load_file(PyObject *, PyObject *path) {
-  PyObject *data = read_file(path);
+// Parses data, a new reference (or nullptr after an error), and releases it.
+template <PyObject *(*Parse)(const char *, size_t, PyObject *)>
+PyObject *parse_and_release(PyObject *data) {
   if (data == nullptr) {
     return nullptr;
   }
-  PyObject *r = with_input<parse_buffer>(data);
+  PyObject *r = with_input<Parse>(data);
   Py_DECREF(data);
   return r;
 }
 
+PyObject *load(PyObject *, PyObject *fp) {
+  return parse_and_release<parse_buffer>(PyObject_CallMethod(fp, "read", nullptr));
+}
+
+PyObject *load_file(PyObject *, PyObject *path) {
+  return parse_and_release<parse_buffer>(read_file(path));
+}
+
 PyObject *parse_file(PyObject *, PyObject *path) {
-  PyObject *data = read_file(path);
-  if (data == nullptr) {
-    return nullptr;
-  }
-  PyObject *r = with_input<parse_lazy_buffer>(data);
-  Py_DECREF(data);
-  return r;
+  return parse_and_release<parse_lazy_buffer>(read_file(path));
 }
 
 // ---------------------------------------------------------------------------
@@ -2108,6 +1978,7 @@ struct StreamObject {
   bool active;     // a simdjson stream is running from `base`
   size_t base;     // offset of the running stream in buf
   size_t last_end; // offset just past the last document returned
+  size_t prefix;   // bytes that parse_many skips at the start (see make_stream)
   size_t open;     // array format: offsets of the outer '[' and ']'
   size_t close;
   PyObject *text;  // the input as str, built on the error path
@@ -2121,23 +1992,21 @@ inline bool json_space(char c) {
 }
 
 // Offset of the first byte at or after `at` that is neither white space nor
-// a separator of the stream format. For the array format, the separators
-// include the opening '[' and the closing ']' of the array, at the offsets
-// `open` and `close`, but no other bracket.
-size_t skip_separators(const char *buf, size_t len, size_t at,
-                       simdjson::stream_format fmt, size_t open, size_t close) {
+// a separator of the stream format, nor the prefix that simdjson skips (a
+// byte order mark and, for the array format, the opening '['). For the array
+// format, the closing ']' is a separator too, but no other bracket.
+size_t skip_separators(const StreamObject *s, size_t at) {
   using simdjson::stream_format;
-  if (at == 0 && len >= 3 && memcmp(buf, "\xEF\xBB\xBF", 3) == 0) {
-    at = 3; // a UTF-8 byte order mark at the start, which simdjson skips
+  if (at < s->prefix) {
+    at = s->prefix;
   }
-  for (; at < len; at++) {
-    char c = buf[at];
+  for (; at < s->len; at++) {
+    char c = s->buf[at];
     bool sep = json_space(c) ||
-               (fmt == stream_format::json_sequence && c == '\x1e') ||
-               ((fmt == stream_format::comma_delimited ||
-                 fmt == stream_format::comma_delimited_array) && c == ',') ||
-               (fmt == stream_format::comma_delimited_array &&
-                (at == open || at == close));
+               (s->format == stream_format::json_sequence && c == '\x1e') ||
+               ((s->format == stream_format::comma_delimited ||
+                 s->format == stream_format::comma_delimited_array) && c == ',') ||
+               at == s->close;
     if (!sep) {
       break;
     }
@@ -2191,25 +2060,6 @@ void stream_error(StreamObject *s, const char *msg, size_t pos) {
   }
 }
 
-// Number of bytes that parse_many skips at the start of buf: a UTF-8 byte
-// order mark, and for the array format, white space and the '['. The
-// offsets that the stream reports are relative to what follows.
-size_t stripped_prefix(const char *buf, size_t len, simdjson::stream_format fmt) {
-  size_t i = 0;
-  if (len >= 3 && memcmp(buf, "\xEF\xBB\xBF", 3) == 0) {
-    i = 3;
-  }
-  if (fmt == simdjson::stream_format::comma_delimited_array) {
-    while (i < len && json_space(buf[i])) {
-      i++;
-    }
-    if (i < len && buf[i] == '[') {
-      i++;
-    }
-  }
-  return i;
-}
-
 bool stream_start(StreamObject *s, size_t at) {
   delete s->stream;
   s->stream = new (std::nothrow) document_stream();
@@ -2236,7 +2086,8 @@ bool stream_start(StreamObject *s, size_t at) {
     return false;
   }
   s->it = s->stream->begin();
-  s->base = at + stripped_prefix(s->buf + at, s->len - at, s->format);
+  // Restarts happen after the prefix: offsets are relative to it only at 0.
+  s->base = at == 0 ? s->prefix : at;
   s->active = true;
   return true;
 }
@@ -2275,36 +2126,17 @@ document *copy_document(const document &src) {
 
 PyObject *stream_value(StreamObject *s) {
   if (!s->lazy) {
-    Builder b{s->p->doc.tape.get(), s->p->doc.string_buf.get(),
-              g_thread_parser.key_cache, g_thread_parser.value_cache};
-    return build_with_gc_paused(b, 1);
+    return build_with_gc_paused(s->p->doc, 1);
   }
   document *d = copy_document(s->p->doc);
-  if (d == nullptr) {
-    return PyErr_NoMemory();
-  }
-  DocumentObject *owner = PyObject_New(DocumentObject, DocumentType);
-  if (owner == nullptr) {
-    delete d;
-    return nullptr;
-  }
-  owner->doc = d;
-  PyObject *root = value_at(owner, 1);
-  Py_DECREF(owner);
-  return root;
+  return d == nullptr ? PyErr_NoMemory() : view_of(d);
 }
 
 // simdjson rejected the document after last_end. For whitespace-separated
 // documents, json decides, as in loads: return the value it accepts and
 // resume after it, or raise its error.
 PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
-  size_t at = s->last_end;
-  if (at == 0 && s->len >= 3 && memcmp(s->buf, "\xEF\xBB\xBF", 3) == 0) {
-    at = 3; // skip a byte order mark, as simdjson and json.loads(bytes) do
-  }
-  while (at < s->len && json_space(s->buf[at])) {
-    at++;
-  }
+  size_t at = skip_separators(s, s->last_end);
   if (s->format != simdjson::stream_format::whitespace_delimited &&
       s->format != simdjson::stream_format::newline_delimited) {
     stream_error(s, simdjson::error_message(err), at);
@@ -2317,28 +2149,7 @@ PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
   Py_ssize_t start = char_index(s->buf, at);
   PyObject *r = PyObject_CallFunction(json_raw_decode, "On", text, start);
   if (r == nullptr) {
-    if (PyErr_ExceptionMatches(json_JSONDecodeError)) {
-      // Re-raise as fastsimdjson.JSONDecodeError, like loads.
-      PyObject *typ, *val, *tb;
-      PyErr_Fetch(&typ, &val, &tb);
-      PyErr_NormalizeException(&typ, &val, &tb);
-      PyObject *msg = PyObject_GetAttrString(val, "msg");
-      PyObject *pos = PyObject_GetAttrString(val, "pos");
-      if (msg != nullptr && pos != nullptr) {
-        PyObject *exc = PyObject_CallFunction(JSONDecodeError, "OOO", msg, text, pos);
-        if (exc != nullptr) {
-          Py_XDECREF(typ);
-          Py_XDECREF(val);
-          Py_XDECREF(tb);
-          typ = Py_NewRef(JSONDecodeError);
-          val = exc;
-          tb = nullptr;
-        }
-      }
-      Py_XDECREF(msg);
-      Py_XDECREF(pos);
-      PyErr_Restore(typ, val, tb);
-    }
+    reraise_decode_error(); // as in loads
     return nullptr;
   }
   PyObject *value = Py_NewRef(PyTuple_GET_ITEM(r, 0));
@@ -2355,52 +2166,34 @@ PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
   return value;
 }
 
+// The next document, or nullptr at the end or after an error.
 PyObject *stream_next_locked(StreamObject *s) {
   for (;;) {
-    if (s->done) {
-      return nullptr;
-    }
     if (!s->active) {
-      size_t at = s->last_end;
-      while (at < s->len && json_space(s->buf[at])) {
-        at++;
-      }
-      if (skip_separators(s->buf, s->len, at, s->format, s->open, s->close) >= s->len) {
-        s->done = true;
+      if (skip_separators(s, s->last_end) >= s->len) {
         return nullptr;
       }
       if (!stream_start(s, s->last_end)) {
-        s->done = true;
         return nullptr;
       }
     }
     if (!(s->it != s->stream->end())) {
-      s->done = true;
       // truncated_bytes() is not reliable for every format: look at what
-      // follows the last document instead.
-      if (skip_separators(s->buf, s->len, s->last_end, s->format, s->open, s->close) < s->len) {
-        // An incomplete document at the end: let json report it.
-        s->active = false;
-        s->done = false;
-        PyObject *v = stream_fallback(s, simdjson::TAPE_ERROR);
-        if (v == nullptr) {
-          s->done = true;
-        }
-        return v;
-      }
-      return nullptr;
+      // follows the last document instead. An incomplete document at the
+      // end: let json report it.
+      return skip_separators(s, s->last_end) < s->len
+                 ? stream_fallback(s, simdjson::TAPE_ERROR)
+                 : nullptr;
     }
     simdjson::dom::element el;
     simdjson::error_code err = (*s->it).get(el);
     if (!err) {
       size_t end = s->base + s->it.current_index() + s->it.source().size();
       PyObject *v = stream_value(s);
-      if (v == nullptr) {
-        s->done = true;
-        return nullptr;
+      if (v != nullptr) {
+        s->last_end = end;
+        ++s->it;
       }
-      s->last_end = end;
-      ++s->it;
       return v;
     }
     if (err == simdjson::CAPACITY && s->batch_size < s->len) {
@@ -2409,18 +2202,18 @@ PyObject *stream_next_locked(StreamObject *s) {
       s->active = false;
       continue;
     }
-    PyObject *v = stream_fallback(s, err);
-    if (v == nullptr) {
-      s->done = true;
-    }
-    return v;
+    return stream_fallback(s, err);
   }
 }
 
 PyObject *stream_next(PyObject *self) {
-  PyObject *r;
+  StreamObject *s = reinterpret_cast<StreamObject *>(self);
+  PyObject *r = nullptr;
   Py_BEGIN_CRITICAL_SECTION(self);
-  r = stream_next_locked(reinterpret_cast<StreamObject *>(self));
+  if (!s->done) {
+    r = stream_next_locked(s);
+    s->done = r == nullptr; // the end, or an error: the stream is over
+  }
   Py_END_CRITICAL_SECTION();
   return r;
 }
@@ -2540,9 +2333,11 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   }
   s->buf = buf;
   s->len = size_t(len);
+  // parse_many skips a UTF-8 byte order mark and, for the array format,
+  // white space and the opening '['; the offsets it reports start after.
+  size_t i = s->len >= 3 && memcmp(buf, "\xEF\xBB\xBF", 3) == 0 ? 3 : 0;
   s->open = s->close = size_t(-1);
   if (fmt == simdjson::stream_format::comma_delimited_array) {
-    size_t i = stripped_prefix(buf, s->len, simdjson::stream_format::whitespace_delimited);
     while (i < s->len && json_space(buf[i])) {
       i++;
     }
@@ -2551,12 +2346,13 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
       j--;
     }
     if (i < s->len && buf[i] == '[') {
-      s->open = i;
+      s->open = i++;
     }
-    if (j > i + 1 && buf[j - 1] == ']') {
+    if (j > i && buf[j - 1] == ']') {
       s->close = j - 1;
     }
   }
+  s->prefix = i;
   if (fmt != simdjson::stream_format::whitespace_delimited &&
       fmt != simdjson::stream_format::newline_delimited && s->batch_size < s->len) {
     // A restart in the middle of the input would miss a separator, so one
@@ -2591,7 +2387,7 @@ PyObject *parse_only(PyObject *, PyObject *arg) {
   }
   const char *buf = PyBytes_AS_STRING(arg);
   size_t len = size_t(PyBytes_GET_SIZE(arg));
-  auto err = parse_input(buf, len);
+  auto err = parse_into(g_thread_parser.ptr->doc, buf, len);
   release_large_parser();
   return PyLong_FromLong(long(err));
 }
@@ -2600,7 +2396,8 @@ PyObject *release(PyObject *, PyObject *) {
   release_parser();
   delete g_thread_parser.spare;
   g_thread_parser.spare = nullptr;
-  release_caches();
+  clear_cache(g_thread_parser.key_cache);
+  clear_cache(g_thread_parser.value_cache);
   Py_RETURN_NONE;
 }
 
@@ -2629,6 +2426,17 @@ PyMethodDef methods[] = {
      "Release the simdjson parser and string caches retained by this thread."},
     {nullptr, nullptr, 0, nullptr},
 };
+
+// collections.abc.<name>.register(type)
+int register_abc(const char *name, PyTypeObject *type) {
+  PyObject *abc = PyImport_ImportModule("collections.abc");
+  PyObject *cls = abc ? PyObject_GetAttrString(abc, name) : nullptr;
+  PyObject *r = cls ? PyObject_CallMethod(cls, "register", "O", type) : nullptr;
+  Py_XDECREF(abc);
+  Py_XDECREF(cls);
+  Py_XDECREF(r);
+  return r == nullptr ? -1 : 0;
+}
 
 // Multi-phase init so the module can declare that it does not need the GIL.
 // Exception types are process-global, so subinterpreters stay unsupported.
@@ -2673,13 +2481,27 @@ int exec_fastsimdjson(PyObject *module) {
   if (PyModule_AddObjectRef(module, "JSONDecodeError", JSONDecodeError) < 0) {
     return -1;
   }
-  if (StreamType == nullptr) {
-    StreamType = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(&stream_spec));
-    if (StreamType == nullptr) {
-      return -1;
+  struct {
+    PyTypeObject **type;
+    PyType_Spec *spec;
+  } types[] = {{&DocumentType, &document_spec}, {&ObjectType, &object_spec},
+               {&ArrayType, &array_spec},       {&IterType, &iter_spec},
+               {&StreamType, &stream_spec}};
+  for (auto &t : types) {
+    if (*t.type == nullptr) {
+      *t.type = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(t.spec));
+      if (*t.type == nullptr) {
+        return -1;
+      }
     }
   }
-  return add_lazy_types(module);
+  // isinstance(x, Mapping) / isinstance(x, Sequence) hold for the views.
+  if (register_abc("Mapping", ObjectType) < 0 || register_abc("Sequence", ArrayType) < 0 ||
+      PyModule_AddObjectRef(module, "Object", reinterpret_cast<PyObject *>(ObjectType)) < 0 ||
+      PyModule_AddObjectRef(module, "Array", reinterpret_cast<PyObject *>(ArrayType)) < 0) {
+    return -1;
+  }
+  return 0;
 }
 
 PyModuleDef_Slot module_slots[] = {
