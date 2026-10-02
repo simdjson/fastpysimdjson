@@ -216,16 +216,16 @@ def test_cls():
 
 
 def test_deep_nesting():
-    for depth in (1000, 10000):
+    for depth in (100, 500):
         deep, deep_dict = [], {}
         for _ in range(depth):
             deep, deep_dict = [deep], {"k": deep_dict}
         assert fastsimdjson.dumps(deep) == json.dumps(deep)
         assert fastsimdjson.dumps(deep_dict) == json.dumps(deep_dict)
-    # Where the stack runs out depends on the Python version and on the
-    # frame sizes of each encoder: the output must still be correct, or the
-    # error a RecursionError, never a crash.
-    for depth in (100000, 1000000):
+    # Where nesting runs out depends on the Python version (a counter before
+    # 3.14, the stack size since) and on each encoder's frames: the output
+    # must be correct, or the error a RecursionError, never a crash.
+    for depth in (1000, 10000, 100000, 1000000):
         deep = []
         for _ in range(depth):
             deep = [deep]
@@ -233,7 +233,6 @@ def test_deep_nesting():
             assert fastsimdjson.dumps(deep) == "[" * (depth + 1) + "]" * (depth + 1)
         except RecursionError:
             pass
-
 
 def test_roundtrip():
     obj = {"a": [1, 2.5, "é", None, True, {"b": -0.0}], "big": 2**80}

@@ -152,3 +152,14 @@ def test_files(tmp_path):
     path = tmp_path / "data.ndjson"
     path.write_text(ndjson(objs))
     assert list(fastsimdjson.loads_many(path.read_bytes())) == objs
+
+
+@pytest.mark.parametrize("fmt", ["whitespace", "lines", "json_seq", "comma", "array"])
+def test_big_integers(fmt):
+    big = [123456789012345678901234, -(10**40), 2**64]
+    objs = [{"n": big[0]}, big, big[2]]
+    enc = [json.dumps(o) for o in objs]
+    text = {"whitespace": " ".join(enc), "lines": "\n".join(enc) + "\n",
+            "json_seq": "".join("\x1e" + e + "\n" for e in enc),
+            "comma": ",".join(enc), "array": "[" + ",".join(enc) + "]"}[fmt]
+    check_stream(text, objs, format=fmt)
