@@ -1583,6 +1583,16 @@ struct Encoder {
     if (kind == PyUnicode_1BYTE_KIND) {
       n = simdutf::convert_latin1_to_utf8(static_cast<const char *>(data), len, tmp);
     } else if (kind == PyUnicode_2BYTE_KIND) {
+      // A str may hold a high and a low surrogate as two code points; json
+      // keeps them apart, but simdutf would join them into one character.
+      const uint16_t *u = static_cast<const uint16_t *>(data);
+      bool surrogate = false;
+      for (size_t i = 0; i < len; i++) {
+        surrogate |= (u[i] & 0xF800) == 0xD800;
+      }
+      if (surrogate) {
+        return ENCODE_FALLBACK;
+      }
       n = simdutf::convert_utf16_to_utf8(static_cast<const char16_t *>(data), len, tmp);
     } else {
       n = simdutf::convert_utf32_to_utf8(static_cast<const char32_t *>(data), len, tmp);
@@ -2098,6 +2108,8 @@ struct StreamObject {
   bool active;     // a simdjson stream is running from `base`
   size_t base;     // offset of the running stream in buf
   size_t last_end; // offset just past the last document returned
+  size_t open;     // array format: offsets of the outer '[' and ']'
+  size_t close;
   PyObject *text;  // the input as str, built on the error path
   parser *p;
   document_stream *stream;
@@ -2109,17 +2121,23 @@ inline bool json_space(char c) {
 }
 
 // Offset of the first byte at or after `at` that is neither white space nor
-// a separator of the stream format.
+// a separator of the stream format. For the array format, the separators
+// include the opening '[' and the closing ']' of the array, at the offsets
+// `open` and `close`, but no other bracket.
 size_t skip_separators(const char *buf, size_t len, size_t at,
-                       simdjson::stream_format fmt) {
+                       simdjson::stream_format fmt, size_t open, size_t close) {
   using simdjson::stream_format;
+  if (at == 0 && len >= 3 && memcmp(buf, "\xEF\xBB\xBF", 3) == 0) {
+    at = 3; // a UTF-8 byte order mark at the start, which simdjson skips
+  }
   for (; at < len; at++) {
     char c = buf[at];
     bool sep = json_space(c) ||
                (fmt == stream_format::json_sequence && c == '\x1e') ||
                ((fmt == stream_format::comma_delimited ||
                  fmt == stream_format::comma_delimited_array) && c == ',') ||
-               (fmt == stream_format::comma_delimited_array && (c == '[' || c == ']'));
+               (fmt == stream_format::comma_delimited_array &&
+                (at == open || at == close));
     if (!sep) {
       break;
     }
@@ -2281,6 +2299,9 @@ PyObject *stream_value(StreamObject *s) {
 // resume after it, or raise its error.
 PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
   size_t at = s->last_end;
+  if (at == 0 && s->len >= 3 && memcmp(s->buf, "\xEF\xBB\xBF", 3) == 0) {
+    at = 3; // skip a byte order mark, as simdjson and json.loads(bytes) do
+  }
   while (at < s->len && json_space(s->buf[at])) {
     at++;
   }
@@ -2344,7 +2365,7 @@ PyObject *stream_next_locked(StreamObject *s) {
       while (at < s->len && json_space(s->buf[at])) {
         at++;
       }
-      if (skip_separators(s->buf, s->len, at, s->format) >= s->len) {
+      if (skip_separators(s->buf, s->len, at, s->format, s->open, s->close) >= s->len) {
         s->done = true;
         return nullptr;
       }
@@ -2357,7 +2378,7 @@ PyObject *stream_next_locked(StreamObject *s) {
       s->done = true;
       // truncated_bytes() is not reliable for every format: look at what
       // follows the last document instead.
-      if (skip_separators(s->buf, s->len, s->last_end, s->format) < s->len) {
+      if (skip_separators(s->buf, s->len, s->last_end, s->format, s->open, s->close) < s->len) {
         // An incomplete document at the end: let json report it.
         s->active = false;
         s->done = false;
@@ -2519,6 +2540,23 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   }
   s->buf = buf;
   s->len = size_t(len);
+  s->open = s->close = size_t(-1);
+  if (fmt == simdjson::stream_format::comma_delimited_array) {
+    size_t i = stripped_prefix(buf, s->len, simdjson::stream_format::whitespace_delimited);
+    while (i < s->len && json_space(buf[i])) {
+      i++;
+    }
+    size_t j = s->len;
+    while (j > i && json_space(buf[j - 1])) {
+      j--;
+    }
+    if (i < s->len && buf[i] == '[') {
+      s->open = i;
+    }
+    if (j > i + 1 && buf[j - 1] == ']') {
+      s->close = j - 1;
+    }
+  }
   if (fmt != simdjson::stream_format::whitespace_delimited &&
       fmt != simdjson::stream_format::newline_delimited && s->batch_size < s->len) {
     // A restart in the middle of the input would miss a separator, so one

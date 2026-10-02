@@ -141,7 +141,9 @@ def test_strings():
 
 
 def test_lone_surrogates():
-    for s in ["\ud800", "a\udfffb", "\ud83d"]:
+    # Including a high and a low surrogate as two code points, which json
+    # keeps apart (they are not a character).
+    for s in ["\ud800", "a\udfffb", "\ud83d", "\ud83d\ude00", "\u6817\uda57\udf54x", "\U0001f600\ud800"]:
         for kw in ({}, {"ensure_ascii": False}):
             assert fastsimdjson.dumps([s], **kw) == json.dumps([s], **kw)
 

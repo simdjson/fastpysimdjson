@@ -163,3 +163,33 @@ def test_big_integers(fmt):
             "json_seq": "".join("\x1e" + e + "\n" for e in enc),
             "comma": ",".join(enc), "array": "[" + ",".join(enc) + "]"}[fmt]
     check_stream(text, objs, format=fmt)
+
+
+@pytest.mark.parametrize("objs", [[[]], [[], []], [{}, []], [[[]]], [[1], [[2]], []]])
+def test_array_of_arrays(objs):
+    for sep in (",", " , "):
+        check_stream("[" + sep.join(json.dumps(o) for o in objs) + "]", objs, format="array")
+
+
+@pytest.mark.parametrize("fmt", ["whitespace", "lines"])
+def test_byte_order_mark_errors(fmt):
+    bom = b"\xef\xbb\xbf"
+    assert list(fastsimdjson.loads_many(bom + b"  \n", format=fmt)) == []
+    assert list(fastsimdjson.loads_many(bom + b'{"a": 1e400}\n', format=fmt)) == [{"a": float("inf")}]
+    for bad in (bom + b'{"a": 1}\n{"b" 2}\n', bom + b"[1,\n", bom + bom + b"[1]\n"):
+        text = bad.decode("utf-8")[1:]
+        expected = None
+        try:
+            pos = 0
+            dec = json.JSONDecoder()
+            while True:
+                while pos < len(text) and text[pos] in " \t\n\r":
+                    pos += 1
+                if pos >= len(text):
+                    break
+                _, pos = dec.raw_decode(text, pos)
+        except json.JSONDecodeError as e:
+            expected = (e.msg, e.pos + 1)  # + 1 for the byte order mark
+        with pytest.raises(fastsimdjson.JSONDecodeError) as info:
+            list(fastsimdjson.loads_many(bad, format=fmt))
+        assert (info.value.msg, info.value.pos) == expected
