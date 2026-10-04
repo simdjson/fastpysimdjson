@@ -34,7 +34,7 @@ Issues = "https://github.com/simdjson/fastpysimdjson/issues"
 
 [project.optional-dependencies]
 test = ["pytest"]
-bench = ["orjson"]
+bench = ["orjson", "msgspec", "pysimdjson", "cysimdjson"]
 
 [tool.cibuildwheel]
 skip = ["pp*"]
