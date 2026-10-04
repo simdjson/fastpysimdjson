@@ -7,7 +7,9 @@ replacement for the `json` module's `loads`, `load`, `dumps` and `dump`, and
 it can be over 3 times faster than the standard `json.loads` and
 `json.dumps`. When you only need part of a document, its lazy `parse`
 function is faster still. It also reads streams of documents (NDJSON, JSON
-Lines) and writes JSON as `bytes` (`dumpb`).
+Lines). It writes JSON in two ways: `dumps` returns the same `str` as
+`json.dumps`, and `dumpb` returns the same `bytes` as `orjson.dumps`, as fast
+as orjson.
 
 With pip:
 
@@ -76,12 +78,11 @@ doc["search_metadata"].as_dict()          # convert a subtree, like loads
   `json.loads` accepts (an overflowing number, an unpaired surrogate) is
   returned as plain Python objects, as `loads` would return it.
 
-### `dumps`, `dumpb` and `dump`: writing JSON
+### `dumps` and `dump`: like `json.dumps`
 
 ```python
 fastsimdjson.dumps({"a": [1, 2.5, None]})            # '{"a": [1, 2.5, null]}'
 fastsimdjson.dumps(obj, indent=2, sort_keys=True)
-fastsimdjson.dumpb(obj, separators=(",", ":"), ensure_ascii=False)  # bytes
 with open("out.json", "w", encoding="utf-8") as f:
     fastsimdjson.dump(obj, f)
 ```
@@ -93,10 +94,36 @@ escapes and the default separators. `ensure_ascii`, `indent`, `separators`,
 passed to `json.dumps` itself, which produces the result or raises its usual
 exception: a `cls` argument or other encoder options, `skipkeys`, a circular
 reference, `NaN` with `allow_nan=False`, a key or a value that `json` cannot
-serialize. `dumpb(obj, **kw)` returns the same text as UTF-8 `bytes`, exactly
-`json.dumps(obj, **kw).encode()`, without building a `str` first: use it to
-write to a binary file or a socket. `dump(obj, fp, **kw)` writes
-`dumps(obj, **kw)` to `fp`.
+serialize. `dump(obj, fp, **kw)` writes `dumps(obj, **kw)` to `fp`.
+
+### `dumpb`: like `orjson.dumps`
+
+```python
+fastsimdjson.dumpb({"a": [1, 2.5, None]})            # b'{"a":[1,2.5,null]}'
+fastsimdjson.dumpb(obj, option=fastsimdjson.OPT_INDENT_2 | fastsimdjson.OPT_SORT_KEYS)
+fastsimdjson.dumpb({1, 2}, default=sorted)           # b'[1,2]'
+```
+
+`dumpb(obj, default=None, option=None)` has the arguments, the output and the
+errors of `orjson.dumps` (orjson 3.12): `orjson.dumps(obj, ...)` can be
+replaced by `fastsimdjson.dumpb(obj, ...)` for the types below. It returns
+compact UTF-8 `bytes`, writes floats as orjson does (`1e-6`, `1e+16`, `NaN`
+and infinities as `null`), and raises `TypeError` with orjson's messages:
+integers beyond 64 bits, a dict key that is not a `str`, invalid UTF-8 (a lone
+surrogate), nesting deeper than 254, a type it cannot serialize. `orjson.JSONEncodeError` is a subclass of `TypeError`, so
+`except TypeError` catches the errors of both.
+
+It serializes `str`, `int`, `float`, `bool`, `None`, `dict`, `list`, `tuple`,
+enums, and subclasses of `str`, `int`, `dict` and `list`. Anything else goes
+to `default`, as in orjson: its result is serialized in place of the object,
+and an exception it raises becomes the `__cause__` of the `TypeError`. The
+options are exported under orjson's names and values (`OPT_APPEND_NEWLINE`,
+`OPT_INDENT_2`, `OPT_NON_STR_KEYS`, `OPT_PASSTHROUGH_SUBCLASS`,
+`OPT_SORT_KEYS`, `OPT_STRICT_INTEGER`, ...). Unlike orjson, `dumpb` does not
+serialize dataclasses, `datetime`, `date`, `time`, `UUID`, numpy arrays or
+`orjson.Fragment` itself: they go to `default`, as if
+`OPT_PASSTHROUGH_DATACLASS` and `OPT_PASSTHROUGH_DATETIME` were set, and the
+options that concern only these types are accepted and have no effect.
 
 ### Files
 
@@ -146,8 +173,9 @@ calling thread. Views returned by `parse` remain valid.
 
 ## Build and test
 
-Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson 5.0.2
-and simdutf 9.2.1 amalgamations are already in `vendor/`.
+Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
+5.0.2 and simdutf 9.2.1 amalgamations, and zmij 1.2 (shortest float
+formatting, MIT license), are already in `vendor/`.
 
 pip:
 
@@ -192,10 +220,12 @@ why `PYTHONPATH=src` is required for the in-place build.
 
 `tests/test_loads.py` compares `loads` with `json.loads` on types and key
 order; `tests/test_lazy.py` checks the views returned by `parse` the same way,
-`tests/test_dumps.py` compares `dumps` and `dumpb` with `json.dumps` (output
-and exceptions), and `tests/test_stream.py` and `tests/test_files.py` cover
-streams and files. It covers scalars, integers past 64 bits, UTF-8 strings at every
-length from 0 to 199, the key cache, random documents, rejected input, deep
+`tests/test_dumps.py` compares `dumps` with `json.dumps` and `dumpb` with
+orjson (output and exceptions; the orjson comparisons are skipped when orjson
+is not installed, and recorded orjson results are checked either way), and
+`tests/test_stream.py` and `tests/test_files.py` cover streams and files. It
+covers scalars, integers past 64 bits, UTF-8 strings at every length from 0 to
+199, the key cache, random documents, rejected input, deep
 nesting, padding at a page boundary, a saturated array count, reference
 counts, and release of a parser that has grown past 64 MB. The corpus test
 is skipped until simdjson-data is checked out beside the project:
@@ -212,8 +242,8 @@ give it some RAM.
 The benchmark scripts need simdjson-data and the `bench` extra (orjson,
 msgspec, pysimdjson, cysimdjson). `bench.py` times `loads` against
 `json.loads` and orjson, `bench_lazy.py` times `parse` against pysimdjson and
-cysimdjson, `bench_dumps.py` times `dumps` and `dumpb`, and `bench_many.py`
-times `loads_many`.
+cysimdjson, `bench_dumps.py` times `dumps` against `json.dumps` and `dumpb`
+against orjson and msgspec, and `bench_many.py` times `loads_many`.
 
 pip:
 
@@ -238,7 +268,7 @@ python bench_many.py
 ## Benchmarks
 
 Intel Xeon Gold 6548N (Emerald Rapids), one core, Python 3.14.6,
-fastsimdjson 0.3.0 (development version, simdjson 5.0.2), the 22 files of
+fastsimdjson 0.3.0 (simdjson 5.0.2), the 22 files of
 [simdjson-data](https://github.com/simdjson/simdjson-data). The scripts are in
 this repository and in
 [the blog repository](https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/tree/master/2026/09/pysimdjson).
@@ -260,13 +290,16 @@ geometric mean over the 22 files (higher is better).
 | orjson 3.12.0 | 0.60 | 2.74× |
 | **fastsimdjson `loads`** | **0.78** | **3.53×** |
 
-fastsimdjson is the fastest on 21 of the 22 files; orjson is slightly faster
-on `numbers.json`, an array of floating-point numbers. Part of the gain comes
-from pausing the garbage collector while the objects are built: if the
-collector is disabled for every parser, fastsimdjson's lead over orjson drops
-from 1.29× to 1.17×, and orjson is slightly faster on `canada.json`,
-`mesh.json` and `numbers.json`. yyjson 4.0.6 is left out: it returns wrong
-strings for non-ASCII text.
+fastsimdjson is the fastest on 21 of the 22 files, and ties with orjson on
+`numbers.json`, an array of floating-point numbers (within 2%). On numbers,
+both spend most of their time creating Python floats, which costs the same in
+both: simdjson parses the numbers of these files 15% to 30% faster than
+orjson's parser (yyjson), but that is a small part of the total. Part of the
+gain comes from pausing the garbage collector while the objects are built.
+Timing each call on its own, fastsimdjson's lead over orjson is 1.33× with
+the collector enabled and 1.22× with it disabled (geometric means); without
+the collector, `canada.json`, `mesh.json` and `numbers.json` are ties. yyjson 4.0.6 is left out: it
+returns wrong strings for non-ASCII text.
 
 Parsing is no longer the bottleneck. simdjson alone parses these files at
 3.1 GB/s. It accounts for about a third of the time of `loads`; the rest goes
@@ -292,33 +325,38 @@ and the screen name of the 100 statuses of `twitter.json`:
 Here `parse` is about 25 times faster than `json.loads` and 5.5 times faster
 than `loads`. Most of its time is the simdjson parse itself.
 
-### Writing JSON with `dumps` and `dumpb`
+### `dumps` against `json.dumps`
 
-With the default arguments, `dumps` returns exactly the `str` of `json.dumps`
-and is 3.3 times faster (geometric mean over the 22 files; from 2.3 times on
-text-heavy files to 8 times on files full of numbers).
+`dumps` returns exactly the `str` of `json.dumps` and is 4.6 times faster
+(geometric mean over the 22 files; from 3.1 times on `citm_catalog.json` to
+12 times on `numbers.json`).
 
-orjson and msgspec produce compact UTF-8 `bytes`: no spaces after separators,
-non-ASCII characters left as they are. The fair comparison is with the same
-output: `dumpb(obj, separators=(",", ":"), ensure_ascii=False)`, and
-`json.dumps` with the same arguments followed by `.encode()`. These four
-produce identical bytes on 18 of the 22 files; on the others they differ only
-in how some floats are written (`1e-05` as in Python's `repr`, against
-`0.00001`). Microseconds:
+### `dumpb` against orjson and msgspec
+
+`dumpb`, `orjson.dumps` and `msgspec.json.encode` produce compact UTF-8
+`bytes`; `dumpb` and orjson produce identical bytes on every file. With the
+standard library, the same compact bytes come from
+`json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()`.
+Microseconds:
 
 | file | `json.dumps(...).encode()` | fastsimdjson `dumpb` | orjson | msgspec |
 |---|---:|---:|---:|---:|
-| twitter | 1798 | 549 | 200 | 348 |
-| citm_catalog | 2956 | 1115 | 430 | 493 |
-| github_events | 173 | 45 | 18 | 30 |
-| gsoc-2018 | 15309 | 1848 | 546 | 1423 |
-| canada | 38095 | 4708 | 2921 | 3636 |
-| numbers | 2515 | 352 | 197 | 333 |
+| twitter | 1827 | 202 | 204 | 330 |
+| citm_catalog | 2921 | 432 | 432 | 499 |
+| github_events | 177 | 17 | 19 | 31 |
+| gsoc-2018 | 15386 | 595 | 554 | 1462 |
+| update-center | 2482 | 254 | 232 | 477 |
+| canada | 38101 | 2432 | 2936 | 3640 |
+| mesh | 8726 | 785 | 999 | 1370 |
+| numbers | 2530 | 178 | 200 | 332 |
 
-`dumpb` is 3.8 times faster than `json.dumps(...).encode()` (geometric mean;
-2.4 to 8.3 times). orjson is faster still, by 2.6 times, and msgspec by 1.6
-times (geometric means). Unlike them, `dumps` and `dumpb` accept every argument
-of `json.dumps` and produce its exact output.
+`dumpb` and orjson are on par: over the 22 files, `dumpb` is 4% faster
+(geometric mean), from 10% slower on text-heavy or tiny files
+(`gsoc-2018.json`, `update-center.json`, `repeat.json`) to 27% faster on files
+full of numbers. Both are 1.7
+times faster than msgspec and 10 times faster than `json`. The comparison was
+run on a processor with AVX-512, which `dumpb` and orjson both use to escape
+strings; other x64 processors use SSE2 and ARM processors NEON.
 
 ### Streams with `loads_many`
 

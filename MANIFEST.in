@@ -1,2 +1,2 @@
-include vendor/*.h vendor/*.cpp src/*.cpp
+include vendor/*.h vendor/*.cpp vendor/*.cc vendor/zmij-LICENSE src/*.cpp
 recursive-include tests *.py

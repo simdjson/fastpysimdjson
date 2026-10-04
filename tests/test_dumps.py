@@ -266,6 +266,10 @@ class MyStr2(str):
     pass
 
 
+class MyTuple(tuple):
+    pass
+
+
 # Expected bytes recorded from orjson 3.12 (so that the tests do not need
 # orjson); each case is (object, option, expected bytes or error message).
 ORJSON_CASES = [
@@ -293,6 +297,22 @@ ORJSON_CASES = [
     ([MyStr2("v")], 256, "Type is not JSON serializable: MyStr2"),
     ({MyStr2("k"): 1}, 256, "Dict key must be str"),
     (1, 1 << 20, "Invalid opts"),
+    # Keys: exact str only, unless OPT_NON_STR_KEYS (which ignores
+    # OPT_PASSTHROUGH_SUBCLASS and OPT_STRICT_INTEGER, and converts every key
+    # before writing a value).
+    ({MyStr2("k"): 1}, 0, "Dict key must be str"),
+    ({MyStr2("k"): 1}, 4 | 256, b'{"k":1}'),
+    ({Level.HIGH: 1, 2**60: 2}, 4 | 64, b'{"3":1,"1152921504606846976":2}'),
+    ({2**64: 1}, 4, "Dict integer key must be within 64-bit range"),
+    ({"a": {1}, -(2**63) - 1: 1}, 4, "Dict integer key must be within 64-bit range"),
+    ({MyFloat(2.5): 1}, 4, "Dict key must a type serializable with OPT_NON_STR_KEYS"),
+    ({(1,): 1}, 4, "Dict key must a type serializable with OPT_NON_STR_KEYS"),
+    ({"b": 1, 10: 2, "a": 3, float("nan"): 4}, 4 | 32, b'{"10":2,"a":3,"b":1,"null":4}'),
+    # Values: subclasses of str, int, list and dict, not of float or tuple;
+    # dict subclasses as stored (not their items()).
+    ([MyFloat(1.5)], 0, "Type is not JSON serializable: MyFloat"),
+    ([MyTuple((1,))], 0, "Type is not JSON serializable: MyTuple"),
+    ([ItemsDict(a=1), MyList([MyDict(b=LoudInt(2))])], 0, b'[{"a":1},[{"b":2}]]'),
 ]
 
 
@@ -321,6 +341,13 @@ def test_dumpb_default_and_depth():
     with pytest.raises(TypeError, match="Type is not JSON serializable: set") as info:
         fastsimdjson.dumpb({1}, default=lambda o: 1 / 0)
     assert isinstance(info.value.__cause__, ZeroDivisionError)
+    # As orjson, default may be any object: one that cannot be called fails
+    # when needed (default=None too).
+    assert fastsimdjson.dumpb([1], default=None) == b"[1]"
+    for dflt in (None, 5):
+        with pytest.raises(TypeError, match="Type is not JSON serializable: set") as info:
+            fastsimdjson.dumpb({1}, default=dflt)
+        assert isinstance(info.value.__cause__, TypeError)
     for depth, ok in ((254, True), (255, False)):
         deep = []
         for _ in range(depth - 1):
@@ -363,7 +390,8 @@ ORJSON_OPTIONS = [0, 1, 32, 1 | 32, 4, 4 | 32, 1024, 64, 256]
 def test_dumpb_matches_orjson_files(path):
     obj = json.loads(open(path, "rb").read())
     for option in ORJSON_OPTIONS:
-        assert fastsimdjson.dumpb(obj, option=option) == orjson.dumps(obj, option=option)
+        assert orjson_outcome(fastsimdjson.dumpb, obj, option=option) == \
+            orjson_outcome(orjson.dumps, obj, option=option)
 
 
 def orjson_outcome(fn, obj, **kw):

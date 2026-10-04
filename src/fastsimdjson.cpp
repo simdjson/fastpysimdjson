@@ -27,6 +27,7 @@
 #include "simdjson.h"
 #include "simdjson.cpp"
 #include "simdutf.h"
+#include "zmij.h" // shortest float digits for dumps and dumpb (vendor/zmij.cc)
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -35,16 +36,30 @@ inline int ctz64(uint64_t x) {
   _BitScanForward64(&i, x);
   return int(i);
 }
+inline int clz64(uint64_t x) {
+  unsigned long i;
+  _BitScanReverse64(&i, x);
+  return 63 - int(i);
+}
 #else
 inline int ctz64(uint64_t x) { return __builtin_ctzll(x); }
+inline int clz64(uint64_t x) { return __builtin_clzll(x); }
 #endif
 
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
 #include <emmintrin.h>
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
 #define FSJ_SSE2 1
 #elif defined(__ARM_NEON) || defined(_M_ARM64)
 #include <arm_neon.h>
 #define FSJ_NEON 1
+#endif
+
+#if defined(_MSC_VER) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define FSJ_LITTLE_ENDIAN 1
 #endif
 
 #if PY_VERSION_HEX >= 0x030D0000
@@ -114,11 +129,14 @@ bool caches_can_decref() {
 // (see the lazy API below), kept for the next parse() on this thread.
 // dumpb's dict keys, as written (quoted and escaped), by object identity.
 // The cache holds a reference to each key, so an entry's object cannot be
-// freed and its address reused while it is in the cache.
+// freed and its address reused while it is in the cache. A key enters the
+// cache the second time it is seen (seen holds no reference: it only
+// remembers an address), so that keys seen once cost little.
 constexpr size_t ENCODED_KEY_CACHE_SIZE = 1024; // power of two
 constexpr size_t ENCODED_KEY_MAX = 64;          // bytes of text
 struct EncodedKey {
   PyObject *key = nullptr;
+  PyObject *seen = nullptr;
   uint32_t len = 0;
   char text[ENCODED_KEY_MAX];
 };
@@ -1257,8 +1275,8 @@ inline PyObject *list_item(PyObject *list, Py_ssize_t i) {
   if (i >= PyList_GET_SIZE(list)) {
     return nullptr; // checked first: an IndexError per list would be costly
   }
-#if PY_VERSION_HEX >= 0x030D0000
-  PyObject *item = PyList_GetItemRef(list, i);
+#ifdef Py_GIL_DISABLED
+  PyObject *item = PyList_GetItemRef(list, i); // another thread may change it
   if (item == nullptr) {
     PyErr_Clear();
   }
@@ -1278,18 +1296,63 @@ struct OutBuf {
   char *buf = nullptr;
   size_t len = 0;
   size_t cap = 0;
-  OutBuf() = default;
+  // With as_bytes, the output is written into a bytes object (no final copy).
+  bool as_bytes = false;
+  PyObject *bytes = nullptr;
+  explicit OutBuf(bool b = false) : as_bytes(b) {}
   OutBuf(const OutBuf &) = delete;
   OutBuf &operator=(const OutBuf &) = delete;
-  ~OutBuf() { free(buf); }
-  FSJ_NOINLINE void grow(size_t n) {
-    size_t c = std::max(cap * 2, len + n + 1024);
-    char *p = static_cast<char *>(realloc(buf, c));
-    if (p == nullptr) {
-      throw std::bad_alloc();
+  ~OutBuf() {
+    if (as_bytes) {
+      Py_XDECREF(bytes);
+    } else {
+      free(buf);
     }
-    buf = p;
+  }
+  FSJ_NOINLINE void grow(size_t n) {
+    // As orjson: a bytes object of one page, doubled as needed (the sizes
+    // matter to glibc, which may move a large buffer at each growth).
+    size_t c = cap == 0 ? 4096 - sizeof(PyBytesObject) : cap;
+    while (c < len + n + 1) {
+      c *= 2;
+    }
+    if (as_bytes) {
+      if (bytes == nullptr) {
+        bytes = PyBytes_FromStringAndSize(nullptr, Py_ssize_t(c));
+      } else if (_PyBytes_Resize(&bytes, Py_ssize_t(c)) < 0) {
+        bytes = nullptr;
+      }
+      if (bytes == nullptr) {
+        throw std::bad_alloc();
+      }
+      buf = PyBytes_AS_STRING(bytes);
+    } else {
+      char *p = static_cast<char *>(realloc(buf, c));
+      if (p == nullptr) {
+        throw std::bad_alloc();
+      }
+      buf = p;
+    }
     cap = c;
+  }
+  // The bytes written (as_bytes only); the buffer gives it up.
+  PyObject *take_bytes() {
+    if (bytes == nullptr) {
+      return PyBytes_FromStringAndSize(nullptr, 0);
+    }
+    if (len >= cap / 2) {
+      // At least half full: keep the allocation, as orjson does. Shrinking a
+      // large buffer lowers glibc's threshold for mmap, and the next large
+      // output then moves to fresh pages at each growth.
+      Py_SET_SIZE(bytes, Py_ssize_t(len));
+      buf[len] = '\0';
+    } else if (_PyBytes_Resize(&bytes, Py_ssize_t(len)) < 0) {
+      bytes = nullptr;
+      return nullptr;
+    }
+    PyObject *r = bytes;
+    bytes = nullptr;
+    return r;
   }
   // Pointer to the end of the output, with room for n more bytes.
   inline char *reserve(size_t n) {
@@ -1316,17 +1379,53 @@ struct OutBuf {
   const char *data() const { return buf; }
 };
 
+// The 8 decimal digits of v < 10^8 as ASCII, most significant first in
+// memory, computed in parallel within a 64-bit word.
+inline uint64_t eight_digits(uint32_t v) {
+  uint64_t merged = uint64_t(v / 10000) | (uint64_t(v % 10000) << 32);
+  uint64_t hundreds = ((merged * 10486) >> 20) & 0x0000007F0000007FULL;
+  uint64_t pairs = hundreds | ((merged - hundreds * 100) << 16);
+  uint64_t tens = ((pairs * 103) >> 10) & 0x000F000F000F000FULL;
+  uint64_t digits = tens | ((pairs - tens * 10) << 8);
+  return digits + 0x3030303030303030ULL;
+}
+
+// Number of decimal digits of v > 0.
+inline int decimal_digits(uint64_t v) {
+  static const uint64_t powers[] = {
+      1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL,
+      100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL, 1000000000000ULL,
+      10000000000000ULL, 100000000000000ULL, 1000000000000000ULL,
+      10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL,
+      10000000000000000000ULL};
+  int bits = 64 - clz64(v | 1);
+  int guess = (bits * 1233) >> 12; // log10(2) ~ 1233 / 4096
+  return guess + (v >= powers[guess]);
+}
+
 // A finite double as Python's repr writes it, or as orjson does. dragonbox
 // gives the shortest digits that round-trip, the same digits as repr
 // (checked on millions of values). repr writes them in fixed notation when
 // the decimal exponent is in (-4, 16], and as d.ddde+XX otherwise (at least
 // two exponent digits); orjson uses fixed notation from one more decade
 // down, (-5, 16], and does not pad the exponent (1e-6).
+// Stores 24 bytes at dst: the digit field w (3 words of ASCII digits, then
+// filler) starting at its byte s, shifted in registers. The digits are never
+// read back from memory: a load spanning several recent stores would stall.
+inline void store_digits(char *dst, const uint64_t *w, unsigned s) {
+  unsigned q = s >> 3, r = (s & 7) * 8;
+  uint64_t a0 = w[q], a1 = w[q + 1], a2 = w[q + 2], a3 = w[q + 3];
+  uint64_t o0 = r ? (a0 >> r) | (a1 << (64 - r)) : a0;
+  uint64_t o1 = r ? (a1 >> r) | (a2 << (64 - r)) : a1;
+  uint64_t o2 = r ? (a2 >> r) | (a3 << (64 - r)) : a2;
+  memcpy(dst, &o0, 8);
+  memcpy(dst + 8, &o1, 8);
+  memcpy(dst + 16, &o2, 8);
+}
+
 template <bool Orjson>
-void append_float(OutBuf &out, double v) {
-  // Digits are copied in fixed blocks of 17 (dragonbox writes at most 17),
-  // which compile to a few moves: reserve room for the overshoot.
-  char *p = out.reserve(64);
+FSJ_NOINLINE void append_float_layout(OutBuf &out, double v) {
+  char *p = out.reserve(64); // writes overshoot the result: reserve the room
   char *start = p;
   if (std::signbit(v)) {
     *p++ = '-';
@@ -1337,36 +1436,56 @@ void append_float(OutBuf &out, double v) {
     out.len += size_t(p + 3 - start);
     return;
   }
-  char d[simdjson::internal::to_chars_buffer_size + 24];
-  int nd, e10;
-  simdjson::internal::dtoa_impl::dragonbox(d, nd, e10, v);
-  int decpt = nd + e10; // v = 0.d * 10^decpt
+  // The shortest digits that round-trip (zmij: the digits of repr, possibly
+  // followed by zeros), as a field of 24 ASCII digits in three words. The
+  // first significant digit is at byte z; trailing '0's are dropped by
+  // counting them in the words, not by dividing.
+  zmij::dec_fp<> dec = zmij::to_decimal(v);
+  uint64_t sig = dec.sig;
+  const uint64_t zeros = 0x3030303030303030ULL;
+  const uint64_t w[7] = {eight_digits(uint32_t(sig / 10000000000000000ULL)),
+                         eight_digits(uint32_t((sig / 100000000) % 100000000)),
+                         eight_digits(uint32_t(sig % 100000000)), zeros, zeros, zeros, zeros};
+  int nd = decimal_digits(sig);
+  // Trailing '0' digits: the last digit is the most significant byte of w[2].
+  int tz;
+  if (uint64_t x = w[2] ^ zeros) {
+    tz = clz64(x) / 8;
+  } else if (uint64_t y = w[1] ^ zeros) {
+    tz = 8 + clz64(y) / 8;
+  } else {
+    tz = 16 + clz64(w[0] ^ zeros) / 8;
+  }
+  unsigned z = unsigned(24 - nd);
+  int decpt = nd + dec.exp; // v = 0.d * 10^decpt
+  nd -= tz;
   if (decpt > (Orjson ? -5 : -4) && decpt <= 16) {
     if (decpt <= 0) {
-      memcpy(p, "0.0000", 8); // "0." and up to four zeros
+      memcpy(p, "0.000000", 8); // "0." and up to four zeros
       p += 2 - decpt;
-      memcpy(p, d, 17);
+      store_digits(p, w, z);
       p += nd;
     } else if (decpt >= nd) {
-      memcpy(p, d, 17);
-      p += nd;
-      memset(p, '0', 16);
-      p += decpt - nd;
+      store_digits(p, w, z); // the digits, then zeros from the filler
+      p += decpt;
       memcpy(p, ".0", 2);
       p += 2;
     } else {
-      memcpy(p, d, 17);
+      store_digits(p, w, z);
       p += decpt;
       *p++ = '.';
-      memcpy(p, d + decpt, 17);
+      store_digits(p, w, z + unsigned(decpt));
       p += nd - decpt;
     }
   } else {
-    *p++ = d[0];
+    // d.ddd: the digits one byte further, then the first moved before '.'.
+    store_digits(p + 1, w, z);
+    p[0] = p[1];
     if (nd > 1) {
-      *p++ = '.';
-      memcpy(p, d + 1, 16);
-      p += nd - 1;
+      p[1] = '.';
+      p += nd + 1;
+    } else {
+      p += 1;
     }
     int e = decpt - 1;
     *p++ = 'e';
@@ -1385,36 +1504,100 @@ void append_float(OutBuf &out, double v) {
   out.len += size_t(p - start);
 }
 
+// zmij writes the digits of repr: fixed notation for 1e-4 <= |v| < 1e16,
+// d.ddde+XX otherwise. Integral values lack repr's ".0"; orjson also writes
+// 1e-5 <= |v| < 1e-4 in fixed notation (append_float_layout) and does not pad
+// a negative exponent (1e-6, not 1e-06). The bounds are compared as doubles:
+// the shortest digits of a double below 1e-5 (or 1e-4) are below it too.
+template <bool Orjson>
+inline void append_float(OutBuf &out, double v) {
+  double a = std::fabs(v);
+  if (Orjson && a >= 1e-5 && a < 1e-4) {
+    append_float_layout<true>(out, v);
+    return;
+  }
+  char *p = out.reserve(64); // zmij needs 34 bytes, ".0" 2 more
+  char *e = zmij::detail::write(p, v);
+  if (a < 1e16 && a == double(int64_t(a))) {
+    memcpy(e, ".0", 2);
+    e += 2;
+  } else if (Orjson && e - p >= 4 && e[-4] == 'e' && e[-3] == '-' && e[-2] == '0') {
+    e[-2] = e[-1];
+    e--;
+  }
+  out.len += size_t(e - p);
+}
+
 const char DIGIT_PAIRS[] =
     "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
     "8081828384858687888990919293949596979899";
 
-// Decimal digits of v, two at a time.
-inline void append_u64(OutBuf &out, uint64_t v) {
-  char buf[24];
-  char *p = buf + sizeof(buf);
-  while (v >= 100) {
-    p -= 2;
-    memcpy(p, DIGIT_PAIRS + 2 * (v % 100), 2);
-    v /= 100;
-  }
-  if (v >= 10) {
-    p -= 2;
+// Decimal digits by magnitude, from pairs of digits (as itoap, which orjson
+// uses): v < 10^4 in one to four digits, wider values in chunks of exactly
+// four or eight digits.
+inline char *write_u32_small(char *p, uint32_t v) { // v < 10^4
+  if (v < 100) {
+    if (v < 10) {
+      *p = char('0' + v);
+      return p + 1;
+    }
     memcpy(p, DIGIT_PAIRS + 2 * v, 2);
-  } else {
-    *--p = char('0' + v);
+    return p + 2;
   }
-  out.append(p, size_t(buf + sizeof(buf) - p));
+  uint32_t hi = v / 100, lo = v % 100;
+  if (v < 1000) {
+    *p = char('0' + hi);
+    memcpy(p + 1, DIGIT_PAIRS + 2 * lo, 2);
+    return p + 3;
+  }
+  memcpy(p, DIGIT_PAIRS + 2 * hi, 2);
+  memcpy(p + 2, DIGIT_PAIRS + 2 * lo, 2);
+  return p + 4;
+}
+
+inline char *write_u32_eight(char *p, uint32_t v) { // v < 10^8
+  if (v < 10000) {
+    return write_u32_small(p, v);
+  }
+  p = write_u32_small(p, v / 10000);
+  uint32_t lo = v % 10000;
+  memcpy(p, DIGIT_PAIRS + 2 * (lo / 100), 2);
+  memcpy(p + 2, DIGIT_PAIRS + 2 * (lo % 100), 2);
+  return p + 4;
+}
+
+inline char *write_u64(char *p, uint64_t v) {
+  if (v < 100000000) {
+    return write_u32_eight(p, uint32_t(v));
+  }
+  uint64_t low;
+  if (v < 10000000000000000ULL) {
+    p = write_u32_eight(p, uint32_t(v / 100000000));
+  } else {
+    uint64_t hi = v / 100000000;
+    p = write_u32_small(p, uint32_t(hi / 100000000)); // at most 1844
+    low = eight_digits(uint32_t(hi % 100000000));
+    memcpy(p, &low, 8);
+    p += 8;
+  }
+  low = eight_digits(uint32_t(v % 100000000));
+  memcpy(p, &low, 8);
+  return p + 8;
+}
+
+inline void append_u64(OutBuf &out, uint64_t v) {
+  char *p = out.reserve(20);
+  out.len += size_t(write_u64(p, v) - p);
 }
 
 inline void append_i64(OutBuf &out, long long v) {
-  if (v < 0) {
-    out.push_back('-');
-    append_u64(out, uint64_t(0) - uint64_t(v));
-  } else {
-    append_u64(out, uint64_t(v));
-  }
+  char *p = out.reserve(21);
+  char *q = p;
+  *q = '-';
+  q += v < 0;
+  uint64_t u = v < 0 ? uint64_t(0) - uint64_t(v) : uint64_t(v);
+  out.len += size_t(write_u64(q, u) - p);
 }
 
 // Writes the JSON escape of c at p (at most 12 bytes); returns the new end.
@@ -1455,6 +1638,29 @@ inline bool byte_needs_escape(uint8_t c, bool escape_del) {
   return c < 0x20 || c == '"' || c == '\\' || (c == 0x7F && escape_del);
 }
 
+// The high bit of each byte of w that may need an escape: exact up to the
+// first that does (a borrow may mark the bytes above it); bytes >= 0x80
+// never do.
+inline uint64_t escape_bits(uint64_t w, bool escape_del) {
+  const uint64_t ones = 0x0101010101010101ULL;
+  const uint64_t highs = 0x8080808080808080ULL;
+  uint64_t lt20 = (w - ones * 0x20) & ~w;
+  uint64_t q = w ^ (ones * '"');
+  uint64_t b = w ^ (ones * '\\');
+  uint64_t eq = ((q - ones) & ~q) | ((b - ones) & ~b);
+  if (escape_del) {
+    uint64_t d = w ^ (ones * 0x7F);
+    eq |= (d - ones) & ~d;
+  }
+  return (lt20 | eq) & highs;
+}
+
+// True when one of the 8 bytes in w may need an escape (exact when none
+// does).
+inline bool word_needs_escape(uint64_t w, bool escape_del) {
+  return escape_bits(w, escape_del) != 0;
+}
+
 // Bit mask of the bytes of the 16 at s that need an escape; bytes >= 0x80
 // (UTF-8 sequences) never do.
 #if FSJ_SSE2
@@ -1481,6 +1687,41 @@ inline uint64_t escape_mask16(const char *s, bool escape_del) {
 }
 #endif
 
+// The escapes of the ASCII characters that need one, as 8 bytes to copy
+// (the text, then padding) and the length in the last byte.
+struct EscapeTable {
+  char entry[128][8] = {};
+  constexpr EscapeTable() {
+    for (int c = 0; c < 128; c++) {
+      char *e = entry[c];
+      const char *hex = "0123456789abcdef";
+      char short_form = c == '"' ? '"' : c == '\\' ? '\\' : c == '\b' ? 'b' : c == '\f' ? 'f'
+                        : c == '\n' ? 'n' : c == '\r' ? 'r' : c == '\t' ? 't' : 0;
+      if (short_form != 0) {
+        e[0] = '\\';
+        e[1] = short_form;
+        e[7] = 2;
+      } else if (c < 0x20 || c == 0x7F) {
+        e[0] = '\\';
+        e[1] = 'u';
+        e[2] = '0';
+        e[3] = '0';
+        e[4] = hex[c >> 4];
+        e[5] = hex[c & 0xF];
+        e[7] = 6;
+      }
+    }
+  }
+};
+constexpr EscapeTable ESCAPES;
+
+// Writes the escape of the ASCII character c (one that needs it) at p, with
+// room for 8 bytes; returns the new end.
+inline char *write_escaped_ascii(char *p, uint8_t c) {
+  memcpy(p, ESCAPES.entry[c], 8);
+  return p + ESCAPES.entry[c][7];
+}
+
 // Copies s[0, len) to p, escaping the ASCII characters that need it; bytes
 // >= 0x80 (UTF-8 sequences) are copied as they are. p must have room for
 // 6 * len + 16 bytes. Returns the new end.
@@ -1502,29 +1743,113 @@ inline char *escape_into(char *p, const char *s, size_t len, bool escape_del) {
 #endif
     p += k;
     i += k;
-    p = write_escaped(p, uint8_t(s[i]));
+    p = write_escaped_ascii(p, uint8_t(s[i]));
     i++;
   }
-  if (i < len) {
-    // The tail (under 16 bytes), checked in a buffer padded with spaces.
-    char tail[16];
-    memset(tail, ' ', 16);
-    memcpy(tail, s + i, len - i);
-    if (escape_mask16(tail, escape_del) == 0) {
-      memcpy(p, tail, 16); // the caller reserved the room
-      return p + (len - i);
+#endif
+  // The tail (under 16 bytes) as two overlapping words: fixed-size loads and
+  // stores, no call to memcpy.
+  size_t n = len - i;
+  if (n >= 8) {
+    uint64_t a = load_u64(s + i), b = load_u64(s + len - 8);
+    if (!word_needs_escape(a, escape_del) && !word_needs_escape(b, escape_del)) {
+      if (n > 8) { // the second word may overlap the first: store it first
+        memcpy(p + n - 8, &b, 8);
+      }
+      memcpy(p, &a, 8);
+      if (n <= 8) {
+        memcpy(p + n - 8, &b, 8);
+      }
+      return p + n;
+    }
+  } else if (n >= 4) {
+    uint32_t a, b;
+    memcpy(&a, s + i, 4);
+    memcpy(&b, s + len - 4, 4);
+    if (!word_needs_escape(uint64_t(a) | (uint64_t(b) << 32), escape_del)) {
+      memcpy(p + n - 4, &b, 4);
+      memcpy(p, &a, 4);
+      return p + n;
     }
   }
-#endif
   for (; i < len; i++) {
     uint8_t c = uint8_t(s[i]);
     if (byte_needs_escape(c, escape_del)) {
-      p = write_escaped(p, c);
+      p = write_escaped_ascii(p, c);
     } else {
       *p++ = char(c);
     }
   }
   return p;
+}
+
+// With AVX-512 (x64, detected at run time), as orjson: 32 bytes at a time,
+// and the tail in one masked load (masked bytes are not read, so it cannot
+// fault). Stores 32 bytes at a time: p must have room for 6 * len + 32
+// bytes, and must not overlap s.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define FSJ_AVX512 1
+bool has_avx512 = false;
+
+// AVX-512F, BW and VL, with the vector and mask registers enabled by the
+// operating system (macOS enables them on first use: the SSE2 code runs).
+bool detect_avx512() {
+  unsigned a, b, c, d;
+  if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27))) { // OSXSAVE
+    return false;
+  }
+  unsigned xcr0_lo, xcr0_hi;
+  __asm__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+  if ((xcr0_lo & 0xE6) != 0xE6) { // SSE, AVX, opmask and ZMM state
+    return false;
+  }
+  if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) {
+    return false;
+  }
+  return (b & (1u << 16)) && (b & (1u << 30)) && (b & (1u << 31)); // F, BW, VL
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl"))) FSJ_NOINLINE char *
+escape_into_avx512(char *p, const char *s, size_t len, bool escape_del) {
+  const __m256i backslash = _mm256_set1_epi8('\\'), quote = _mm256_set1_epi8('"');
+  const __m256i space = _mm256_set1_epi8(0x20), del = _mm256_set1_epi8(0x7F);
+  for (;;) {
+    bool full = len >= 32;
+    __mmask32 live = full ? ~__mmask32(0) : __mmask32((uint32_t(1) << len) - 1);
+    __m256i v = _mm256_maskz_loadu_epi8(live, s);
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(p), v);
+    uint32_t m = _mm256_cmpeq_epi8_mask(v, backslash) | _mm256_cmpeq_epi8_mask(v, quote) |
+                 _mm256_cmplt_epu8_mask(v, space);
+    if (escape_del) {
+      m |= _mm256_cmpeq_epi8_mask(v, del);
+    }
+    m &= live;
+    if (m == 0) {
+      if (!full) {
+        return p + len;
+      }
+      p += 32;
+      s += 32;
+      len -= 32;
+      continue;
+    }
+    size_t k = size_t(ctz64(m));
+    p = write_escaped_ascii(p + k, uint8_t(s[k]));
+    s += k + 1;
+    len -= k + 1;
+  }
+}
+#endif
+
+// escape_into, with AVX-512 when available: p must have room for
+// 6 * len + 32 bytes and must not overlap s.
+inline char *escape_into_wide(char *p, const char *s, size_t len, bool escape_del) {
+#if FSJ_AVX512
+  if (has_avx512) {
+    return escape_into_avx512(p, s, len, escape_del);
+  }
+#endif
+  return escape_into(p, s, len, escape_del);
 }
 
 struct Encoder {
@@ -1590,9 +1915,9 @@ struct Encoder {
   FSJ_NOINLINE int encode_str(PyObject *s) {
     size_t len = size_t(PyUnicode_GET_LENGTH(s));
     if (PyUnicode_IS_ASCII(s)) {
-      char *p = out.reserve(6 * len + 18);
+      char *p = out.reserve(6 * len + 34);
       *p++ = '"';
-      p = escape_into(p, static_cast<const char *>(PyUnicode_DATA(s)), len, ensure_ascii);
+      p = escape_into_wide(p, static_cast<const char *>(PyUnicode_DATA(s)), len, ensure_ascii);
       *p++ = '"';
       out.len = size_t(p - out.buf);
       return ENCODE_OK;
@@ -2004,15 +2329,37 @@ constexpr int ORJSON_MAX_DEPTH = 254;
 PyObject *EnumType = nullptr; // enum.Enum
 
 struct OrjsonEncoder {
-  OutBuf out;
+  OutBuf out{true};
+  EncodedKey *keys = g_thread_parser.encoded_keys; // fetched once: TLS is slow
   PyObject *default_fn = nullptr; // borrowed
   unsigned long opts = 0;
   int depth = 0;         // containers being encoded
   int default_calls = 0; // nested calls to default
+  // With borrowed, the items of containers are not referenced, as with
+  // orjson: fast, and safe as long as no Python code runs, as none does for
+  // the exact types. Python code (default, enum values, dict subclasses)
+  // sets restart instead, and dumpb encodes again without borrowed.
+  bool borrowed = false;
+  bool restart = false;
 
   int fail(const char *msg) {
     PyErr_SetString(PyExc_TypeError, msg);
     return -1;
+  }
+
+  // Before running Python code: -1 (no exception) to start again when the
+  // items are borrowed, else 0.
+  int python_may_run() {
+    if (borrowed) {
+      restart = true;
+      return -1;
+    }
+    return 0;
+  }
+
+  // As orjson: an instance of a class made by enum.EnumType.
+  static bool is_enum(PyObject *o) {
+    return reinterpret_cast<PyObject *>(Py_TYPE(o))->ob_type == Py_TYPE(EnumType);
   }
 
   void newline() {
@@ -2029,6 +2376,21 @@ struct OrjsonEncoder {
     if (PyUnicode_IS_COMPACT_ASCII(s)) {
       p = static_cast<const char *>(PyUnicode_DATA(s));
       n = PyUnicode_GET_LENGTH(s);
+#if FSJ_LITTLE_ENDIAN
+      if (n < 8) {
+        // One load: the 8 bytes ending with the terminating NUL, within the
+        // object (the text follows a header of 40 bytes or more).
+        uint64_t w = load_u64(p + n - 7) >> (8 * (7 - n));
+        if ((escape_bits(w, false) & ((uint64_t(1) << (8 * n)) - 1)) == 0) {
+          char *d = out.reserve(18);
+          d[0] = '"';
+          memcpy(d + 1, &w, 8);
+          d[n + 1] = '"';
+          out.len += size_t(n) + 2;
+          return 0;
+        }
+      }
+#endif
     } else {
       p = PyUnicode_AsUTF8AndSize(s, &n); // cached on the str, as orjson does
       if (p == nullptr) {
@@ -2036,15 +2398,15 @@ struct OrjsonEncoder {
         return fail("str is not valid UTF-8: surrogates not allowed");
       }
     }
-    char *w = out.reserve(6 * size_t(n) + 18);
+    char *w = out.reserve(6 * size_t(n) + 34);
     *w++ = '"';
-    w = escape_into(w, p, size_t(n), false);
+    w = escape_into_wide(w, p, size_t(n), false);
     *w++ = '"';
     out.len = size_t(w - out.buf);
     return 0;
   }
 
-  int encode_int(PyObject *o) {
+  FSJ_NOINLINE int encode_int(PyObject *o) {
     int overflow = 0;
     long long v = PyLong_AsLongLongAndOverflow(o, &overflow);
     if (overflow == 0) {
@@ -2072,77 +2434,133 @@ struct OrjsonEncoder {
     return fail("Integer exceeds 64-bit range");
   }
 
-  void encode_float(double v) {
+  static void encode_float_into(OutBuf &o, double v) {
     if (std::isfinite(v)) {
-      append_float<true>(out, v);
+      append_float<true>(o, v);
     } else {
-      out.append("null", 4);
+      o.append("null", 4);
     }
   }
 
-  // A dict key: a str, or with OPT_NON_STR_KEYS, the text of an int, float,
-  // bool, None or enum.
-  // An exact str key, from the cache of encoded keys when possible.
-  int encode_str_key(PyObject *k) {
-    EncodedKey *cache = g_thread_parser.encoded_keys;
-    if (cache == nullptr) {
-      cache = g_thread_parser.encoded_keys = new (std::nothrow) EncodedKey[ENCODED_KEY_CACHE_SIZE];
-      if (cache == nullptr) {
-        return encode_str(k);
-      }
+  void encode_float(double v) { encode_float_into(out, v); }
+
+  void key_separator() {
+    if (opts & OPT_INDENT_2) {
+      out.append(": ", 2);
+    } else {
+      out.push_back(':');
     }
-    EncodedKey &e = cache[(reinterpret_cast<uintptr_t>(k) >> 4) & (ENCODED_KEY_CACHE_SIZE - 1)];
-    if (e.key == k) {
-      memcpy(out.reserve(ENCODED_KEY_MAX), e.text, ENCODED_KEY_MAX);
-      out.len += e.len;
-      return 0;
-    }
+  }
+
+  // An exact str key with its separators, when its text is not in the cache
+  // (or with indent). A key enters the cache the second time it is seen.
+  FSJ_NOINLINE int encode_str_key_miss(PyObject *k, EncodedKey *e, bool first) {
+    separate(first);
     size_t start = out.len;
     if (encode_str(k) < 0) {
       return -1;
     }
     size_t n = out.len - start;
-    if (n <= ENCODED_KEY_MAX) {
+    if (e == nullptr || e->key == k) {
+      // No cache, or in the cache (with indent).
+    } else if (e->seen != k) {
+      e->seen = k;
+    } else if (n <= ENCODED_KEY_MAX) {
+      out.reserve(ENCODED_KEY_MAX); // the copy reads a whole entry
       Py_INCREF(k);
-      Py_XDECREF(e.key);
-      e.key = k;
-      e.len = uint32_t(n);
-      memcpy(e.text, out.buf + start, n);
+      Py_XDECREF(e->key);
+      e->key = k;
+      e->len = uint32_t(n);
+      memcpy(e->text, out.buf + start, ENCODED_KEY_MAX);
     }
+    key_separator();
     return 0;
   }
 
-  int encode_key(PyObject *k) {
-    if (PyUnicode_CheckExact(k)) {
-      return encode_str_key(k);
-    }
-    if (PyUnicode_Check(k) && !(opts & OPT_PASSTHROUGH_SUBCLASS)) {
-      return encode_str(k);
-    }
-    if (!(opts & OPT_NON_STR_KEYS)) {
+  // A dict entry without OPT_NON_STR_KEYS or OPT_SORT_KEYS: the key must be
+  // an exact str (not a subclass, as with orjson).
+  FSJ_ALWAYS_INLINE int encode_entry(PyObject *key, PyObject *value, bool first) {
+    if (!PyUnicode_CheckExact(key)) {
       return fail("Dict key must be str");
     }
-    if (k == Py_True || k == Py_False || k == Py_None) {
-      out.append(k == Py_True ? "\"true\"" : k == Py_False ? "\"false\"" : "\"null\"");
+    EncodedKey *e = keys == nullptr ? nullptr
+                                    : &keys[(reinterpret_cast<uintptr_t>(key) >> 4) &
+                                            (ENCODED_KEY_CACHE_SIZE - 1)];
+    if (e != nullptr && e->key == key && !(opts & OPT_INDENT_2)) {
+      char *d = out.reserve(ENCODED_KEY_MAX + 2);
+      *d = ',';
+      d += !first;
+      memcpy(d, e->text, ENCODED_KEY_MAX);
+      d[e->len] = ':';
+      out.len = size_t(d + e->len + 1 - out.buf);
+    } else if (encode_str_key_miss(key, e, first) < 0) {
+      return -1;
+    }
+    return encode(value);
+  }
+
+  static int utf8_of(PyObject *s, std::string &text) {
+    Py_ssize_t n;
+    const char *u = PyUnicode_AsUTF8AndSize(s, &n);
+    if (u == nullptr) {
+      PyErr_Clear();
+      PyErr_SetString(PyExc_TypeError, "str is not valid UTF-8: surrogates not allowed");
+      return -1;
+    }
+    text.assign(u, size_t(n));
+    return 0;
+  }
+
+  // The text of a key other than an exact str, with OPT_NON_STR_KEYS. As
+  // orjson: OPT_PASSTHROUGH_SUBCLASS does not apply, int keys may exceed 53
+  // bits, and a float subclass is not accepted.
+  int non_str_key(PyObject *k, std::string &text) {
+    if (PyUnicode_Check(k)) {
+      return utf8_of(k, text);
+    }
+    if (k == Py_None || k == Py_True || k == Py_False) {
+      text = k == Py_None ? "null" : k == Py_True ? "true" : "false";
       return 0;
     }
-    if (PyLong_Check(k) || PyFloat_Check(k)) {
-      out.push_back('"');
-      int rc = 0;
-      if (PyLong_Check(k)) {
-        rc = encode_int(k);
+    char buf[64];
+    char *end;
+    if (PyLong_Check(k)) {
+      int overflow = 0;
+      long long v = PyLong_AsLongLongAndOverflow(k, &overflow);
+      if (overflow == 0) {
+        if (v == -1 && PyErr_Occurred()) {
+          return -1;
+        }
+        char *p = buf;
+        *p = '-';
+        p += v < 0;
+        end = write_u64(p, v < 0 ? uint64_t(0) - uint64_t(v) : uint64_t(v));
       } else {
-        encode_float(PyFloat_AS_DOUBLE(k));
+        unsigned long long u = overflow > 0 ? PyLong_AsUnsignedLongLong(k) : (unsigned long long)-1;
+        if (u == (unsigned long long)-1 && (overflow < 0 || PyErr_Occurred())) {
+          PyErr_Clear();
+          return fail("Dict integer key must be within 64-bit range");
+        }
+        end = write_u64(buf, u);
       }
-      out.push_back('"');
-      return rc;
+      text.assign(buf, size_t(end - buf));
+      return 0;
     }
-    if (PyObject_IsInstance(k, EnumType) == 1) {
+    if (PyFloat_CheckExact(k)) {
+      OutBuf tmp;
+      encode_float_into(tmp, PyFloat_AS_DOUBLE(k));
+      text.assign(tmp.data(), tmp.size());
+      return 0;
+    }
+    if (is_enum(k)) {
+      if (python_may_run() < 0) {
+        return -1;
+      }
       PyObject *value = PyObject_GetAttrString(k, "value");
       if (value == nullptr) {
         return -1;
       }
-      int rc = encode_key(value);
+      int rc = PyUnicode_CheckExact(value) ? utf8_of(value, text) : non_str_key(value, text);
       Py_DECREF(value);
       return rc;
     }
@@ -2174,7 +2592,7 @@ struct OrjsonEncoder {
     }
   }
 
-  int encode_list(PyObject *o) {
+  FSJ_NOINLINE int encode_list(PyObject *o) {
     bool is_list = PyList_Check(o);
     Py_ssize_t n = is_list ? PyList_GET_SIZE(o) : PyTuple_GET_SIZE(o);
     if (depth >= ORJSON_MAX_DEPTH) { // empty containers count too
@@ -2187,87 +2605,88 @@ struct OrjsonEncoder {
     if (open('[') < 0) {
       return -1;
     }
-    for (Py_ssize_t i = 0;; i++) {
-      PyObject *item = is_list ? list_item(o, i)
-                       : i < n ? Py_NewRef(PyTuple_GET_ITEM(o, i))
-                               : nullptr;
-      if (item == nullptr) {
-        break;
+    if (borrowed) {
+      PyObject **items = is_list ? reinterpret_cast<PyListObject *>(o)->ob_item
+                                 : reinterpret_cast<PyTupleObject *>(o)->ob_item;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        separate(i == 0);
+        if (encode(items[i]) < 0) {
+          return -1;
+        }
       }
-      separate(i == 0);
-      int rc = encode(item);
-      Py_DECREF(item);
-      if (rc < 0) {
-        return -1;
+    } else {
+      for (Py_ssize_t i = 0;; i++) {
+        PyObject *item = is_list ? list_item(o, i)
+                         : i < n ? Py_NewRef(PyTuple_GET_ITEM(o, i))
+                                 : nullptr;
+        if (item == nullptr) {
+          break;
+        }
+        separate(i == 0);
+        int rc = encode(item);
+        Py_DECREF(item);
+        if (rc < 0) {
+          return -1;
+        }
       }
     }
     close(']');
     return 0;
   }
 
-  int encode_pair(PyObject *key, PyObject *value, bool first) {
-    separate(first);
-    if (encode_key(key) < 0) {
-      return -1;
-    }
-    if (opts & OPT_INDENT_2) {
-      out.append(": ", 2);
-    } else {
-      out.push_back(':');
-    }
-    return encode(value);
-  }
-
-  // Sorting keys: compare the keys as they will be written (UTF-8 of str
-  // keys, the text of the others).
-  int encode_sorted(PyObject *o) {
-    PyObject *items = PyDict_CheckExact(o) ? PyDict_Items(o) : PyMapping_Items(o);
-    if (items == nullptr) {
-      return -1;
-    }
+  // With OPT_NON_STR_KEYS or OPT_SORT_KEYS: the text of every key first (so
+  // its errors come before those of the values, as with orjson), sorted by
+  // UTF-8 with OPT_SORT_KEYS.
+  FSJ_NOINLINE int encode_dict_collected(PyObject *o, PyObject *items) {
     struct Entry {
       std::string key;
-      PyObject *pair;
+      PyObject *value;
     };
     std::vector<Entry> entries;
-    entries.reserve(size_t(PyList_GET_SIZE(items)));
-    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(items); i++) {
-      PyObject *pair = PyList_GET_ITEM(items, i);
-      PyObject *k = PyTuple_GET_ITEM(pair, 0);
-      std::string text;
-      if (PyUnicode_Check(k)) {
-        Py_ssize_t n;
-        const char *u = PyUnicode_AsUTF8AndSize(k, &n);
-        if (u == nullptr) {
-          PyErr_Clear();
-          Py_DECREF(items);
-          return fail("str is not valid UTF-8: surrogates not allowed");
+    entries.reserve(size_t(PyDict_GET_SIZE(o)));
+    Py_ssize_t pos = 0, i = 0;
+    PyObject *key, *value;
+    for (;;) {
+      if (items != nullptr) {
+        if (i == PyList_GET_SIZE(items)) {
+          break;
         }
-        text.assign(u, size_t(n));
-      } else {
-        // The text of a non-str key, as written (quotes removed).
-        OrjsonEncoder sub;
-        sub.opts = opts;
-        if (sub.encode_key(k) < 0) {
-          Py_DECREF(items);
-          return -1;
-        }
-        text.assign(sub.out.data() + 1, sub.out.size() - 2);
+        PyObject *pair = PyList_GET_ITEM(items, i++);
+        key = PyTuple_GET_ITEM(pair, 0);
+        value = PyTuple_GET_ITEM(pair, 1);
+      } else if (!PyDict_Next(o, &pos, &key, &value)) {
+        break;
       }
-      entries.push_back({std::move(text), pair});
+      entries.push_back({std::string(), value});
+      int rc = PyUnicode_CheckExact(key)              ? utf8_of(key, entries.back().key)
+               : (opts & OPT_NON_STR_KEYS) != 0 ? non_str_key(key, entries.back().key)
+                                                 : fail("Dict key must be str");
+      if (rc < 0) {
+        return -1;
+      }
     }
-    std::stable_sort(entries.begin(), entries.end(),
-                     [](const Entry &a, const Entry &b) { return a.key < b.key; });
-    int rc = 0;
-    for (size_t i = 0; rc == 0 && i < entries.size(); i++) {
-      rc = encode_pair(PyTuple_GET_ITEM(entries[i].pair, 0),
-                       PyTuple_GET_ITEM(entries[i].pair, 1), i == 0);
+    if (opts & OPT_SORT_KEYS) {
+      std::stable_sort(entries.begin(), entries.end(),
+                       [](const Entry &a, const Entry &b) { return a.key < b.key; });
     }
-    Py_DECREF(items);
-    return rc;
+    for (size_t j = 0; j < entries.size(); j++) {
+      separate(j == 0);
+      const std::string &k = entries[j].key;
+      char *w = out.reserve(6 * k.size() + 34);
+      *w++ = '"';
+      w = escape_into_wide(w, k.data(), k.size(), false);
+      *w++ = '"';
+      out.len = size_t(w - out.buf);
+      key_separator();
+      if (encode(entries[j].value) < 0) {
+        return -1;
+      }
+    }
+    return 0;
   }
 
-  int encode_dict(PyObject *o) {
+  // Dict subclasses as dicts (their items, as stored), as with orjson.
+  FSJ_NOINLINE int encode_dict(PyObject *o) {
     if (depth >= ORJSON_MAX_DEPTH) { // empty containers count too
       return fail("Recursion limit reached");
     }
@@ -2278,40 +2697,40 @@ struct OrjsonEncoder {
     if (open('{') < 0) {
       return -1;
     }
+    if (keys == nullptr) {
+      keys = g_thread_parser.encoded_keys = new (std::nothrow) EncodedKey[ENCODED_KEY_CACHE_SIZE];
+    }
     int rc = 0;
-#ifdef Py_GIL_DISABLED
-    bool snapshot = true; // another thread may change the dict
-#else
-    bool snapshot = default_fn != nullptr || !PyDict_CheckExact(o); // Python code may run
-#endif
-    if (opts & OPT_SORT_KEYS) {
-      rc = encode_sorted(o);
-    } else if (snapshot) {
-      PyObject *items = PyDict_CheckExact(o) ? PyDict_Items(o) : PyMapping_Items(o);
-      if (items == nullptr) {
-        return -1;
-      }
+    // Without borrowed (Python code may run, or another thread), a snapshot
+    // holds the keys and values.
+    PyObject *items = borrowed ? nullptr : PyDict_Items(o);
+    if (!borrowed && items == nullptr) {
+      return -1;
+    }
+    if (opts & (OPT_NON_STR_KEYS | OPT_SORT_KEYS)) {
+      rc = encode_dict_collected(o, items);
+    } else if (items != nullptr) {
       for (Py_ssize_t i = 0; rc == 0 && i < PyList_GET_SIZE(items); i++) {
         PyObject *pair = PyList_GET_ITEM(items, i);
-        rc = encode_pair(PyTuple_GET_ITEM(pair, 0), PyTuple_GET_ITEM(pair, 1), i == 0);
+        rc = encode_entry(PyTuple_GET_ITEM(pair, 0), PyTuple_GET_ITEM(pair, 1), i == 0);
       }
-      Py_DECREF(items);
     } else {
       Py_ssize_t pos = 0;
       PyObject *key, *value;
       bool first = true;
       while (rc == 0 && PyDict_Next(o, &pos, &key, &value)) {
-        rc = encode_pair(key, value, first);
+        rc = encode_entry(key, value, first);
         first = false;
       }
     }
+    Py_XDECREF(items);
     if (rc == 0) {
       close('}');
     }
     return rc;
   }
 
-  int encode_default(PyObject *o) {
+  FSJ_NOINLINE int encode_default(PyObject *o) {
     if (default_fn == nullptr) {
       PyErr_Format(PyExc_TypeError, "Type is not JSON serializable: %s", Py_TYPE(o)->tp_name);
       return -1;
@@ -2346,16 +2765,35 @@ struct OrjsonEncoder {
     return rc;
   }
 
-  int encode(PyObject *o) {
+  // The common types inline, in the loops over containers; the others in
+  // encode_other.
+  FSJ_ALWAYS_INLINE int encode(PyObject *o) {
     PyTypeObject *t = Py_TYPE(o);
     if (t == &PyUnicode_Type) {
       return encode_str(o);
     }
     if (t == &PyLong_Type) {
+#if PY_VERSION_HEX >= 0x030C0000
+      if (PyUnstable_Long_IsCompact(reinterpret_cast<PyLongObject *>(o))) {
+        // At most 30 bits: within the 53-bit range of OPT_STRICT_INTEGER.
+        append_i64(out, PyUnstable_Long_CompactValue(reinterpret_cast<PyLongObject *>(o)));
+        return 0;
+      }
+#endif
       return encode_int(o);
     }
     if (t == &PyFloat_Type) {
       encode_float(PyFloat_AS_DOUBLE(o));
+      return 0;
+    }
+    if (o == Py_None) {
+      memcpy(out.reserve(4), "null", 4);
+      out.len += 4;
+      return 0;
+    }
+    if (o == Py_True || o == Py_False) {
+      memcpy(out.reserve(5), o == Py_True ? "true " : "false", 5);
+      out.len += o == Py_True ? 4 : 5;
       return 0;
     }
     if (t == &PyDict_Type) {
@@ -2364,17 +2802,31 @@ struct OrjsonEncoder {
     if (t == &PyList_Type || t == &PyTuple_Type) {
       return encode_list(o);
     }
-    if (o == Py_None || o == Py_True || o == Py_False) {
-      if (o == Py_None) {
-        out.append("null", 4);
-      } else if (o == Py_True) {
-        out.append("true", 4);
-      } else {
-        out.append("false", 5);
+    return encode_other(o);
+  }
+
+  // In the order of orjson: subclasses of str, int, list and dict (unless
+  // OPT_PASSTHROUGH_SUBCLASS), enums, then default (subclasses of float and
+  // tuple too).
+  FSJ_NOINLINE int encode_other(PyObject *o) {
+    if (!(opts & OPT_PASSTHROUGH_SUBCLASS)) {
+      if (PyUnicode_Check(o)) {
+        return encode_str(o);
       }
-      return 0;
+      if (PyLong_Check(o)) {
+        return encode_int(o);
+      }
+      if (PyList_Check(o)) {
+        return encode_list(o);
+      }
+      if (PyDict_Check(o)) {
+        return encode_dict(o);
+      }
     }
-    if (PyObject_IsInstance(o, EnumType) == 1) {
+    if (is_enum(o)) {
+      if (python_may_run() < 0) {
+        return -1;
+      }
       PyObject *value = PyObject_GetAttrString(o, "value");
       if (value == nullptr) {
         return -1;
@@ -2383,26 +2835,8 @@ struct OrjsonEncoder {
       Py_DECREF(value);
       return rc;
     }
-    if (!(opts & OPT_PASSTHROUGH_SUBCLASS)) {
-      if (PyUnicode_Check(o)) {
-        return encode_str(o);
-      }
-      if (PyLong_Check(o)) {
-        return encode_int(o);
-      }
-      if (PyDict_Check(o)) {
-        return encode_dict(o);
-      }
-      if (PyList_Check(o)) {
-        return encode_list(o);
-      }
-    }
-    if (PyFloat_Check(o)) {
-      encode_float(PyFloat_AS_DOUBLE(o));
-      return 0;
-    }
-    if (PyTuple_Check(o)) {
-      return encode_list(o);
+    if (default_fn != nullptr && python_may_run() < 0) {
+      return -1;
     }
     return encode_default(o);
   }
@@ -2431,11 +2865,9 @@ PyObject *dumpb(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *k
     }
   }
   OrjsonEncoder e;
-  if (dflt != nullptr && dflt != Py_None) {
-    if (!PyCallable_Check(dflt)) {
-      PyErr_SetString(PyExc_TypeError, "default must be callable");
-      return nullptr;
-    }
+  if (dflt != nullptr) {
+    // Any object, as orjson: calling one that is not callable (even None)
+    // fails, and becomes the __cause__ of the error.
     e.default_fn = dflt;
   }
   if (option != nullptr && option != Py_None) {
@@ -2453,7 +2885,16 @@ PyObject *dumpb(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *k
   }
   int rc;
   try {
+#ifndef Py_GIL_DISABLED
+    e.borrowed = true;
+#endif
     rc = e.encode(obj);
+    if (rc < 0 && e.restart) {
+      e.borrowed = e.restart = false;
+      e.out.len = 0;
+      e.depth = e.default_calls = 0;
+      rc = e.encode(obj);
+    }
     if (rc == 0 && (e.opts & OPT_APPEND_NEWLINE)) {
       e.out.push_back('\n');
     }
@@ -2463,7 +2904,7 @@ PyObject *dumpb(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *k
   if (rc < 0) {
     return nullptr;
   }
-  return PyBytes_FromStringAndSize(e.out.data(), Py_ssize_t(e.out.size()));
+  return e.out.take_bytes();
 }
 
 // dump(obj, fp, **kw): fp.write(dumps(obj, **kw)).
@@ -3039,6 +3480,9 @@ int register_abc(const char *name, PyTypeObject *type) {
 // Multi-phase init so the module can declare that it does not need the GIL.
 // Exception types are process-global, so subinterpreters stay unsupported.
 int exec_fastsimdjson(PyObject *module) {
+#if FSJ_AVX512
+  has_avx512 = detect_avx512();
+#endif
   if (json_loads == nullptr) {
     PyObject *json = PyImport_ImportModule("json");
     if (json == nullptr) {
