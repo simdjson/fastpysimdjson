@@ -278,6 +278,11 @@ this repository and in
 Each parser produces the whole document as Python objects. Speed is the
 geometric mean over the 22 files (higher is better).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads.png" width="80%" alt="Parsing JSON in Python: fastsimdjson loads 0.78 GB/s, orjson 0.60, msgspec 0.53, pysimdjson 0.44, cysimdjson 0.43, ujson 0.37, python-rapidjson 0.24, simplejson 0.23, json 0.22">
+</picture>
+
 | parser | GB/s | vs `json.loads` |
 |---|---:|---:|
 | json (standard library) | 0.22 | 1.00× |
@@ -312,6 +317,11 @@ of the total. Even if parsing took no time at all, `loads` would be less than
 If you only need a few values, `parse` creates only those. Extracting the id
 and the screen name of the 100 statuses of `twitter.json`:
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_parse_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_parse.png" width="80%" alt="Reading part of twitter.json: fastsimdjson parse 158 µs, pysimdjson 179, cysimdjson 229, msgspec 336, fastsimdjson loads 861, orjson 1009, json 3922">
+</picture>
+
 | method | µs |
 |---|---:|
 | `json.loads` | 3922 |
@@ -327,6 +337,11 @@ than `loads`. Most of its time is the simdjson parse itself.
 
 ### `dumps` against `json.dumps`
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_dumps_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_dumps.png" width="80%" alt="Writing JSON as str: fastsimdjson dumps 4.63 times faster than json.dumps">
+</picture>
+
 `dumps` returns exactly the `str` of `json.dumps` and is 4.6 times faster
 (geometric mean over the 22 files; from 3.1 times on `citm_catalog.json` to
 12 times on `numbers.json`).
@@ -338,6 +353,11 @@ than `loads`. Most of its time is the simdjson parse itself.
 standard library, the same compact bytes come from
 `json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()`.
 Microseconds:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_dumpb_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_dumpb.png" width="80%" alt="Writing JSON as bytes, speed relative to json.dumps(...).encode(): fastsimdjson dumpb 10.09x, orjson 9.69x, msgspec 6.03x">
+</picture>
 
 | file | `json.dumps(...).encode()` | fastsimdjson `dumpb` | orjson | msgspec |
 |---|---:|---:|---:|---:|
@@ -362,6 +382,11 @@ strings; other x64 processors use SSE2 and ARM processors NEON.
 
 20 MB of NDJSON (5268 objects and arrays, one per line), made from the same
 files; best of three runs:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_ndjson_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_ndjson.png" width="80%" alt="Reading NDJSON: fastsimdjson parse_many 0.94 GB/s, loads_many 0.38, msgspec decode_lines 0.37, fastsimdjson loads per line 0.33, msgspec decode per line 0.27, orjson per line 0.26, json per line 0.12">
+</picture>
 
 | method | ms | GB/s |
 |---|---:|---:|
