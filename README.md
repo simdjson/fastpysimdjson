@@ -311,15 +311,21 @@ faster and msgspec 1.8 times faster (geometric means).
 ### Streams with `loads_many`
 
 20 MB of NDJSON (5268 objects and arrays, one per line), made from the same
-files:
+files; best of three runs:
 
 | method | ms | GB/s |
 |---|---:|---:|
-| `json.loads` on each line | 167 | 0.12 |
-| orjson on each line | 81 | 0.24 |
+| `json.loads` on each line | 170 | 0.12 |
+| orjson on each line | 79 | 0.25 |
+| msgspec `decode` on each line | 76 | 0.26 |
 | fastsimdjson `loads` on each line | 61 | 0.32 |
+| msgspec `decode_lines` | 55 | 0.36 |
 | fastsimdjson `loads_many` | 52 | 0.38 |
-| fastsimdjson `parse_many` (views only) | 20 | 0.96 |
+| fastsimdjson `parse_many` (views only) | 21 | 0.94 |
+
+msgspec's `decode_lines` is the closest competitor: `loads_many` is about 6%
+faster. `parse_many` only creates the views; reading values from them adds to
+its time.
 
 ## Limitations
 

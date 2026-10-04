@@ -16,6 +16,10 @@ try:
     import orjson
 except ImportError:
     orjson = None
+try:
+    import msgspec
+except ImportError:
+    msgspec = None
 
 DATA = os.environ.get("JSONDIR", "simdjson-data/jsonexamples")
 
@@ -55,6 +59,10 @@ def main():
     }
     if orjson:
         methods["orjson.loads per line"] = lambda d: [orjson.loads(l) for l in d.splitlines() if l]
+    if msgspec:
+        decoder = msgspec.json.Decoder()
+        methods["msgspec decode per line"] = lambda d: [decoder.decode(l) for l in d.splitlines() if l]
+        methods["msgspec decode_lines"] = decoder.decode_lines
     ref = methods["json.loads per line"](data)
     for name, fn in methods.items():
         if "parse_many" not in name:
