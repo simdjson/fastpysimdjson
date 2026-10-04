@@ -193,3 +193,32 @@ def test_byte_order_mark_errors(fmt):
         with pytest.raises(fastsimdjson.JSONDecodeError) as info:
             list(fastsimdjson.loads_many(bad, format=fmt))
         assert (info.value.msg, info.value.pos) == expected
+
+
+@pytest.mark.parametrize("fmt", ["json_seq", "comma", "array"])
+def test_json_fallback_other_formats(fmt):
+    # As with white space: documents that only json accepts are decoded by
+    # json, and errors are json's, at their position in the whole input.
+    docs = ['{"a": 1}', '{"v": 1e400}', '["\\ud800"]', '{"c": 3}']
+    expected = [{"a": 1}, {"v": float("inf")}, ["\ud800"], {"c": 3}]
+    join = {"json_seq": lambda d: "".join("\x1e" + x + "\n" for x in d),
+            "comma": lambda d: ", ".join(d),
+            "array": lambda d: "[" + ", ".join(d) + "]"}[fmt]
+    assert list(fastsimdjson.loads_many(join(docs), format=fmt)) == expected
+    got = [to_py(x) for x in fastsimdjson.parse_many(join(docs), format=fmt)]
+    assert got == expected
+    bad = join(['{"a": 1}', '{"v": 1e400}', '{"b": ]'])
+    with pytest.raises(fastsimdjson.JSONDecodeError) as info:
+        list(fastsimdjson.loads_many(bad, format=fmt))
+    assert info.value.msg == "Expecting value"
+    assert bad[info.value.pos] == "]"
+
+
+def test_fallback_needs_the_separator():
+    # After json decodes a document, the next one must follow a separator.
+    with pytest.raises(fastsimdjson.JSONDecodeError) as info:
+        list(fastsimdjson.loads_many("1e400 2", format="json_seq"))
+    assert info.value.msg == "Expecting record separator"
+    with pytest.raises(fastsimdjson.JSONDecodeError) as info:
+        list(fastsimdjson.loads_many("[1e400 2]", format="array"))
+    assert info.value.msg == "Expecting ',' delimiter"

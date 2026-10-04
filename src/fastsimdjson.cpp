@@ -2091,15 +2091,31 @@ bool stream_start(StreamObject *s, size_t at) {
     PyErr_NoMemory();
     return false;
   }
+  // The first start parses the whole input in its format. A restart (after a
+  // document that json decoded, or with larger batches) begins after a
+  // document: comma-separated documents restart at the next one, and the
+  // rest of an array is parsed as comma-separated documents before its ']'.
+  using simdjson::stream_format;
+  stream_format fmt = s->format;
+  size_t end = s->len;
+  if (at > 0) {
+    if (fmt == stream_format::comma_delimited_array) {
+      fmt = stream_format::comma_delimited;
+      end = s->close < s->len ? s->close : s->len;
+    }
+    if (fmt == stream_format::comma_delimited) {
+      at = skip_separators(s, at);
+    }
+  }
   auto r = s->p->parse_many(reinterpret_cast<const uint8_t *>(s->buf) + at,
-                            s->len - at, s->batch_size, s->format);
+                            at < end ? end - at : 0, s->batch_size, fmt);
   simdjson::error_code err = std::move(r).get(*s->stream);
   if (err) {
     stream_error(s, simdjson::error_message(err), at);
     return false;
   }
   s->it = s->stream->begin();
-  // Restarts happen after the prefix: offsets are relative to it only at 0.
+  // At 0, offsets are relative to what follows the prefix.
   s->base = at == 0 ? s->prefix : at;
   s->active = true;
   return true;
@@ -2145,16 +2161,10 @@ PyObject *stream_value(StreamObject *s) {
   return d == nullptr ? PyErr_NoMemory() : view_of(d);
 }
 
-// simdjson rejected the document after last_end. For whitespace-separated
-// documents, json decides, as in loads: return the value it accepts and
-// resume after it, or raise its error.
-PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
+// simdjson rejected the document after last_end. json decides, as in loads:
+// return the value it accepts and resume after it, or raise its error.
+PyObject *stream_fallback(StreamObject *s) {
   size_t at = skip_separators(s, s->last_end);
-  if (s->format != simdjson::stream_format::whitespace_delimited &&
-      s->format != simdjson::stream_format::newline_delimited) {
-    stream_error(s, simdjson::error_message(err), at);
-    return nullptr;
-  }
   PyObject *text = stream_text(s);
   if (text == nullptr) {
     return nullptr;
@@ -2173,6 +2183,23 @@ PyObject *stream_fallback(StreamObject *s, simdjson::error_code err) {
     return nullptr;
   }
   s->last_end = byte_offset(s->buf, s->len, at, end - start);
+  // Between documents, the formats other than white space need their
+  // separator: json decoded one document, not the separator after it.
+  using simdjson::stream_format;
+  size_t next = s->last_end;
+  while (next < s->len && json_space(s->buf[next])) {
+    next++;
+  }
+  char sep = s->format == stream_format::json_sequence ? '\x1e'
+             : s->format == stream_format::comma_delimited ||
+                     s->format == stream_format::comma_delimited_array
+                 ? ','
+                 : 0;
+  if (sep != 0 && next < s->len && next != s->close && s->buf[next] != sep) {
+    Py_DECREF(value);
+    stream_error(s, sep == ',' ? "Expecting ',' delimiter" : "Expecting record separator", next);
+    return nullptr;
+  }
   s->active = false; // resume with simdjson after this document
   // As with parse(), a document that only json accepts is returned as plain
   // Python objects.
@@ -2193,9 +2220,7 @@ PyObject *stream_next_locked(StreamObject *s) {
     if (!(s->it != s->stream->end())) {
       // Anything but separators after the last document is an incomplete
       // document: let json report it.
-      return skip_separators(s, s->last_end) < s->len
-                 ? stream_fallback(s, simdjson::TAPE_ERROR)
-                 : nullptr;
+      return skip_separators(s, s->last_end) < s->len ? stream_fallback(s) : nullptr;
     }
     simdjson::dom::element el;
     simdjson::error_code err = (*s->it).get(el);
@@ -2214,7 +2239,7 @@ PyObject *stream_next_locked(StreamObject *s) {
       s->active = false;
       continue;
     }
-    return stream_fallback(s, err);
+    return stream_fallback(s);
   }
 }
 
