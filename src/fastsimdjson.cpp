@@ -2067,17 +2067,6 @@ bool stream_start(StreamObject *s, size_t at) {
     PyErr_NoMemory();
     return false;
   }
-  // parse_many does not pass number_as_string on to the parser
-  // implementation (simdjson 5.0.2), so big integers would fail: create the
-  // implementation now and set the flag on it; later reallocations keep it.
-  if (!s->p->implementation) {
-    simdjson::error_code alloc_err = s->p->allocate(s->batch_size);
-    if (alloc_err) {
-      stream_error(s, simdjson::error_message(alloc_err), at);
-      return false;
-    }
-  }
-  s->p->implementation->_number_as_string = true;
   auto r = s->p->parse_many(reinterpret_cast<const uint8_t *>(s->buf) + at,
                             s->len - at, s->batch_size, s->format);
   simdjson::error_code err = std::move(r).get(*s->stream);
@@ -2178,9 +2167,8 @@ PyObject *stream_next_locked(StreamObject *s) {
       }
     }
     if (!(s->it != s->stream->end())) {
-      // truncated_bytes() is not reliable for every format: look at what
-      // follows the last document instead. An incomplete document at the
-      // end: let json report it.
+      // Anything but separators after the last document is an incomplete
+      // document: let json report it.
       return skip_separators(s, s->last_end) < s->len
                  ? stream_fallback(s, simdjson::TAPE_ERROR)
                  : nullptr;

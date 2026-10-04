@@ -325,9 +325,6 @@ files:
 
 * `dumps` returns a `str`, like `json.dumps`; there is no option to return
   `bytes`.
-* In streams, a document that is a bare number (`3.14` alone on its line)
-  is slow to parse: simdjson copies the rest of the batch for each one. Streams
-  of objects and arrays are not affected.
 * With the `"json_seq"`, `"comma"` and `"array"` stream formats, documents
   that simdjson rejects raise `JSONDecodeError` with simdjson's message;
   there is no fallback to `json`.
