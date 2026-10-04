@@ -7,10 +7,18 @@ replacement for the `json` module's `loads`, `load`, `dumps` and `dump`, and
 it can be over 3 times faster than the standard `json.loads` and
 `json.dumps`. When you only need part of a document, its lazy `parse`
 function is faster still. It also reads streams of documents (NDJSON, JSON
-Lines).
+Lines) and writes JSON as `bytes` (`dumpb`).
+
+With pip:
 
 ```sh
 pip install fastsimdjson
+```
+
+With uv:
+
+```sh
+uv pip install fastsimdjson      # in a uv project: uv add fastsimdjson
 ```
 
 Wheels are available for Linux, macOS and Windows, for Python 3.10 to 3.14,
@@ -68,12 +76,12 @@ doc["search_metadata"].as_dict()          # convert a subtree, like loads
   `json.loads` accepts (an overflowing number, an unpaired surrogate) is
   returned as plain Python objects, as `loads` would return it.
 
-### `dumps` and `dump`: writing JSON
+### `dumps`, `dumpb` and `dump`: writing JSON
 
 ```python
 fastsimdjson.dumps({"a": [1, 2.5, None]})            # '{"a": [1, 2.5, null]}'
 fastsimdjson.dumps(obj, indent=2, sort_keys=True)
-fastsimdjson.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+fastsimdjson.dumpb(obj, separators=(",", ":"), ensure_ascii=False)  # bytes
 with open("out.json", "w", encoding="utf-8") as f:
     fastsimdjson.dump(obj, f)
 ```
@@ -85,7 +93,10 @@ escapes and the default separators. `ensure_ascii`, `indent`, `separators`,
 passed to `json.dumps` itself, which produces the result or raises its usual
 exception: a `cls` argument or other encoder options, `skipkeys`, a circular
 reference, `NaN` with `allow_nan=False`, a key or a value that `json` cannot
-serialize. `dump(obj, fp, **kw)` writes `dumps(obj, **kw)` to `fp`.
+serialize. `dumpb(obj, **kw)` returns the same text as UTF-8 `bytes`, exactly
+`json.dumps(obj, **kw).encode()`, without building a `str` first: use it to
+write to a binary file or a socket. `dump(obj, fp, **kw)` writes
+`dumps(obj, **kw)` to `fp`.
 
 ### Files
 
@@ -118,16 +129,15 @@ separated:
 | `"whitespace"` (default) | documents separated by white space, including NDJSON and JSON Lines |
 | `"lines"` | one document per line (NDJSON, JSON Lines) |
 | `"json_seq"` | RFC 7464 JSON text sequences (each document preceded by `\x1e`) |
-| `"comma"` | documents separated by commas: `{...}, {...}` |
+| `"comma"` | documents separated by commas: `{...}, {...}` (simdjson also accepts white space between them) |
 | `"array"` | the elements of one array: `[{...}, {...}]` |
 
 simdjson parses the input in batches (`batch_size`, 1 MB by default); a
-larger document is handled automatically. With `"whitespace"` and `"lines"`,
-documents that simdjson rejects are handled as in `loads`: a document that
-`json` accepts is returned, otherwise `JSONDecodeError` reports `json`'s
-message and the position in the whole input. A truncated last document is an
-error. The views returned by `parse_many` remain valid after the iterator
-moves on.
+larger document is handled automatically. In every format, documents that
+simdjson rejects are handled as in `loads`: a document that `json` accepts is
+returned, otherwise `JSONDecodeError` reports `json`'s message and the
+position in the whole input. A truncated last document is an error. The
+views returned by `parse_many` remain valid after the iterator moves on.
 
 ### `release`
 
@@ -182,8 +192,8 @@ why `PYTHONPATH=src` is required for the in-place build.
 
 `tests/test_loads.py` compares `loads` with `json.loads` on types and key
 order; `tests/test_lazy.py` checks the views returned by `parse` the same way,
-`tests/test_dumps.py` compares `dumps` with `json.dumps` (output and
-exceptions), and `tests/test_stream.py` and `tests/test_files.py` cover
+`tests/test_dumps.py` compares `dumps` and `dumpb` with `json.dumps` (output
+and exceptions), and `tests/test_stream.py` and `tests/test_files.py` cover
 streams and files. It covers scalars, integers past 64 bits, UTF-8 strings at every
 length from 0 to 199, the key cache, random documents, rejected input, deep
 nesting, padding at a page boundary, a saturated array count, reference
@@ -199,26 +209,38 @@ pytest tests
 The suite builds an ~80 MB document and a list of 16,777,221 integers, so
 give it some RAM.
 
-To time `loads` against `json.loads` and orjson on those files
-(`bench_lazy.py` times `parse` against pysimdjson and cysimdjson,
-`bench_dumps.py` times `dumps`, and `bench_many.py` times `loads_many`):
+The benchmark scripts need simdjson-data and the `bench` extra (orjson,
+msgspec, pysimdjson, cysimdjson). `bench.py` times `loads` against
+`json.loads` and orjson, `bench_lazy.py` times `parse` against pysimdjson and
+cysimdjson, `bench_dumps.py` times `dumps` and `dumpb`, and `bench_many.py`
+times `loads_many`.
+
+pip:
 
 ```sh
 python -m pip install -e ".[bench]"
 python bench.py
+python bench_lazy.py
+python bench_dumps.py
+python bench_many.py
 ```
+
+uv:
 
 ```sh
 uv pip install -e ".[bench]"
 python bench.py
+python bench_lazy.py
+python bench_dumps.py
+python bench_many.py
 ```
 
 ## Benchmarks
 
 Intel Xeon Gold 6548N (Emerald Rapids), one core, Python 3.14.6,
-fastsimdjson 0.2.0, the 22 files of
-[simdjson-data](https://github.com/simdjson/simdjson-data). The scripts and
-the full results are in
+fastsimdjson 0.3.0 (development version, simdjson 5.0.2), the 22 files of
+[simdjson-data](https://github.com/simdjson/simdjson-data). The scripts are in
+this repository and in
 [the blog repository](https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/tree/master/2026/09/pysimdjson).
 
 ### Whole documents
@@ -229,24 +251,25 @@ geometric mean over the 22 files (higher is better).
 | parser | GB/s | vs `json.loads` |
 |---|---:|---:|
 | json (standard library) | 0.22 | 1.00× |
-| simplejson 4.1.2 | 0.23 | 1.05× |
+| simplejson 4.2.0 | 0.23 | 1.05× |
 | python-rapidjson 1.25 | 0.24 | 1.10× |
-| ujson 6.0.0 | 0.36 | 1.65× |
-| cysimdjson 26.27 | 0.43 | 1.94× |
+| ujson 6.0.0 | 0.37 | 1.66× |
+| cysimdjson 26.27 | 0.43 | 1.96× |
 | pysimdjson 7.0.2 | 0.44 | 1.98× |
-| msgspec 0.22.0 | 0.53 | 2.41× |
-| orjson 3.12.0 | 0.60 | 2.73× |
-| **fastsimdjson `loads`** | **0.77** | **3.49×** |
+| msgspec 0.22.0 | 0.53 | 2.42× |
+| orjson 3.12.0 | 0.60 | 2.74× |
+| **fastsimdjson `loads`** | **0.78** | **3.53×** |
 
 fastsimdjson is the fastest on 21 of the 22 files; orjson is slightly faster
 on `numbers.json`, an array of floating-point numbers. Part of the gain comes
 from pausing the garbage collector while the objects are built: if the
 collector is disabled for every parser, fastsimdjson's lead over orjson drops
-from 1.28× to 1.18×. yyjson 4.0.6 is left out: it returns wrong strings for
-non-ASCII text.
+from 1.29× to 1.17×, and orjson is slightly faster on `canada.json`,
+`mesh.json` and `numbers.json`. yyjson 4.0.6 is left out: it returns wrong
+strings for non-ASCII text.
 
 Parsing is no longer the bottleneck. simdjson alone parses these files at
-3.0 GB/s. It accounts for about a third of the time of `loads`; the rest goes
+3.1 GB/s. It accounts for about a third of the time of `loads`; the rest goes
 into creating Python objects. Freeing those objects later costs about a sixth
 of the total. Even if parsing took no time at all, `loads` would be less than
 1.5 times faster.
@@ -258,55 +281,44 @@ and the screen name of the 100 statuses of `twitter.json`:
 
 | method | µs |
 |---|---:|
-| `json.loads` | 3879 |
-| orjson | 1008 |
-| fastsimdjson `loads` | 860 |
+| `json.loads` | 3922 |
+| orjson | 1009 |
+| fastsimdjson `loads` | 861 |
 | msgspec (typed `Struct`) | 336 |
-| cysimdjson (lazy) | 235 |
-| pysimdjson (lazy) | 183 |
-| **fastsimdjson `parse`** | **155** |
+| cysimdjson (lazy) | 229 |
+| pysimdjson (lazy) | 179 |
+| **fastsimdjson `parse`** | **158** |
 
-Here `parse` is 25 times faster than `json.loads` and 5.5 times faster than
-`loads`. Most of its time is the simdjson parse itself: reading the 200
-values takes less than 20 µs. Compared with pysimdjson on other tasks
-(µs, lower is better):
+Here `parse` is about 25 times faster than `json.loads` and 5.5 times faster
+than `loads`. Most of its time is the simdjson parse itself.
 
-| file | task | fastsimdjson `parse` | fastsimdjson `loads` | pysimdjson |
-|---|---|---:|---:|---:|
-| twitter | open | 140 | 676 | 156 |
-| citm_catalog | open | 369 | 1612 | 472 |
-| citm_catalog | extract | 394 | 2142 | 504 |
-| gsoc-2018 | open | 615 | 2206 | 813 |
-| twitter | visit all | 1985 | 2183 | 3033 |
-| canada | visit all | 17528 | 18998 | 19750 |
-| twitter_api_response | open | 3.6 | 13.6 | 3.4 |
+### Writing JSON with `dumps` and `dumpb`
 
-"open" parses the document and looks at its root; "extract" collects the
-start time of every performance; "visit all" walks every value through the
-views (with `loads`: through the dict). When you visit everything, `parse`
-is about as fast as `loads`. On very small documents (15 KB), pysimdjson's
-`parse` is marginally faster.
+With the default arguments, `dumps` returns exactly the `str` of `json.dumps`
+and is 3.3 times faster (geometric mean over the 22 files; from 2.3 times on
+text-heavy files to 8 times on files full of numbers).
 
-### Writing JSON with `dumps`
+orjson and msgspec produce compact UTF-8 `bytes`: no spaces after separators,
+non-ASCII characters left as they are. The fair comparison is with the same
+output: `dumpb(obj, separators=(",", ":"), ensure_ascii=False)`, and
+`json.dumps` with the same arguments followed by `.encode()`. These four
+produce identical bytes on 18 of the 22 files; on the others they differ only
+in how some floats are written (`1e-05` as in Python's `repr`, against
+`0.00001`). Microseconds:
 
-Same machine, fastsimdjson 0.3.0, the objects of the 22 files. With the
-default arguments, `dumps` returns exactly what `json.dumps` returns and is
-3.4 times faster (geometric mean; from 2.5 times on text-heavy files to 8
-times on files full of numbers). Microseconds:
-
-| file | `json.dumps` | fastsimdjson `dumps` | orjson | msgspec |
+| file | `json.dumps(...).encode()` | fastsimdjson `dumpb` | orjson | msgspec |
 |---|---:|---:|---:|---:|
-| twitter | 1482 | 529 | 199 | 347 |
-| citm_catalog | 2702 | 1071 | 427 | 494 |
-| github_events | 158 | 43 | 19 | 30 |
-| canada | 38622 | 4843 | 2923 | 3653 |
-| numbers | 2515 | 349 | 198 | 332 |
+| twitter | 1798 | 549 | 200 | 348 |
+| citm_catalog | 2956 | 1115 | 430 | 493 |
+| github_events | 173 | 45 | 18 | 30 |
+| gsoc-2018 | 15309 | 1848 | 546 | 1423 |
+| canada | 38095 | 4708 | 2921 | 3636 |
+| numbers | 2515 | 352 | 197 | 333 |
 
-orjson and msgspec are faster still, but they produce something else: they
-return `bytes`, without spaces after separators and without escaping
-non-ASCII characters. Compared with `separators=(",", ":")` and
-`ensure_ascii=False`, the closest `dumps` settings, orjson is 2.9 times
-faster and msgspec 1.8 times faster (geometric means).
+`dumpb` is 3.8 times faster than `json.dumps(...).encode()` (geometric mean;
+2.4 to 8.3 times). orjson is faster still, by 2.6 times, and msgspec by 1.6
+times (geometric means). Unlike them, `dumps` and `dumpb` accept every argument
+of `json.dumps` and produce its exact output.
 
 ### Streams with `loads_many`
 
@@ -315,36 +327,26 @@ files; best of three runs:
 
 | method | ms | GB/s |
 |---|---:|---:|
-| `json.loads` on each line | 170 | 0.12 |
-| orjson on each line | 79 | 0.25 |
-| msgspec `decode` on each line | 76 | 0.26 |
-| fastsimdjson `loads` on each line | 61 | 0.32 |
-| msgspec `decode_lines` | 55 | 0.36 |
+| `json.loads` on each line | 169 | 0.12 |
+| orjson on each line | 77 | 0.26 |
+| msgspec `decode` on each line | 74 | 0.27 |
+| fastsimdjson `loads` on each line | 60 | 0.33 |
+| msgspec `decode_lines` | 53 | 0.37 |
 | fastsimdjson `loads_many` | 52 | 0.38 |
 | fastsimdjson `parse_many` (views only) | 21 | 0.94 |
 
-msgspec's `decode_lines` is the closest competitor: `loads_many` is about 6%
-faster. `parse_many` only creates the views; reading values from them adds to
+msgspec's `decode_lines` and `loads_many` are on par (`loads_many` is about 2%
+faster). `parse_many` only creates the views; reading values from them adds to
 its time.
 
 ## Limitations
 
-* `dumps` returns a `str`, like `json.dumps`; there is no option to return
-  `bytes`.
-* With the `"json_seq"`, `"comma"` and `"array"` stream formats, documents
-  that simdjson rejects raise `JSONDecodeError` with simdjson's message;
-  there is no fallback to `json`.
 * The simdjson parser and the key and string caches are thread-local.
   `release()` frees the parser and the cached strings retained by the calling
   thread. A parser that grows past 64 MB is freed on its own at the end of
   that call; its caches stay. A thread that exits without `release()` leaves
-  its cached strings behind. The module is marked free-threading compatible
-  (`Py_MOD_GIL_NOT_USED` on Python 3.13 and newer), so importing it on a
-  free-threaded build does not re-enable the GIL. Subinterpreters are not
-  supported. On a free-threaded build, `bytearray` and `memoryview` inputs
-  are copied before parsing.
-* A document simdjson rejects is reparsed with `json.loads`. `loads` returns
-  that value when `json.loads` accepts it, which is how overflow to infinity
-  is handled. An exception is raised only when `json.loads` also fails.
-  `JSONDecodeError` is re-raised as `fastsimdjson.JSONDecodeError` with the
-  same message, document, and position. Any other exception propagates.
+  its cached strings behind.
+* The module is marked free-threading compatible (`Py_MOD_GIL_NOT_USED` on
+  Python 3.13 and newer), so importing it on a free-threaded build does not
+  re-enable the GIL. On a free-threaded build, `bytearray` and `memoryview`
+  inputs are copied before parsing. Subinterpreters are not supported.
