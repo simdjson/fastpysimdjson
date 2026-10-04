@@ -250,3 +250,51 @@ def test_dump():
         assert a.getvalue() == b.getvalue()
     with pytest.raises(TypeError):
         fastsimdjson.dump(obj)
+
+
+def expected_bytes(obj, **kw):
+    try:
+        return ("ok", json.dumps(obj, **kw).encode())
+    except Exception as e:  # noqa: BLE001
+        return ("exc", type(e), str(e))
+
+
+def got_bytes(obj, **kw):
+    try:
+        return ("ok", fastsimdjson.dumpb(obj, **kw))
+    except Exception as e:  # noqa: BLE001
+        return ("exc", type(e), str(e))
+
+
+@pytest.mark.parametrize("path", sorted(glob.glob(os.path.join(DATA, "*.json"))))
+def test_dumpb_files(path):
+    obj = json.loads(open(path, "rb").read())
+    for kw in OPTIONS:
+        out = fastsimdjson.dumpb(obj, **kw)
+        assert type(out) is bytes and out == json.dumps(obj, **kw).encode()
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_dumpb_random(seed):
+    obj = random_value(random.Random(seed))
+    for kw in OPTIONS:
+        assert fastsimdjson.dumpb(obj, **kw) == json.dumps(obj, **kw).encode()
+
+
+def test_dumpb_fallbacks_and_errors():
+    a = [1]
+    a.append(a)
+    cases = [
+        ([float("nan")], {"allow_nan": False}),
+        ({(1, 2): 3}, {}),
+        ({(1, 2): 3}, {"skipkeys": True}),
+        ([{1, 2}], {}),
+        ([{1, 2}], {"default": sorted}),
+        (a, {}),
+        (["\ud800"], {}),
+        (["\ud800"], {"ensure_ascii": False}),  # json's str cannot be UTF-8
+        (["é\U0001f600"], {"ensure_ascii": False}),
+        ([object()], {"cls": None, "default": str}),
+    ]
+    for obj, kw in cases:
+        assert got_bytes(obj, **kw) == expected_bytes(obj, **kw), (obj, kw)

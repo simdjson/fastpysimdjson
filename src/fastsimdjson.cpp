@@ -1863,11 +1863,24 @@ bool configure(Encoder &e, PyObject *kwargs, bool *error) {
   return true;
 }
 
-PyObject *dumps(PyObject *, PyObject *args, PyObject *kwargs) {
+// json.dumps(*args, **kwargs), as a str, or encoded as UTF-8 bytes.
+PyObject *call_json_dumps(PyObject *args, PyObject *kwargs, bool as_bytes) {
+  PyObject *s = PyObject_Call(json_dumps, args, kwargs);
+  if (s == nullptr || !as_bytes) {
+    return s;
+  }
+  PyObject *b = PyUnicode_AsUTF8String(s);
+  Py_DECREF(s);
+  return b;
+}
+
+// dumps returns the str of json.dumps; dumpb returns it encoded as UTF-8.
+template <bool AsBytes>
+PyObject *serialize(PyObject *, PyObject *args, PyObject *kwargs) {
   Encoder e;
   bool error = false;
   if (PyTuple_GET_SIZE(args) != 1 || !configure(e, kwargs, &error)) {
-    return error ? nullptr : PyObject_Call(json_dumps, args, kwargs);
+    return error ? nullptr : call_json_dumps(args, kwargs, AsBytes);
   }
   int rc;
   try {
@@ -1879,10 +1892,21 @@ PyObject *dumps(PyObject *, PyObject *args, PyObject *kwargs) {
     return nullptr;
   }
   if (rc == ENCODE_FALLBACK) {
-    return PyObject_Call(json_dumps, args, kwargs);
+    return call_json_dumps(args, kwargs, AsBytes);
+  }
+  if (AsBytes) { // the output is UTF-8 (ASCII with ensure_ascii)
+    return PyBytes_FromStringAndSize(e.out.data(), Py_ssize_t(e.out.size()));
   }
   return e.ascii_output ? new_ascii(e.out.data(), e.out.size())
                         : PyUnicode_DecodeUTF8(e.out.data(), Py_ssize_t(e.out.size()), nullptr);
+}
+
+PyObject *dumps(PyObject *self, PyObject *args, PyObject *kwargs) {
+  return serialize<false>(self, args, kwargs);
+}
+
+PyObject *dumpb(PyObject *self, PyObject *args, PyObject *kwargs) {
+  return serialize<true>(self, args, kwargs);
 }
 
 // dump(obj, fp, **kw): fp.write(dumps(obj, **kw)).
@@ -2395,6 +2419,9 @@ PyMethodDef methods[] = {
     {"dumps", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumps)),
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj to a JSON str. Same arguments and output as json.dumps."},
+    {"dumpb", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumpb)),
+     METH_VARARGS | METH_KEYWORDS,
+     "Serialize obj to JSON as UTF-8 bytes: json.dumps(obj, **kw).encode()."},
     {"dump", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dump)),
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj as JSON to fp (a file with a write method), like json.dump."},
