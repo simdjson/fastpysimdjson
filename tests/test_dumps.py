@@ -252,49 +252,138 @@ def test_dump():
         fastsimdjson.dump(obj)
 
 
-def expected_bytes(obj, **kw):
+# dumpb has the arguments, output and errors of orjson.dumps.
+
+class Hue(enum.Enum):
+    RED = "red"
+
+
+class Level(enum.IntEnum):
+    HIGH = 3
+
+
+class MyStr2(str):
+    pass
+
+
+# Expected bytes recorded from orjson 3.12 (so that the tests do not need
+# orjson); each case is (object, option, expected bytes or error message).
+ORJSON_CASES = [
+    ({"a": [1, 2.5, "x", True, None]}, 0, b'{"a":[1,2.5,"x",true,null]}'),
+    ([0.0, -0.0, 1e16, 1e15, 1e-4, 1e-5, 2.5e-5, 1e-6, 1.5e-7, 1e-100, 5e-324, 1e22],
+     0, b'[0.0,-0.0,1e+16,1000000000000000.0,0.0001,0.00001,0.000025,1e-6,1.5e-7,1e-100,5e-324,1e+22]'),
+    ([float("nan"), float("inf"), float("-inf")], 0, b"[null,null,null]"),
+    ([0, -1, 2**63 - 1, -(2**63), 2**64 - 1], 0,
+     b"[0,-1,9223372036854775807,-9223372036854775808,18446744073709551615]"),
+    (2**64, 0, "Integer exceeds 64-bit range"),
+    (-(2**63) - 1, 0, "Integer exceeds 64-bit range"),
+    (2**53, 64, "Integer exceeds 53-bit range"),
+    (2**53 - 1, 64, b"9007199254740991"),
+    ("\x00\x1f\"\\/\x7f\u00e9\u2028\U0001f600\b\f\n\r\t", 0,
+     b'"\\u0000\\u001f\\"\\\\/\x7f\xc3\xa9\xe2\x80\xa8\xf0\x9f\x98\x80\\b\\f\\n\\r\\t"'),
+    ("\ud800", 0, "str is not valid UTF-8: surrogates not allowed"),
+    ({1: 2}, 0, "Dict key must be str"),
+    ({True: 1, 2.5: 2, -3: 3, None: 4, Hue.RED: 5}, 4, b'{"true":1,"2.5":2,"-3":3,"null":4,"red":5}'),
+    ({"b": 1, "a": [1, {}], "\u00e9": 2, "B": []}, 32 | 1 | 1024,
+     b'{\n  "B": [],\n  "a": [\n    1,\n    {}\n  ],\n  "b": 1,\n  "\xc3\xa9": 2\n}\n'),
+    ([{}, [], ()], 1, b"[\n  {},\n  [],\n  []\n]"),
+    ([Hue.RED, Level.HIGH, MyStr2("s"), collections.OrderedDict(a=1), (1, 2)], 0,
+     b'["red",3,"s",{"a":1},[1,2]]'),
+    ({1, 2}, 0, "Type is not JSON serializable: set"),
+    ([MyStr2("v")], 256, "Type is not JSON serializable: MyStr2"),
+    ({MyStr2("k"): 1}, 256, "Dict key must be str"),
+    (1, 1 << 20, "Invalid opts"),
+]
+
+
+def run_dumpb(obj, option=0, **kw):
     try:
-        return ("ok", json.dumps(obj, **kw).encode())
-    except Exception as e:  # noqa: BLE001
-        return ("exc", type(e), str(e))
+        return fastsimdjson.dumpb(obj, option=option, **kw)
+    except TypeError as e:
+        return str(e)
 
 
-def got_bytes(obj, **kw):
-    try:
-        return ("ok", fastsimdjson.dumpb(obj, **kw))
-    except Exception as e:  # noqa: BLE001
-        return ("exc", type(e), str(e))
+@pytest.mark.parametrize("case", range(len(ORJSON_CASES)))
+def test_dumpb_recorded(case):
+    obj, option, expected = ORJSON_CASES[case]
+    assert run_dumpb(obj, option) == expected
 
 
+def test_dumpb_options_exported():
+    assert fastsimdjson.OPT_INDENT_2 == 1 and fastsimdjson.OPT_SORT_KEYS == 32
+    assert fastsimdjson.OPT_NON_STR_KEYS == 4 and fastsimdjson.OPT_APPEND_NEWLINE == 1024
+
+
+def test_dumpb_default_and_depth():
+    assert fastsimdjson.dumpb({1, 2}, default=sorted) == b"[1,2]"
+    with pytest.raises(TypeError, match="default serializer exceeds recursion limit"):
+        fastsimdjson.dumpb({1}, default=lambda o: {2})
+    with pytest.raises(TypeError, match="Type is not JSON serializable: set") as info:
+        fastsimdjson.dumpb({1}, default=lambda o: 1 / 0)
+    assert isinstance(info.value.__cause__, ZeroDivisionError)
+    for depth, ok in ((254, True), (255, False)):
+        deep = []
+        for _ in range(depth - 1):
+            deep = [deep]
+        if ok:
+            assert fastsimdjson.dumpb(deep) == b"[" * depth + b"]" * depth
+        else:
+            with pytest.raises(TypeError, match="Recursion limit reached"):
+                fastsimdjson.dumpb(deep)
+    cycle = []
+    cycle.append(cycle)
+    with pytest.raises(TypeError, match="Recursion limit reached"):
+        fastsimdjson.dumpb(cycle)
+
+
+def test_dumpb_key_cache():
+    # Keys are cached by identity: different keys at the same address over
+    # time, and the same key in many dicts, must be written correctly.
+    for i in range(3000):
+        k = "key%d" % i
+        assert fastsimdjson.dumpb({k: i}) == b'{"%s":%d}' % (k.encode(), i)
+    key = "shared\u00e9\n"
+    obj = [{key: i} for i in range(100)]
+    assert fastsimdjson.dumpb(obj) == b"[" + b",".join(b'{"shared\xc3\xa9\\n":%d}' % i for i in range(100)) + b"]"
+    fastsimdjson.release()
+    assert fastsimdjson.dumpb({key: 1}) == b'{"shared\xc3\xa9\\n":1}'
+
+
+orjson = None
+try:
+    import orjson
+except ImportError:
+    pass
+
+ORJSON_OPTIONS = [0, 1, 32, 1 | 32, 4, 4 | 32, 1024, 64, 256]
+
+
+@pytest.mark.skipif(orjson is None, reason="orjson not installed")
 @pytest.mark.parametrize("path", sorted(glob.glob(os.path.join(DATA, "*.json"))))
-def test_dumpb_files(path):
+def test_dumpb_matches_orjson_files(path):
     obj = json.loads(open(path, "rb").read())
-    for kw in OPTIONS:
-        out = fastsimdjson.dumpb(obj, **kw)
-        assert type(out) is bytes and out == json.dumps(obj, **kw).encode()
+    for option in ORJSON_OPTIONS:
+        assert fastsimdjson.dumpb(obj, option=option) == orjson.dumps(obj, option=option)
 
 
-@pytest.mark.parametrize("seed", range(20))
-def test_dumpb_random(seed):
+def orjson_outcome(fn, obj, **kw):
+    try:
+        return ("ok", fn(obj, **kw))
+    except TypeError as e:
+        return ("TypeError", str(e))
+
+
+@pytest.mark.skipif(orjson is None, reason="orjson not installed")
+@pytest.mark.parametrize("seed", range(30))
+def test_dumpb_matches_orjson_random(seed):
     obj = random_value(random.Random(seed))
-    for kw in OPTIONS:
-        assert fastsimdjson.dumpb(obj, **kw) == json.dumps(obj, **kw).encode()
+    for option in ORJSON_OPTIONS:
+        assert orjson_outcome(fastsimdjson.dumpb, obj, option=option) == \
+            orjson_outcome(orjson.dumps, obj, option=option)
 
 
-def test_dumpb_fallbacks_and_errors():
-    a = [1]
-    a.append(a)
-    cases = [
-        ([float("nan")], {"allow_nan": False}),
-        ({(1, 2): 3}, {}),
-        ({(1, 2): 3}, {"skipkeys": True}),
-        ([{1, 2}], {}),
-        ([{1, 2}], {"default": sorted}),
-        (a, {}),
-        (["\ud800"], {}),
-        (["\ud800"], {"ensure_ascii": False}),  # json's str cannot be UTF-8
-        (["é\U0001f600"], {"ensure_ascii": False}),
-        ([object()], {"cls": None, "default": str}),
-    ]
-    for obj, kw in cases:
-        assert got_bytes(obj, **kw) == expected_bytes(obj, **kw), (obj, kw)
+@pytest.mark.skipif(orjson is None, reason="orjson not installed")
+def test_dumpb_matches_orjson_cases():
+    for obj, option, _ in ORJSON_CASES:
+        assert orjson_outcome(fastsimdjson.dumpb, obj, option=option) == \
+            orjson_outcome(orjson.dumps, obj, option=option), (obj, option)

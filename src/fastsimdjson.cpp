@@ -28,6 +28,25 @@
 #include "simdjson.cpp"
 #include "simdutf.h"
 
+#ifdef _MSC_VER
+#include <intrin.h>
+inline int ctz64(uint64_t x) {
+  unsigned long i;
+  _BitScanForward64(&i, x);
+  return int(i);
+}
+#else
+inline int ctz64(uint64_t x) { return __builtin_ctzll(x); }
+#endif
+
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#define FSJ_SSE2 1
+#elif defined(__ARM_NEON) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define FSJ_NEON 1
+#endif
+
 #if PY_VERSION_HEX >= 0x030D0000
 // No longer declared in the public headers since 3.13, but still exported.
 extern "C" int _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key,
@@ -93,11 +112,32 @@ bool caches_can_decref() {
 // The parser is large once a document has been parsed, so it is a pointer
 // and release() can delete it. `spare` is a document released by parse()
 // (see the lazy API below), kept for the next parse() on this thread.
+// dumpb's dict keys, as written (quoted and escaped), by object identity.
+// The cache holds a reference to each key, so an entry's object cannot be
+// freed and its address reused while it is in the cache.
+constexpr size_t ENCODED_KEY_CACHE_SIZE = 1024; // power of two
+constexpr size_t ENCODED_KEY_MAX = 64;          // bytes of text
+struct EncodedKey {
+  PyObject *key = nullptr;
+  uint32_t len = 0;
+  char text[ENCODED_KEY_MAX];
+};
+
 struct ThreadParser {
   parser *ptr = nullptr;
   simdjson::dom::document *spare = nullptr;
   KeyCacheEntry key_cache[KEY_CACHE_SIZE]{};
   KeyCacheEntry value_cache[KEY_CACHE_SIZE]{};
+  EncodedKey *encoded_keys = nullptr; // allocated on first use by dumpb
+  void clear_encoded_keys() {
+    if (encoded_keys != nullptr) {
+      for (size_t i = 0; i < ENCODED_KEY_CACHE_SIZE; i++) {
+        Py_XDECREF(encoded_keys[i].key);
+      }
+      delete[] encoded_keys;
+      encoded_keys = nullptr;
+    }
+  }
   ~ThreadParser() {
     delete ptr;
     ptr = nullptr;
@@ -106,6 +146,7 @@ struct ThreadParser {
     if (caches_can_decref()) {
       clear_cache(key_cache);
       clear_cache(value_cache);
+      clear_encoded_keys();
     }
   }
 };
@@ -1275,12 +1316,17 @@ struct OutBuf {
   const char *data() const { return buf; }
 };
 
-// Python's repr of a finite double. dragonbox gives the shortest digits that
-// round-trip, the same digits as repr (checked on millions of values); repr
-// writes them in fixed notation when the decimal exponent is in (-4, 16],
-// and as d.ddde+XX otherwise.
-void append_float_repr(OutBuf &out, double v) {
-  char *p = out.reserve(40);
+// A finite double as Python's repr writes it, or as orjson does. dragonbox
+// gives the shortest digits that round-trip, the same digits as repr
+// (checked on millions of values). repr writes them in fixed notation when
+// the decimal exponent is in (-4, 16], and as d.ddde+XX otherwise (at least
+// two exponent digits); orjson uses fixed notation from one more decade
+// down, (-5, 16], and does not pad the exponent (1e-6).
+template <bool Orjson>
+void append_float(OutBuf &out, double v) {
+  // Digits are copied in fixed blocks of 17 (dragonbox writes at most 17),
+  // which compile to a few moves: reserve room for the overshoot.
+  char *p = out.reserve(64);
   char *start = p;
   if (std::signbit(v)) {
     *p++ = '-';
@@ -1291,39 +1337,35 @@ void append_float_repr(OutBuf &out, double v) {
     out.len += size_t(p + 3 - start);
     return;
   }
-  char d[simdjson::internal::to_chars_buffer_size];
+  char d[simdjson::internal::to_chars_buffer_size + 24];
   int nd, e10;
   simdjson::internal::dtoa_impl::dragonbox(d, nd, e10, v);
   int decpt = nd + e10; // v = 0.d * 10^decpt
-  if (decpt > -4 && decpt <= 16) {
+  if (decpt > (Orjson ? -5 : -4) && decpt <= 16) {
     if (decpt <= 0) {
-      *p++ = '0';
-      *p++ = '.';
-      for (int i = 0; i < -decpt; i++) {
-        *p++ = '0';
-      }
-      memcpy(p, d, size_t(nd));
+      memcpy(p, "0.0000", 8); // "0." and up to four zeros
+      p += 2 - decpt;
+      memcpy(p, d, 17);
       p += nd;
     } else if (decpt >= nd) {
-      memcpy(p, d, size_t(nd));
+      memcpy(p, d, 17);
       p += nd;
-      for (int i = nd; i < decpt; i++) {
-        *p++ = '0';
-      }
-      *p++ = '.';
-      *p++ = '0';
+      memset(p, '0', 16);
+      p += decpt - nd;
+      memcpy(p, ".0", 2);
+      p += 2;
     } else {
-      memcpy(p, d, size_t(decpt));
+      memcpy(p, d, 17);
       p += decpt;
       *p++ = '.';
-      memcpy(p, d + decpt, size_t(nd - decpt));
+      memcpy(p, d + decpt, 17);
       p += nd - decpt;
     }
   } else {
     *p++ = d[0];
     if (nd > 1) {
       *p++ = '.';
-      memcpy(p, d + 1, size_t(nd - 1));
+      memcpy(p, d + 1, 16);
       p += nd - 1;
     }
     int e = decpt - 1;
@@ -1335,20 +1377,154 @@ void append_float_repr(OutBuf &out, double v) {
     if (e >= 100) {
       *p++ = char('0' + e / 100);
     }
-    *p++ = char('0' + (e / 10) % 10);
+    if (e >= 10 || !Orjson) {
+      *p++ = char('0' + (e / 10) % 10);
+    }
     *p++ = char('0' + e % 10);
   }
   out.len += size_t(p - start);
 }
 
+const char DIGIT_PAIRS[] =
+    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+    "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+
+// Decimal digits of v, two at a time.
 inline void append_u64(OutBuf &out, uint64_t v) {
   char buf[24];
   char *p = buf + sizeof(buf);
-  do {
-    *--p = char('0' + v % 10);
-    v /= 10;
-  } while (v != 0);
+  while (v >= 100) {
+    p -= 2;
+    memcpy(p, DIGIT_PAIRS + 2 * (v % 100), 2);
+    v /= 100;
+  }
+  if (v >= 10) {
+    p -= 2;
+    memcpy(p, DIGIT_PAIRS + 2 * v, 2);
+  } else {
+    *--p = char('0' + v);
+  }
   out.append(p, size_t(buf + sizeof(buf) - p));
+}
+
+inline void append_i64(OutBuf &out, long long v) {
+  if (v < 0) {
+    out.push_back('-');
+    append_u64(out, uint64_t(0) - uint64_t(v));
+  } else {
+    append_u64(out, uint64_t(v));
+  }
+}
+
+// Writes the JSON escape of c at p (at most 12 bytes); returns the new end.
+inline char *write_escaped(char *p, uint32_t c) {
+  char short_form = 0;
+  switch (c) {
+  case '"': short_form = '"'; break;
+  case '\\': short_form = '\\'; break;
+  case '\b': short_form = 'b'; break;
+  case '\f': short_form = 'f'; break;
+  case '\n': short_form = 'n'; break;
+  case '\r': short_form = 'r'; break;
+  case '\t': short_form = 't'; break;
+  default: break;
+  }
+  if (short_form != 0) {
+    p[0] = '\\';
+    p[1] = short_form;
+    return p + 2;
+  }
+  if (c >= 0x10000) {
+    c -= 0x10000;
+    p = write_escaped(p, 0xD800 | (c >> 10));
+    return write_escaped(p, 0xDC00 | (c & 0x3FF));
+  }
+  p[0] = '\\';
+  p[1] = 'u';
+  p[2] = HEX_DIGITS[(c >> 12) & 0xF];
+  p[3] = HEX_DIGITS[(c >> 8) & 0xF];
+  p[4] = HEX_DIGITS[(c >> 4) & 0xF];
+  p[5] = HEX_DIGITS[c & 0xF];
+  return p + 6;
+}
+
+// The ASCII characters that need an escape: control characters, '"', '\',
+// and DEL when escape_del (json with ensure_ascii escapes all but ' '..'~').
+inline bool byte_needs_escape(uint8_t c, bool escape_del) {
+  return c < 0x20 || c == '"' || c == '\\' || (c == 0x7F && escape_del);
+}
+
+// Bit mask of the bytes of the 16 at s that need an escape; bytes >= 0x80
+// (UTF-8 sequences) never do.
+#if FSJ_SSE2
+inline uint32_t escape_mask16(const char *s, bool escape_del) {
+  __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s));
+  __m128i ctrl = _mm_cmpeq_epi8(_mm_max_epu8(v, _mm_set1_epi8(0x1F)), _mm_set1_epi8(0x1F));
+  __m128i m = _mm_or_si128(ctrl, _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8('"')),
+                                              _mm_cmpeq_epi8(v, _mm_set1_epi8('\\'))));
+  if (escape_del) {
+    m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8(0x7F)));
+  }
+  return uint32_t(_mm_movemask_epi8(m));
+}
+#elif FSJ_NEON
+inline uint64_t escape_mask16(const char *s, bool escape_del) {
+  uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t *>(s));
+  uint8x16_t m = vorrq_u8(vcleq_u8(v, vdupq_n_u8(0x1F)),
+                          vorrq_u8(vceqq_u8(v, vdupq_n_u8('"')), vceqq_u8(v, vdupq_n_u8('\\'))));
+  if (escape_del) {
+    m = vorrq_u8(m, vceqq_u8(v, vdupq_n_u8(0x7F)));
+  }
+  // Four bits per byte.
+  return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0);
+}
+#endif
+
+// Copies s[0, len) to p, escaping the ASCII characters that need it; bytes
+// >= 0x80 (UTF-8 sequences) are copied as they are. p must have room for
+// 6 * len + 16 bytes. Returns the new end.
+inline char *escape_into(char *p, const char *s, size_t len, bool escape_del) {
+  size_t i = 0;
+#if FSJ_SSE2 || FSJ_NEON
+  while (i + 16 <= len) {
+    auto mask = escape_mask16(s + i, escape_del);
+    memcpy(p, s + i, 16); // speculative: overwritten below if needed
+    if (mask == 0) {
+      p += 16;
+      i += 16;
+      continue;
+    }
+#if FSJ_SSE2
+    size_t k = size_t(ctz64(mask));
+#else
+    size_t k = size_t(ctz64(mask)) / 4;
+#endif
+    p += k;
+    i += k;
+    p = write_escaped(p, uint8_t(s[i]));
+    i++;
+  }
+  if (i < len) {
+    // The tail (under 16 bytes), checked in a buffer padded with spaces.
+    char tail[16];
+    memset(tail, ' ', 16);
+    memcpy(tail, s + i, len - i);
+    if (escape_mask16(tail, escape_del) == 0) {
+      memcpy(p, tail, 16); // the caller reserved the room
+      return p + (len - i);
+    }
+  }
+#endif
+  for (; i < len; i++) {
+    uint8_t c = uint8_t(s[i]);
+    if (byte_needs_escape(c, escape_del)) {
+      p = write_escaped(p, c);
+    } else {
+      *p++ = char(c);
+    }
+  }
+  return p;
 }
 
 struct Encoder {
@@ -1390,57 +1566,8 @@ struct Encoder {
     out.push_back(bracket);
   }
 
-  // Writes the escape of c at p (at most 12 bytes); returns the new end.
-  static inline char *write_escaped(char *p, uint32_t c) {
-    char short_form = 0;
-    switch (c) {
-    case '"': short_form = '"'; break;
-    case '\\': short_form = '\\'; break;
-    case '\b': short_form = 'b'; break;
-    case '\f': short_form = 'f'; break;
-    case '\n': short_form = 'n'; break;
-    case '\r': short_form = 'r'; break;
-    case '\t': short_form = 't'; break;
-    default: break;
-    }
-    if (short_form != 0) {
-      p[0] = '\\';
-      p[1] = short_form;
-      return p + 2;
-    }
-    if (c >= 0x10000) {
-      c -= 0x10000;
-      p = write_escaped(p, 0xD800 | (c >> 10));
-      return write_escaped(p, 0xDC00 | (c & 0x3FF));
-    }
-    p[0] = '\\';
-    p[1] = 'u';
-    p[2] = HEX_DIGITS[(c >> 12) & 0xF];
-    p[3] = HEX_DIGITS[(c >> 8) & 0xF];
-    p[4] = HEX_DIGITS[(c >> 4) & 0xF];
-    p[5] = HEX_DIGITS[c & 0xF];
-    return p + 6;
-  }
-
-  // ASCII characters that need an escape: control characters, '"' and '\',
-  // and with ensure_ascii, DEL (json escapes everything outside ' '..'~').
   inline bool ascii_needs_escape(uint8_t c) const {
-    return c < 0x20 || c == '"' || c == '\\' || (c == 0x7F && ensure_ascii);
-  }
-
-  // True when one of the 8 ASCII bytes in w needs an escape.
-  inline bool word_needs_escape(uint64_t w) const {
-    const uint64_t ones = 0x0101010101010101ULL;
-    const uint64_t highs = 0x8080808080808080ULL;
-    uint64_t lt20 = (w - ones * 0x20) & ~w;
-    uint64_t q = w ^ (ones * '"');
-    uint64_t b = w ^ (ones * '\\');
-    uint64_t eq = ((q - ones) & ~q) | ((b - ones) & ~b);
-    if (ensure_ascii) {
-      uint64_t d = w ^ (ones * 0x7F);
-      eq |= (d - ones) & ~d;
-    }
-    return ((lt20 | eq) & highs) != 0;
+    return byte_needs_escape(c, ensure_ascii);
   }
 
   // Writes the code units s[0, len) with every non-ASCII character escaped
@@ -1458,37 +1585,14 @@ struct Encoder {
     return p;
   }
 
-  // Copies s[0, len) to p, escaping the ASCII characters that need it;
-  // bytes >= 0x80 (UTF-8 sequences) are copied as they are. p must have
-  // room for 6 * len bytes. Returns the new end.
-  inline char *write_escaped_bytes(char *p, const char *s, size_t len) const {
-    size_t i = 0;
-    while (i < len) {
-      size_t start = i;
-      while (i + 8 <= len && !word_needs_escape(load_u64(s + i))) {
-        i += 8;
-      }
-      while (i < len && (uint8_t(s[i]) >= 0x80 || !ascii_needs_escape(uint8_t(s[i])))) {
-        i++;
-      }
-      memcpy(p, s + start, i - start);
-      p += i - start;
-      if (i < len) {
-        p = write_escaped(p, uint8_t(s[i]));
-        i++;
-      }
-    }
-    return p;
-  }
-
   // The leaf encoders are out of line, which keeps the frames of the
   // recursive encode small (json.dumps handles deep nesting, so must we).
   FSJ_NOINLINE int encode_str(PyObject *s) {
     size_t len = size_t(PyUnicode_GET_LENGTH(s));
     if (PyUnicode_IS_ASCII(s)) {
-      char *p = out.reserve(6 * len + 2);
+      char *p = out.reserve(6 * len + 18);
       *p++ = '"';
-      p = write_escaped_bytes(p, static_cast<const char *>(PyUnicode_DATA(s)), len);
+      p = escape_into(p, static_cast<const char *>(PyUnicode_DATA(s)), len, ensure_ascii);
       *p++ = '"';
       out.len = size_t(p - out.buf);
       return ENCODE_OK;
@@ -1513,8 +1617,8 @@ struct Encoder {
     // characters that need it. simdutf rejects lone surrogates, which json
     // keeps in its str output: those strings go to json.dumps.
     size_t utf8_max = (kind == PyUnicode_1BYTE_KIND ? 2 : kind == PyUnicode_2BYTE_KIND ? 3 : 4) * len;
-    char *p = out.reserve(utf8_max + 6 * utf8_max + 2);
-    char *tmp = p + 6 * utf8_max + 2; // transcode past the room for the escaped copy
+    char *p = out.reserve(utf8_max + 6 * utf8_max + 18);
+    char *tmp = p + 6 * utf8_max + 18; // transcode past the room for the escaped copy
     size_t n;
     if (kind == PyUnicode_1BYTE_KIND) {
       n = simdutf::convert_latin1_to_utf8(static_cast<const char *>(data), len, tmp);
@@ -1537,7 +1641,7 @@ struct Encoder {
       return ENCODE_FALLBACK; // a lone surrogate cannot be UTF-8
     }
     *p++ = '"';
-    p = write_escaped_bytes(p, tmp, n);
+    p = escape_into(p, tmp, n, ensure_ascii);
     *p++ = '"';
     out.len = size_t(p - out.buf);
     return ENCODE_OK;
@@ -1550,12 +1654,7 @@ struct Encoder {
       if (v == -1 && PyErr_Occurred()) {
         return ENCODE_ERROR;
       }
-      if (v < 0) {
-        out.push_back('-');
-        append_u64(out, uint64_t(0) - uint64_t(v));
-      } else {
-        append_u64(out, uint64_t(v));
-      }
+      append_i64(out, v);
       return ENCODE_OK;
     }
     // int.__repr__, as json does (an int subclass may override __repr__).
@@ -1574,7 +1673,7 @@ struct Encoder {
 
   FSJ_NOINLINE int encode_float(double v) {
     if (std::isfinite(v)) {
-      append_float_repr(out, v);
+      append_float<false>(out, v);
       return ENCODE_OK;
     }
     if (!allow_nan) {
@@ -1863,24 +1962,11 @@ bool configure(Encoder &e, PyObject *kwargs, bool *error) {
   return true;
 }
 
-// json.dumps(*args, **kwargs), as a str, or encoded as UTF-8 bytes.
-PyObject *call_json_dumps(PyObject *args, PyObject *kwargs, bool as_bytes) {
-  PyObject *s = PyObject_Call(json_dumps, args, kwargs);
-  if (s == nullptr || !as_bytes) {
-    return s;
-  }
-  PyObject *b = PyUnicode_AsUTF8String(s);
-  Py_DECREF(s);
-  return b;
-}
-
-// dumps returns the str of json.dumps; dumpb returns it encoded as UTF-8.
-template <bool AsBytes>
-PyObject *serialize(PyObject *, PyObject *args, PyObject *kwargs) {
+PyObject *dumps(PyObject *, PyObject *args, PyObject *kwargs) {
   Encoder e;
   bool error = false;
   if (PyTuple_GET_SIZE(args) != 1 || !configure(e, kwargs, &error)) {
-    return error ? nullptr : call_json_dumps(args, kwargs, AsBytes);
+    return error ? nullptr : PyObject_Call(json_dumps, args, kwargs);
   }
   int rc;
   try {
@@ -1892,21 +1978,492 @@ PyObject *serialize(PyObject *, PyObject *args, PyObject *kwargs) {
     return nullptr;
   }
   if (rc == ENCODE_FALLBACK) {
-    return call_json_dumps(args, kwargs, AsBytes);
-  }
-  if (AsBytes) { // the output is UTF-8 (ASCII with ensure_ascii)
-    return PyBytes_FromStringAndSize(e.out.data(), Py_ssize_t(e.out.size()));
+    return PyObject_Call(json_dumps, args, kwargs);
   }
   return e.ascii_output ? new_ascii(e.out.data(), e.out.size())
                         : PyUnicode_DecodeUTF8(e.out.data(), Py_ssize_t(e.out.size()), nullptr);
 }
 
-PyObject *dumps(PyObject *self, PyObject *args, PyObject *kwargs) {
-  return serialize<false>(self, args, kwargs);
-}
+// ---------------------------------------------------------------------------
+// dumpb: the output of orjson.dumps (compact UTF-8 bytes), with its
+// arguments (default, option) and errors, for the JSON types: str, int,
+// float, bool, None, list, tuple, dict, their subclasses, and enums. The
+// other types orjson serializes natively (dataclasses, datetime, UUID,
+// numpy) go to default.
+// ---------------------------------------------------------------------------
+enum : unsigned long {
+  OPT_INDENT_2 = 1,
+  OPT_NON_STR_KEYS = 4,
+  OPT_SORT_KEYS = 32,
+  OPT_STRICT_INTEGER = 64,
+  OPT_PASSTHROUGH_SUBCLASS = 256,
+  OPT_APPEND_NEWLINE = 1024,
+  OPT_ALL = 4095, // orjson's options; the others concern types we do not serialize
+};
+constexpr int ORJSON_MAX_DEPTH = 254;
+PyObject *EnumType = nullptr; // enum.Enum
 
-PyObject *dumpb(PyObject *self, PyObject *args, PyObject *kwargs) {
-  return serialize<true>(self, args, kwargs);
+struct OrjsonEncoder {
+  OutBuf out;
+  PyObject *default_fn = nullptr; // borrowed
+  unsigned long opts = 0;
+  int depth = 0;         // containers being encoded
+  int default_calls = 0; // nested calls to default
+
+  int fail(const char *msg) {
+    PyErr_SetString(PyExc_TypeError, msg);
+    return -1;
+  }
+
+  void newline() {
+    size_t n = 1 + 2 * size_t(depth);
+    char *p = out.reserve(n);
+    p[0] = '\n';
+    memset(p + 1, ' ', n - 1);
+    out.len += n;
+  }
+
+  int encode_str(PyObject *s) {
+    Py_ssize_t n;
+    const char *p;
+    if (PyUnicode_IS_COMPACT_ASCII(s)) {
+      p = static_cast<const char *>(PyUnicode_DATA(s));
+      n = PyUnicode_GET_LENGTH(s);
+    } else {
+      p = PyUnicode_AsUTF8AndSize(s, &n); // cached on the str, as orjson does
+      if (p == nullptr) {
+        PyErr_Clear();
+        return fail("str is not valid UTF-8: surrogates not allowed");
+      }
+    }
+    char *w = out.reserve(6 * size_t(n) + 18);
+    *w++ = '"';
+    w = escape_into(w, p, size_t(n), false);
+    *w++ = '"';
+    out.len = size_t(w - out.buf);
+    return 0;
+  }
+
+  int encode_int(PyObject *o) {
+    int overflow = 0;
+    long long v = PyLong_AsLongLongAndOverflow(o, &overflow);
+    if (overflow == 0) {
+      if (v == -1 && PyErr_Occurred()) {
+        return -1;
+      }
+      if ((opts & OPT_STRICT_INTEGER) && (v > 9007199254740991LL || v < -9007199254740991LL)) {
+        return fail("Integer exceeds 53-bit range");
+      }
+      append_i64(out, v);
+      return 0;
+    }
+    if (overflow > 0) {
+      unsigned long long u = PyLong_AsUnsignedLongLong(o);
+      if (u == (unsigned long long)-1 && PyErr_Occurred()) {
+        PyErr_Clear();
+      } else {
+        if (opts & OPT_STRICT_INTEGER) {
+          return fail("Integer exceeds 53-bit range");
+        }
+        append_u64(out, u);
+        return 0;
+      }
+    }
+    return fail("Integer exceeds 64-bit range");
+  }
+
+  void encode_float(double v) {
+    if (std::isfinite(v)) {
+      append_float<true>(out, v);
+    } else {
+      out.append("null", 4);
+    }
+  }
+
+  // A dict key: a str, or with OPT_NON_STR_KEYS, the text of an int, float,
+  // bool, None or enum.
+  // An exact str key, from the cache of encoded keys when possible.
+  int encode_str_key(PyObject *k) {
+    EncodedKey *cache = g_thread_parser.encoded_keys;
+    if (cache == nullptr) {
+      cache = g_thread_parser.encoded_keys = new (std::nothrow) EncodedKey[ENCODED_KEY_CACHE_SIZE];
+      if (cache == nullptr) {
+        return encode_str(k);
+      }
+    }
+    EncodedKey &e = cache[(reinterpret_cast<uintptr_t>(k) >> 4) & (ENCODED_KEY_CACHE_SIZE - 1)];
+    if (e.key == k) {
+      memcpy(out.reserve(ENCODED_KEY_MAX), e.text, ENCODED_KEY_MAX);
+      out.len += e.len;
+      return 0;
+    }
+    size_t start = out.len;
+    if (encode_str(k) < 0) {
+      return -1;
+    }
+    size_t n = out.len - start;
+    if (n <= ENCODED_KEY_MAX) {
+      Py_INCREF(k);
+      Py_XDECREF(e.key);
+      e.key = k;
+      e.len = uint32_t(n);
+      memcpy(e.text, out.buf + start, n);
+    }
+    return 0;
+  }
+
+  int encode_key(PyObject *k) {
+    if (PyUnicode_CheckExact(k)) {
+      return encode_str_key(k);
+    }
+    if (PyUnicode_Check(k) && !(opts & OPT_PASSTHROUGH_SUBCLASS)) {
+      return encode_str(k);
+    }
+    if (!(opts & OPT_NON_STR_KEYS)) {
+      return fail("Dict key must be str");
+    }
+    if (k == Py_True || k == Py_False || k == Py_None) {
+      out.append(k == Py_True ? "\"true\"" : k == Py_False ? "\"false\"" : "\"null\"");
+      return 0;
+    }
+    if (PyLong_Check(k) || PyFloat_Check(k)) {
+      out.push_back('"');
+      int rc = 0;
+      if (PyLong_Check(k)) {
+        rc = encode_int(k);
+      } else {
+        encode_float(PyFloat_AS_DOUBLE(k));
+      }
+      out.push_back('"');
+      return rc;
+    }
+    if (PyObject_IsInstance(k, EnumType) == 1) {
+      PyObject *value = PyObject_GetAttrString(k, "value");
+      if (value == nullptr) {
+        return -1;
+      }
+      int rc = encode_key(value);
+      Py_DECREF(value);
+      return rc;
+    }
+    return fail("Dict key must a type serializable with OPT_NON_STR_KEYS");
+  }
+
+  int open(char bracket) {
+    if (++depth > ORJSON_MAX_DEPTH) {
+      return fail("Recursion limit reached");
+    }
+    out.push_back(bracket);
+    return 0;
+  }
+
+  void close(char bracket) {
+    depth--;
+    if (opts & OPT_INDENT_2) {
+      newline();
+    }
+    out.push_back(bracket);
+  }
+
+  void separate(bool first) {
+    if (!first) {
+      out.push_back(',');
+    }
+    if (opts & OPT_INDENT_2) {
+      newline();
+    }
+  }
+
+  int encode_list(PyObject *o) {
+    bool is_list = PyList_Check(o);
+    Py_ssize_t n = is_list ? PyList_GET_SIZE(o) : PyTuple_GET_SIZE(o);
+    if (depth >= ORJSON_MAX_DEPTH) { // empty containers count too
+      return fail("Recursion limit reached");
+    }
+    if (n == 0) {
+      out.append("[]", 2);
+      return 0;
+    }
+    if (open('[') < 0) {
+      return -1;
+    }
+    for (Py_ssize_t i = 0;; i++) {
+      PyObject *item = is_list ? list_item(o, i)
+                       : i < n ? Py_NewRef(PyTuple_GET_ITEM(o, i))
+                               : nullptr;
+      if (item == nullptr) {
+        break;
+      }
+      separate(i == 0);
+      int rc = encode(item);
+      Py_DECREF(item);
+      if (rc < 0) {
+        return -1;
+      }
+    }
+    close(']');
+    return 0;
+  }
+
+  int encode_pair(PyObject *key, PyObject *value, bool first) {
+    separate(first);
+    if (encode_key(key) < 0) {
+      return -1;
+    }
+    if (opts & OPT_INDENT_2) {
+      out.append(": ", 2);
+    } else {
+      out.push_back(':');
+    }
+    return encode(value);
+  }
+
+  // Sorting keys: compare the keys as they will be written (UTF-8 of str
+  // keys, the text of the others).
+  int encode_sorted(PyObject *o) {
+    PyObject *items = PyDict_CheckExact(o) ? PyDict_Items(o) : PyMapping_Items(o);
+    if (items == nullptr) {
+      return -1;
+    }
+    struct Entry {
+      std::string key;
+      PyObject *pair;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(size_t(PyList_GET_SIZE(items)));
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(items); i++) {
+      PyObject *pair = PyList_GET_ITEM(items, i);
+      PyObject *k = PyTuple_GET_ITEM(pair, 0);
+      std::string text;
+      if (PyUnicode_Check(k)) {
+        Py_ssize_t n;
+        const char *u = PyUnicode_AsUTF8AndSize(k, &n);
+        if (u == nullptr) {
+          PyErr_Clear();
+          Py_DECREF(items);
+          return fail("str is not valid UTF-8: surrogates not allowed");
+        }
+        text.assign(u, size_t(n));
+      } else {
+        // The text of a non-str key, as written (quotes removed).
+        OrjsonEncoder sub;
+        sub.opts = opts;
+        if (sub.encode_key(k) < 0) {
+          Py_DECREF(items);
+          return -1;
+        }
+        text.assign(sub.out.data() + 1, sub.out.size() - 2);
+      }
+      entries.push_back({std::move(text), pair});
+    }
+    std::stable_sort(entries.begin(), entries.end(),
+                     [](const Entry &a, const Entry &b) { return a.key < b.key; });
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < entries.size(); i++) {
+      rc = encode_pair(PyTuple_GET_ITEM(entries[i].pair, 0),
+                       PyTuple_GET_ITEM(entries[i].pair, 1), i == 0);
+    }
+    Py_DECREF(items);
+    return rc;
+  }
+
+  int encode_dict(PyObject *o) {
+    if (depth >= ORJSON_MAX_DEPTH) { // empty containers count too
+      return fail("Recursion limit reached");
+    }
+    if (PyDict_GET_SIZE(o) == 0) {
+      out.append("{}", 2);
+      return 0;
+    }
+    if (open('{') < 0) {
+      return -1;
+    }
+    int rc = 0;
+#ifdef Py_GIL_DISABLED
+    bool snapshot = true; // another thread may change the dict
+#else
+    bool snapshot = default_fn != nullptr || !PyDict_CheckExact(o); // Python code may run
+#endif
+    if (opts & OPT_SORT_KEYS) {
+      rc = encode_sorted(o);
+    } else if (snapshot) {
+      PyObject *items = PyDict_CheckExact(o) ? PyDict_Items(o) : PyMapping_Items(o);
+      if (items == nullptr) {
+        return -1;
+      }
+      for (Py_ssize_t i = 0; rc == 0 && i < PyList_GET_SIZE(items); i++) {
+        PyObject *pair = PyList_GET_ITEM(items, i);
+        rc = encode_pair(PyTuple_GET_ITEM(pair, 0), PyTuple_GET_ITEM(pair, 1), i == 0);
+      }
+      Py_DECREF(items);
+    } else {
+      Py_ssize_t pos = 0;
+      PyObject *key, *value;
+      bool first = true;
+      while (rc == 0 && PyDict_Next(o, &pos, &key, &value)) {
+        rc = encode_pair(key, value, first);
+        first = false;
+      }
+    }
+    if (rc == 0) {
+      close('}');
+    }
+    return rc;
+  }
+
+  int encode_default(PyObject *o) {
+    if (default_fn == nullptr) {
+      PyErr_Format(PyExc_TypeError, "Type is not JSON serializable: %s", Py_TYPE(o)->tp_name);
+      return -1;
+    }
+    if (++default_calls > ORJSON_MAX_DEPTH) {
+      return fail("default serializer exceeds recursion limit");
+    }
+    PyObject *r = PyObject_CallOneArg(default_fn, o);
+    if (r == nullptr) {
+      // TypeError("Type is not JSON serializable: ...") from the exception
+      // that default raised, as orjson does.
+      PyObject *typ, *cause, *tb;
+      PyErr_Fetch(&typ, &cause, &tb);
+      PyErr_NormalizeException(&typ, &cause, &tb);
+      if (tb != nullptr) {
+        PyException_SetTraceback(cause, tb);
+      }
+      Py_XDECREF(typ);
+      Py_XDECREF(tb);
+      PyErr_Format(PyExc_TypeError, "Type is not JSON serializable: %s", Py_TYPE(o)->tp_name);
+      PyObject *t2, *exc, *tb2;
+      PyErr_Fetch(&t2, &exc, &tb2);
+      PyErr_NormalizeException(&t2, &exc, &tb2);
+      PyException_SetContext(exc, Py_NewRef(cause));
+      PyException_SetCause(exc, cause); // steals cause
+      PyErr_Restore(t2, exc, tb2);
+      return -1;
+    }
+    int rc = encode(r);
+    Py_DECREF(r);
+    default_calls--;
+    return rc;
+  }
+
+  int encode(PyObject *o) {
+    PyTypeObject *t = Py_TYPE(o);
+    if (t == &PyUnicode_Type) {
+      return encode_str(o);
+    }
+    if (t == &PyLong_Type) {
+      return encode_int(o);
+    }
+    if (t == &PyFloat_Type) {
+      encode_float(PyFloat_AS_DOUBLE(o));
+      return 0;
+    }
+    if (t == &PyDict_Type) {
+      return encode_dict(o);
+    }
+    if (t == &PyList_Type || t == &PyTuple_Type) {
+      return encode_list(o);
+    }
+    if (o == Py_None || o == Py_True || o == Py_False) {
+      if (o == Py_None) {
+        out.append("null", 4);
+      } else if (o == Py_True) {
+        out.append("true", 4);
+      } else {
+        out.append("false", 5);
+      }
+      return 0;
+    }
+    if (PyObject_IsInstance(o, EnumType) == 1) {
+      PyObject *value = PyObject_GetAttrString(o, "value");
+      if (value == nullptr) {
+        return -1;
+      }
+      int rc = encode(value);
+      Py_DECREF(value);
+      return rc;
+    }
+    if (!(opts & OPT_PASSTHROUGH_SUBCLASS)) {
+      if (PyUnicode_Check(o)) {
+        return encode_str(o);
+      }
+      if (PyLong_Check(o)) {
+        return encode_int(o);
+      }
+      if (PyDict_Check(o)) {
+        return encode_dict(o);
+      }
+      if (PyList_Check(o)) {
+        return encode_list(o);
+      }
+    }
+    if (PyFloat_Check(o)) {
+      encode_float(PyFloat_AS_DOUBLE(o));
+      return 0;
+    }
+    if (PyTuple_Check(o)) {
+      return encode_list(o);
+    }
+    return encode_default(o);
+  }
+};
+
+// dumpb(obj, /, default=None, option=None), as orjson.dumps.
+PyObject *dumpb(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
+  PyObject *obj = nullptr, *dflt = nullptr, *option = nullptr;
+  Py_ssize_t nkw = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
+  if (nargs < 1 || nargs > 3) {
+    PyErr_SetString(PyExc_TypeError, "dumpb() takes 1 to 3 positional arguments");
+    return nullptr;
+  }
+  obj = args[0];
+  dflt = nargs > 1 ? args[1] : nullptr;
+  option = nargs > 2 ? args[2] : nullptr;
+  for (Py_ssize_t i = 0; i < nkw; i++) {
+    PyObject *name = PyTuple_GET_ITEM(kwnames, i);
+    if (PyUnicode_CompareWithASCIIString(name, "default") == 0 && dflt == nullptr) {
+      dflt = args[nargs + i];
+    } else if (PyUnicode_CompareWithASCIIString(name, "option") == 0 && option == nullptr) {
+      option = args[nargs + i];
+    } else {
+      PyErr_Format(PyExc_TypeError, "dumpb() got an unexpected keyword argument '%U'", name);
+      return nullptr;
+    }
+  }
+  OrjsonEncoder e;
+  if (dflt != nullptr && dflt != Py_None) {
+    if (!PyCallable_Check(dflt)) {
+      PyErr_SetString(PyExc_TypeError, "default must be callable");
+      return nullptr;
+    }
+    e.default_fn = dflt;
+  }
+  if (option != nullptr && option != Py_None) {
+    if (!PyLong_Check(option)) {
+      PyErr_SetString(PyExc_TypeError, "Invalid opts");
+      return nullptr;
+    }
+    long v = PyLong_AsLong(option);
+    if ((v == -1 && PyErr_Occurred()) || v < 0 || (unsigned long)v > OPT_ALL) {
+      PyErr_Clear();
+      PyErr_SetString(PyExc_TypeError, "Invalid opts");
+      return nullptr;
+    }
+    e.opts = (unsigned long)v;
+  }
+  int rc;
+  try {
+    rc = e.encode(obj);
+    if (rc == 0 && (e.opts & OPT_APPEND_NEWLINE)) {
+      e.out.push_back('\n');
+    }
+  } catch (const std::bad_alloc &) {
+    return PyErr_NoMemory();
+  }
+  if (rc < 0) {
+    return nullptr;
+  }
+  return PyBytes_FromStringAndSize(e.out.data(), Py_ssize_t(e.out.size()));
 }
 
 // dump(obj, fp, **kw): fp.write(dumps(obj, **kw)).
@@ -2435,6 +2992,7 @@ PyObject *release(PyObject *, PyObject *) {
   g_thread_parser.spare = nullptr;
   clear_cache(g_thread_parser.key_cache);
   clear_cache(g_thread_parser.value_cache);
+  g_thread_parser.clear_encoded_keys();
   Py_RETURN_NONE;
 }
 
@@ -2445,8 +3003,8 @@ PyMethodDef methods[] = {
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj to a JSON str. Same arguments and output as json.dumps."},
     {"dumpb", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumpb)),
-     METH_VARARGS | METH_KEYWORDS,
-     "Serialize obj to JSON as UTF-8 bytes: json.dumps(obj, **kw).encode()."},
+     METH_FASTCALL | METH_KEYWORDS,
+     "Serialize obj to JSON bytes, with the arguments and output of orjson.dumps."},
     {"dump", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dump)),
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj as JSON to fp (a file with a write method), like json.dump."},
@@ -2507,6 +3065,29 @@ int exec_fastsimdjson(PyObject *module) {
       Py_CLEAR(json_dumps);
       Py_CLEAR(json_raw_decode);
       Py_CLEAR(io_open);
+      return -1;
+    }
+  }
+  if (EnumType == nullptr) {
+    PyObject *enum_module = PyImport_ImportModule("enum");
+    EnumType = enum_module ? PyObject_GetAttrString(enum_module, "Enum") : nullptr;
+    Py_XDECREF(enum_module);
+    if (EnumType == nullptr) {
+      return -1;
+    }
+  }
+  struct {
+    const char *name;
+    long value;
+  } options[] = {{"OPT_APPEND_NEWLINE", 1024}, {"OPT_INDENT_2", 1},
+                 {"OPT_NAIVE_UTC", 2},          {"OPT_NON_STR_KEYS", 4},
+                 {"OPT_OMIT_MICROSECONDS", 8},  {"OPT_PASSTHROUGH_DATACLASS", 2048},
+                 {"OPT_PASSTHROUGH_DATETIME", 512}, {"OPT_PASSTHROUGH_SUBCLASS", 256},
+                 {"OPT_SERIALIZE_DATACLASS", 0}, {"OPT_SERIALIZE_NUMPY", 16},
+                 {"OPT_SERIALIZE_UUID", 0},     {"OPT_SORT_KEYS", 32},
+                 {"OPT_STRICT_INTEGER", 64},    {"OPT_UTC_Z", 128}};
+  for (auto &o : options) {
+    if (PyModule_AddIntConstant(module, o.name, o.value) < 0) {
       return -1;
     }
   }
