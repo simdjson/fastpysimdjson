@@ -11,6 +11,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -3052,6 +3053,9 @@ struct StreamObject {
   size_t open;     // array format: offsets of the outer '[' and ']'
   size_t close;
   PyObject *text;  // the input as str, built on the error path
+  size_t text_len; // bytes of buf that `text` covers (len, or more for a chunk)
+  bool no_fallback;   // a chunk of a parallel run: do not call json (see run_chunk)
+  bool need_fallback; // set instead of calling json, with no_fallback
   parser *p;
   document_stream *stream;
   document_stream::iterator it;
@@ -3111,7 +3115,7 @@ PyObject *stream_text(StreamObject *s) {
   if (s->text == nullptr) {
     s->text = PyUnicode_Check(s->source)
                   ? Py_NewRef(s->source)
-                  : PyUnicode_DecodeUTF8(s->buf, Py_ssize_t(s->len), nullptr);
+                  : PyUnicode_DecodeUTF8(s->buf, Py_ssize_t(s->text_len), nullptr);
   }
   return s->text;
 }
@@ -3252,6 +3256,16 @@ PyObject *stream_fallback(StreamObject *s) {
   return value;
 }
 
+// In a chunk of a parallel run, json is not called: the run continues in one
+// thread from there, where json decides as it does without threads.
+PyObject *stream_fallback_or_stop(StreamObject *s) {
+  if (s->no_fallback) {
+    s->need_fallback = true;
+    return nullptr;
+  }
+  return stream_fallback(s);
+}
+
 // The next document, or nullptr at the end or after an error.
 PyObject *stream_next_locked(StreamObject *s) {
   for (;;) {
@@ -3266,7 +3280,7 @@ PyObject *stream_next_locked(StreamObject *s) {
     if (!(s->it != s->stream->end())) {
       // Anything but separators after the last document is an incomplete
       // document: let json report it.
-      return skip_separators(s, s->last_end) < s->len ? stream_fallback(s) : nullptr;
+      return skip_separators(s, s->last_end) < s->len ? stream_fallback_or_stop(s) : nullptr;
     }
     simdjson::dom::element el;
     simdjson::error_code err = (*s->it).get(el);
@@ -3285,7 +3299,7 @@ PyObject *stream_next_locked(StreamObject *s) {
       s->active = false;
       continue;
     }
-    return stream_fallback(s);
+    return stream_fallback_or_stop(s);
   }
 }
 
@@ -3393,6 +3407,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   s->active = false;
   s->base = 0;
   s->last_end = 0;
+  s->no_fallback = s->need_fallback = false;
   PyObject *self = reinterpret_cast<PyObject *>(s);
   if (must_copy) {
     PyObject *b = PyBytes_FromObject(data);
@@ -3415,7 +3430,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
     buf = s->copy->data();
   }
   s->buf = buf;
-  s->len = size_t(len);
+  s->len = s->text_len = size_t(len);
   // parse_many skips a UTF-8 byte order mark and, for the array format,
   // white space and the opening '['; the offsets it reports start after.
   size_t i = s->len >= 3 && memcmp(buf, "\xEF\xBB\xBF", 3) == 0 ? 3 : 0;
@@ -3451,12 +3466,410 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   return self;
 }
 
+// ---------------------------------------------------------------------------
+// Streams over several threads (threads=N): the input is cut into chunks at
+// document boundaries (after a newline; before a record separator for
+// json_seq), and threads take the chunks in turn, each building the
+// documents of its chunk (and calling fn on them, for map_many). Without
+// the GIL (free-threaded Python), the threads run in parallel; with it, the
+// calling thread does all the work.
+//
+// The result is that of one thread: at the first chunk where anything other
+// than plain documents shows up (an error, a document that only json
+// accepts), the documents before it are kept and the calling thread goes on
+// from there as a stream without threads would. (fn may then have been
+// called on documents after that point, in other threads.)
+// ---------------------------------------------------------------------------
+
+// A stream over [from, to) of the input of `whole`, sharing its buffer.
+StreamObject *stream_over(StreamObject *whole, size_t from, size_t to) {
+  StreamObject *s = PyObject_New(StreamObject, StreamType);
+  if (s == nullptr) {
+    return nullptr;
+  }
+  s->source = Py_NewRef(whole->source);
+  s->copy = nullptr;
+  s->text = nullptr;
+  s->stream = nullptr;
+  s->p = nullptr;
+  new (&s->it) document_stream::iterator();
+  s->buf = whole->buf;
+  s->len = to;
+  s->text_len = whole->len;
+  s->batch_size = whole->batch_size;
+  s->format = whole->format;
+  s->lazy = whole->lazy;
+  s->done = false;
+  s->active = false;
+  s->base = 0;
+  s->last_end = from;
+  s->prefix = whole->prefix;
+  s->open = whole->open;
+  s->close = whole->close;
+  s->no_fallback = s->need_fallback = false;
+  s->p = new (std::nothrow) parser();
+  if (s->p == nullptr) {
+    Py_DECREF(reinterpret_cast<PyObject *>(s));
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  s->p->number_as_string(true);
+  return s;
+}
+
+struct ParallelRun {
+  StreamObject *whole;
+  PyObject *fn; // borrowed, or nullptr
+  std::vector<size_t> bounds; // chunk i is [bounds[i], bounds[i + 1])
+  struct Chunk {
+    PyObject *items = nullptr; // list of the chunk's results
+    bool failed = false;       // stopped before the end of the chunk
+    PyObject *exc = nullptr;   // the exception fn raised, if it did
+    size_t resume_at = 0;      // where the one-thread run goes on
+  };
+  std::vector<Chunk> chunks;
+  std::atomic<size_t> next{0};
+  std::atomic<size_t> first_failure{SIZE_MAX};
+
+  void note_failure(size_t i) {
+    size_t f = first_failure.load();
+    while (i < f && !first_failure.compare_exchange_weak(f, i)) {
+    }
+  }
+
+  // On an attached thread.
+  void run_chunk(size_t i) {
+    Chunk &c = chunks[i];
+    c.resume_at = bounds[i];
+    StreamObject *st = stream_over(whole, bounds[i], bounds[i + 1]);
+    c.items = st ? PyList_New(0) : nullptr;
+    if (c.items == nullptr) {
+      PyErr_Clear(); // the one-thread run will report it
+      c.failed = true;
+    }
+    if (st != nullptr && c.items != nullptr) {
+      st->no_fallback = true;
+      while (first_failure.load(std::memory_order_relaxed) > i) {
+        size_t before = st->last_end;
+        PyObject *v = stream_next_locked(st);
+        if (v == nullptr) {
+          if (PyErr_Occurred() || st->need_fallback) {
+            PyErr_Clear(); // reported again by the one-thread run
+            c.failed = true;
+            c.resume_at = before;
+          }
+          break;
+        }
+        c.resume_at = st->last_end;
+        if (fn != nullptr) {
+          PyObject *r = PyObject_CallOneArg(fn, v);
+          Py_DECREF(v);
+          if (r == nullptr) {
+            PyObject *t, *val, *tb;
+            PyErr_Fetch(&t, &val, &tb);
+            PyErr_NormalizeException(&t, &val, &tb);
+            if (tb != nullptr && val != nullptr) {
+              PyException_SetTraceback(val, tb);
+            }
+            Py_XDECREF(t);
+            Py_XDECREF(tb);
+            c.exc = val;
+            c.failed = true;
+            break;
+          }
+          v = r;
+        }
+        int rc = PyList_Append(c.items, v);
+        Py_DECREF(v);
+        if (rc < 0) {
+          PyErr_Clear();
+          c.failed = true;
+          break;
+        }
+      }
+    }
+    Py_XDECREF(reinterpret_cast<PyObject *>(st));
+    if (c.failed) {
+      note_failure(i);
+    }
+  }
+
+  // Takes chunks until none is left, letting the garbage collector of
+  // other threads run between chunks.
+  void work() {
+    for (;;) {
+      size_t i = next.fetch_add(1);
+      if (i >= chunks.size() || i > first_failure.load()) {
+        return;
+      }
+      run_chunk(i);
+      Py_BEGIN_ALLOW_THREADS
+      Py_END_ALLOW_THREADS
+    }
+  }
+};
+
+// Chunk boundaries: about `n` chunks, each ending just after a newline (or
+// just before a record separator, for json_seq).
+std::vector<size_t> chunk_bounds(const StreamObject *w, size_t n) {
+  std::vector<size_t> b{0};
+  size_t step = std::max<size_t>(w->len / std::max<size_t>(n, 1), 1 << 16);
+  bool seq = w->format == simdjson::stream_format::json_sequence;
+  for (size_t at = step; at < w->len; at = b.back() + step) {
+    const void *hit = memchr(w->buf + at, seq ? '\x1e' : '\n', w->len - at);
+    if (hit == nullptr) {
+      break;
+    }
+    size_t cut = size_t(static_cast<const char *>(hit) - w->buf) + (seq ? 0 : 1);
+    if (cut >= w->len) {
+      break;
+    }
+    b.push_back(cut);
+  }
+  b.push_back(w->len);
+  return b;
+}
+
+// All the results (documents, or fn of each) of the stream `whole`, as a
+// list, using up to `threads` threads.
+PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
+  PyObject *result = PyList_New(0);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  size_t resume_at = 0;
+#ifdef Py_GIL_DISABLED
+  if (threads > 1 && whole->len >= (size_t(1) << 17)) {
+    ParallelRun run;
+    run.whole = whole;
+    run.fn = fn;
+    run.bounds = chunk_bounds(whole, threads * 8);
+    run.chunks.resize(run.bounds.size() - 1);
+    // Starting a thread costs about as much as building 512 KB of documents.
+    size_t nthreads = std::min({threads, run.chunks.size(), std::max<size_t>(whole->len >> 19, 1)});
+    std::vector<std::thread> pool;
+    PyInterpreterState *interp = PyInterpreterState_Get();
+    for (size_t t = 1; t < nthreads; t++) {
+      try {
+        pool.emplace_back([&run, interp] {
+          PyThreadState *ts = PyThreadState_New(interp);
+          if (ts == nullptr) {
+            return;
+          }
+          PyEval_RestoreThread(ts);
+          run.work();
+          PyThreadState_Clear(ts);
+          PyThreadState_DeleteCurrent();
+        });
+      } catch (...) {
+        break; // fewer threads
+      }
+    }
+    run.work(); // the calling thread too
+    Py_BEGIN_ALLOW_THREADS
+    for (std::thread &t : pool) {
+      t.join();
+    }
+    Py_END_ALLOW_THREADS
+    size_t f = run.first_failure.load();
+    size_t total = 0;
+    for (size_t i = 0; i < run.chunks.size() && i <= f; i++) {
+      total += run.chunks[i].items ? size_t(PyList_GET_SIZE(run.chunks[i].items)) : 0;
+    }
+    PyObject *exc = nullptr;
+    int rc = 0;
+    if (total > 0) {
+      Py_DECREF(result);
+      result = PyList_New(Py_ssize_t(total));
+      rc = result == nullptr ? -1 : 0;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < run.chunks.size(); i++) {
+      ParallelRun::Chunk &c = run.chunks[i];
+      if (c.items != nullptr && i <= f && rc == 0) {
+        for (Py_ssize_t j = 0; j < PyList_GET_SIZE(c.items); j++) {
+          PyList_SET_ITEM(result, Py_ssize_t(k++), Py_NewRef(PyList_GET_ITEM(c.items, j)));
+        }
+      }
+      Py_XDECREF(c.items);
+      if (i == f) {
+        exc = c.exc;
+        resume_at = c.resume_at;
+      } else {
+        Py_XDECREF(c.exc);
+      }
+    }
+    if (rc < 0) {
+      Py_XDECREF(exc);
+      return nullptr;
+    }
+    if (exc != nullptr) { // fn raised: as it would have without threads
+      Py_DECREF(result);
+      PyErr_SetObject(reinterpret_cast<PyObject *>(Py_TYPE(exc)), exc);
+      Py_DECREF(exc);
+      return nullptr;
+    }
+    if (f == SIZE_MAX) {
+      return result;
+    }
+  }
+#else
+  (void)threads;
+#endif
+  // One thread, from resume_at to the end.
+  StreamObject *st = resume_at == 0 ? reinterpret_cast<StreamObject *>(
+                                          Py_NewRef(reinterpret_cast<PyObject *>(whole)))
+                                    : stream_over(whole, resume_at, whole->len);
+  if (st == nullptr) {
+    Py_DECREF(result);
+    return nullptr;
+  }
+  for (;;) {
+    PyObject *v = stream_next_locked(st);
+    if (v == nullptr) {
+      break;
+    }
+    if (fn != nullptr) {
+      PyObject *r = PyObject_CallOneArg(fn, v);
+      Py_DECREF(v);
+      if (r == nullptr) {
+        break;
+      }
+      v = r;
+    }
+    int rc = PyList_Append(result, v);
+    Py_DECREF(v);
+    if (rc < 0) {
+      break;
+    }
+  }
+  Py_DECREF(reinterpret_cast<PyObject *>(st));
+  if (PyErr_Occurred()) {
+    Py_DECREF(result);
+    return nullptr;
+  }
+  return result;
+}
+
+// Removes the keyword `threads` from kwargs (into *threads: 0 when absent or
+// None, else at least 1); returns the remaining keywords (new reference).
+PyObject *take_threads(PyObject *kwargs, Py_ssize_t *threads, bool *given) {
+  *threads = 0;
+  *given = false;
+  if (kwargs == nullptr) {
+    return nullptr;
+  }
+  PyObject *rest = PyDict_Copy(kwargs);
+  if (rest == nullptr) {
+    return nullptr;
+  }
+  PyObject *t = PyDict_GetItemString(rest, "threads"); // borrowed
+  if (t == nullptr) {
+    return rest;
+  }
+  Py_INCREF(t);
+  PyDict_DelItemString(rest, "threads");
+  *given = true;
+  if (t != Py_None) {
+    Py_ssize_t n = PyNumber_AsSsize_t(t, PyExc_OverflowError);
+    if (n == -1 && PyErr_Occurred()) {
+      Py_DECREF(t);
+      Py_DECREF(rest);
+      return nullptr;
+    }
+    if (n < 0) {
+      PyErr_SetString(PyExc_ValueError, "threads must be at least 0 (0: one per processor)");
+      Py_DECREF(t);
+      Py_DECREF(rest);
+      return nullptr;
+    }
+    *threads = n == 0 ? Py_ssize_t(std::max(1u, std::thread::hardware_concurrency())) : n;
+  } else {
+    *threads = Py_ssize_t(std::max(1u, std::thread::hardware_concurrency()));
+  }
+  Py_DECREF(t);
+  return rest;
+}
+
+// The stream for loads_many/parse_many/map_many; with threads, the list of
+// all results instead.
+PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *fn,
+                         bool force_list) {
+  Py_ssize_t threads;
+  bool given;
+  PyObject *rest = take_threads(kwargs, &threads, &given);
+  if (rest == nullptr && PyErr_Occurred()) {
+    return nullptr;
+  }
+  PyObject *self = make_stream(args, rest, lazy);
+  Py_XDECREF(rest);
+  if (self == nullptr) {
+    return nullptr;
+  }
+  if (!given && !force_list) {
+    return self;
+  }
+  StreamObject *whole = reinterpret_cast<StreamObject *>(self);
+  using simdjson::stream_format;
+  if (given && whole->format != stream_format::whitespace_delimited &&
+      whole->format != stream_format::newline_delimited &&
+      whole->format != stream_format::json_sequence) {
+    Py_DECREF(self);
+    PyErr_SetString(PyExc_ValueError,
+                    "threads requires the format 'whitespace', 'lines' or 'json_seq'");
+    return nullptr;
+  }
+  PyObject *r = run_stream(whole, fn, given ? size_t(threads) : 1);
+  Py_DECREF(self);
+  return r;
+}
+
 PyObject *loads_many(PyObject *, PyObject *args, PyObject *kwargs) {
-  return make_stream(args, kwargs, false);
+  return stream_or_list(args, kwargs, false, nullptr, false);
 }
 
 PyObject *parse_many(PyObject *, PyObject *args, PyObject *kwargs) {
-  return make_stream(args, kwargs, true);
+  return stream_or_list(args, kwargs, true, nullptr, false);
+}
+
+// map_many(fn, data, *, format, batch_size, threads, lazy=False): [fn(doc) for
+// doc in loads_many(data)] (parse_many with lazy=True), with fn called in the
+// threads.
+PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
+  if (PyTuple_GET_SIZE(args) < 1) {
+    PyErr_SetString(PyExc_TypeError, "map_many() missing required argument 'fn'");
+    return nullptr;
+  }
+  PyObject *fn = PyTuple_GET_ITEM(args, 0);
+  if (!PyCallable_Check(fn)) {
+    PyErr_SetString(PyExc_TypeError, "map_many() fn must be callable");
+    return nullptr;
+  }
+  bool lazy = false;
+  PyObject *rest = kwargs ? PyDict_Copy(kwargs) : nullptr;
+  if (kwargs != nullptr && rest == nullptr) {
+    return nullptr;
+  }
+  if (rest != nullptr) {
+    PyObject *l = PyDict_GetItemString(rest, "lazy"); // borrowed
+    if (l != nullptr) {
+      int t = PyObject_IsTrue(l);
+      if (t < 0 || PyDict_DelItemString(rest, "lazy") < 0) {
+        Py_DECREF(rest);
+        return nullptr;
+      }
+      lazy = t != 0;
+    }
+  }
+  PyObject *tail = PyTuple_GetSlice(args, 1, PyTuple_GET_SIZE(args));
+  if (tail == nullptr) {
+    Py_XDECREF(rest);
+    return nullptr;
+  }
+  PyObject *r = stream_or_list(tail, rest, lazy, fn, true);
+  Py_DECREF(tail);
+  Py_XDECREF(rest);
+  return r;
 }
 
 // Benchmarking helper: run simdjson without building Python objects.
@@ -3497,10 +3910,15 @@ PyMethodDef methods[] = {
     {"parse_file", parse_file, METH_O, "Parse the JSON file at path lazily, like parse."},
     {"loads_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(loads_many)),
      METH_VARARGS | METH_KEYWORDS,
-     "Iterate over the JSON documents of data (NDJSON, JSON Lines, ...), like loads."},
+     "Iterate over the JSON documents of data (NDJSON, JSON Lines, ...), like loads; "
+     "with threads=N, the list of the documents, built by N threads."},
     {"parse_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(parse_many)),
      METH_VARARGS | METH_KEYWORDS,
      "Iterate over the JSON documents of data lazily, like parse."},
+    {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
+     METH_VARARGS | METH_KEYWORDS,
+     "map_many(fn, data, *, format, batch_size, threads, lazy): the list of fn(doc) for the "
+     "documents of data, with fn called in the threads."},
     {"parse", parse, METH_O,
      "Parse JSON lazily: objects and arrays are returned as read-only views "
      "(Object, Array) whose values are converted on access."},

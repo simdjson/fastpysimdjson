@@ -222,3 +222,69 @@ def test_fallback_needs_the_separator():
     with pytest.raises(fastsimdjson.JSONDecodeError) as info:
         list(fastsimdjson.loads_many("[1e400 2]", format="array"))
     assert info.value.msg == "Expecting ',' delimiter"
+
+
+# threads=N: the list of all documents, as without threads. Inputs over
+# 128 KB, so that free-threaded builds use several threads.
+
+def _outcome(fn):
+    try:
+        return ("ok", fn())
+    except Exception as e:  # noqa: BLE001
+        return (type(e).__name__, str(e), getattr(e, "pos", None))
+
+
+def _threaded_input(seed, fmt):
+    r = random.Random(seed)
+    docs = []
+    for i in range(6000):
+        c = r.randrange(100)
+        if c == 0:
+            docs.append(b"[1e400]")  # json only: inf
+        elif c == 1:
+            docs.append(b'{"big": %d}' % (10**30 + i))
+        elif c == 2 and fmt == "whitespace":
+            docs.append(b'{\n  "pretty": [1,\n 2]\n}')  # spans lines
+        else:
+            docs.append(json.dumps({"i": i, "s": "x" * r.randrange(60), "f": i / 7}).encode())
+    if seed % 3 == 1:
+        docs[r.randrange(len(docs))] = b'{"broken": [1, 2'  # an error somewhere
+    if seed % 3 == 2:
+        docs[r.randrange(len(docs))] = b'"\\ud800"'  # json only: lone surrogate
+    sep = b"\n\x1e" if fmt == "json_seq" else b"\n"
+    data = sep.join(docs)
+    return b"\x1e" + data if fmt == "json_seq" else data
+
+
+@pytest.mark.parametrize("fmt", ["whitespace", "lines", "json_seq"])
+@pytest.mark.parametrize("seed", range(9))
+def test_threads_match_one_thread(fmt, seed):
+    data = _threaded_input(seed, fmt)
+    expected = _outcome(lambda: list(fastsimdjson.loads_many(data, format=fmt)))
+    for threads in (None, 0, 1, 2, 7):
+        assert _outcome(lambda: fastsimdjson.loads_many(data, format=fmt, threads=threads)) == expected
+    lazy = _outcome(lambda: [to_py(v) for v in fastsimdjson.parse_many(data, format=fmt, threads=4)])
+    assert lazy == expected
+    mapped = _outcome(lambda: fastsimdjson.map_many(json.dumps, data, format=fmt, threads=4))
+    assert mapped == (_outcome(lambda: [json.dumps(d) for d in expected[1]]) if expected[0] == "ok" else expected)
+
+
+def test_threads_api():
+    data = b"\n".join(b'{"n": %d}' % i for i in range(30000))
+    docs = fastsimdjson.loads_many(data, threads=4)
+    assert isinstance(docs, list) and docs == [{"n": i} for i in range(30000)]
+    assert fastsimdjson.map_many(lambda d: d["n"], data, threads=3) == list(range(30000))
+    assert fastsimdjson.map_many(lambda v: v["n"], data, threads=3, lazy=True) == list(range(30000))
+    assert fastsimdjson.map_many(len, b"") == []
+    with pytest.raises(ValueError):
+        fastsimdjson.loads_many(b"[1],[2]", format="comma", threads=2)
+    with pytest.raises(ValueError):
+        fastsimdjson.loads_many(data, threads=-1)
+
+    def boom(d):
+        if d["n"] == 20000:
+            raise KeyError("boom")
+        return d
+
+    with pytest.raises(KeyError, match="boom"):
+        fastsimdjson.map_many(boom, data, threads=4)

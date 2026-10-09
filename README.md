@@ -166,6 +166,40 @@ returned, otherwise `JSONDecodeError` reports `json`'s message and the
 position in the whole input. A truncated last document is an error. The
 views returned by `parse_many` remain valid after the iterator moves on.
 
+### Streams on several threads: `threads=N` and `map_many`
+
+On free-threaded Python (3.14t and newer), a stream can be parsed by several
+threads at once:
+
+```python
+docs = fastsimdjson.loads_many(data, threads=16)        # a list, in order
+views = fastsimdjson.parse_many(data, threads=16)       # a list of views
+# fn runs in the threads too, on each document; its results, in order:
+scores = fastsimdjson.map_many(score, data, threads=16)
+```
+
+With `threads`, `loads_many` and `parse_many` return a list of all the
+documents instead of an iterator. `map_many(fn, data, **kw)` returns
+`[fn(doc) for doc in loads_many(data, **kw)]` (`parse_many` with
+`lazy=True`), with `fn` called in the threads. `threads=0` (or `None`) uses
+one thread per processor; small inputs use fewer threads (about one per
+512 KB). The input is cut into chunks at newlines (before each `\x1e` for
+`json_seq`), so `threads` works with the formats `"whitespace"`, `"lines"`
+and `"json_seq"`.
+
+The results, and the exceptions, are those of one thread: when a chunk
+contains an error or a document that only `json` accepts, the documents
+before it are kept and the rest is parsed in the calling thread, as without
+threads. An exception raised by `fn` is raised again, for the first document
+where it happened; `fn` may then have been called on later documents, in
+other threads, and it must be safe to call from several threads at once.
+
+`map_many` scales best: each document is built, used and freed in the same
+thread, and only `fn`'s results come back. `loads_many` must return every
+document, and the Python objects of all of them, to the calling thread.
+With the GIL (the default build of Python), the calling thread does all the
+work: `threads` has no effect on speed.
+
 ### `release`
 
 `release()` frees the simdjson parser and the string caches kept by the
@@ -401,6 +435,24 @@ files; best of three runs:
 msgspec's `decode_lines` and `loads_many` are on par (`loads_many` is about 2%
 faster). `parse_many` only creates the views; reading values from them adds to
 its time.
+
+### Streams on several threads
+
+300 MB of NDJSON (146,624 records: tweets, GitHub events, citm performances,
+gsoc and update-center entries), free-threaded Python 3.14.6, collector
+disabled (see below), Intel Xeon Gold 6548N (64 cores); GB/s:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `map_many(len, data, threads=N)` | 0.91 | 1.77 | 3.28 | 6.22 | 10.9 | 15.4 | **21.2** |
+| `parse_many(data, threads=N)` | 1.82 | 3.06 | 4.80 | 6.90 | 10.2 | 12.3 | 16.4 |
+| `loads_many(data, threads=N)` | 0.82 | 1.43 | 2.26 | 3.88 | 5.77 | 7.45 | 8.63 |
+
+`map_many` is 23 times faster on 64 threads than on one. `loads_many` builds
+every document for the calling thread and is 11 times faster. With the
+collector enabled, Python collects after the call returns: it examines the
+millions of objects just created, which takes about 0.1 s here, with or
+without threads.
 
 ## Limitations
 
