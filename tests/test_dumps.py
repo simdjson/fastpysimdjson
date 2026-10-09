@@ -415,3 +415,23 @@ def test_dumpb_matches_orjson_cases():
     for obj, option, _ in ORJSON_CASES:
         assert orjson_outcome(fastsimdjson.dumpb, obj, option=option) == \
             orjson_outcome(orjson.dumps, obj, option=option), (obj, option)
+
+
+def test_thread_exit_releases_caches():
+    # A key that enters dumpb's key cache (seen twice) is referenced by the
+    # cache; when the thread exits, its caches are released.
+    import sys
+    import threading
+
+    key = "".join(["thread", "-exit-", "key"])  # not interned
+    before = sys.getrefcount(key)
+
+    def work():
+        for _ in range(3):
+            assert fastsimdjson.dumpb({key: 1}) == b'{"thread-exit-key":1}'
+        fastsimdjson.loads(b'{"a": "b"}')
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join()
+    assert sys.getrefcount(key) == before

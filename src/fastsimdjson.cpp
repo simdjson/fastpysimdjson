@@ -147,6 +147,7 @@ struct ThreadParser {
   KeyCacheEntry key_cache[KEY_CACHE_SIZE]{};
   KeyCacheEntry value_cache[KEY_CACHE_SIZE]{};
   EncodedKey *encoded_keys = nullptr; // allocated on first use by dumpb
+  bool cleanup_registered = false;    // see register_thread_cleanup
   void clear_encoded_keys() {
     if (encoded_keys != nullptr) {
       for (size_t i = 0; i < ENCODED_KEY_CACHE_SIZE; i++) {
@@ -169,6 +170,50 @@ struct ThreadParser {
   }
 };
 thread_local ThreadParser g_thread_parser;
+
+// Frees this thread's parser, documents and caches (release()).
+void release_thread_state() {
+  delete g_thread_parser.ptr;
+  g_thread_parser.ptr = nullptr;
+  delete g_thread_parser.spare;
+  g_thread_parser.spare = nullptr;
+  clear_cache(g_thread_parser.key_cache);
+  clear_cache(g_thread_parser.value_cache);
+  g_thread_parser.clear_encoded_keys();
+}
+
+// The thread-local destructor runs after Python has deleted the thread
+// state of an exiting thread, too late to release the cached strings. So
+// each thread puts a capsule in its thread state's dict: Python clears that
+// dict while the thread state is still valid, and the capsule's destructor
+// releases the caches then. It does so only on its own thread (a thread
+// state can be cleared from another thread, at finalization).
+const char THREAD_CAPSULE[] = "fastsimdjson.thread_state";
+
+void thread_cleanup(PyObject *capsule) {
+  if (PyCapsule_GetPointer(capsule, THREAD_CAPSULE) == &g_thread_parser) {
+    g_thread_parser.cleanup_registered = false;
+    if (caches_can_decref()) {
+      release_thread_state();
+    }
+  }
+}
+
+FSJ_NOINLINE void register_thread_cleanup_slow() {
+  g_thread_parser.cleanup_registered = true;
+  PyObject *dict = PyThreadState_GetDict(); // borrowed
+  PyObject *capsule = dict ? PyCapsule_New(&g_thread_parser, THREAD_CAPSULE, thread_cleanup) : nullptr;
+  if (capsule == nullptr || PyDict_SetItemString(dict, THREAD_CAPSULE, capsule) < 0) {
+    PyErr_Clear(); // without it, the caches of an exiting thread leak, as before
+  }
+  Py_XDECREF(capsule);
+}
+
+inline void register_thread_cleanup() {
+  if (!g_thread_parser.cleanup_registered) {
+    register_thread_cleanup_slow();
+  }
+}
 
 inline uint64_t load_u64(const char *p) {
   uint64_t v;
@@ -284,6 +329,7 @@ inline PyObject *make_str(const char *s, size_t len) {
 }
 
 inline void cache_store(KeyCacheEntry &entry, PyObject *u, size_t len, const KeyWords &w) {
+  register_thread_cleanup(); // the entry holds a reference: free it at thread exit
   Py_INCREF(u);
   Py_XDECREF(entry.key);
   entry.key = u;
@@ -593,6 +639,7 @@ bool ensure_parser() {
   if (g_thread_parser.ptr != nullptr) {
     return true;
   }
+  register_thread_cleanup();
   g_thread_parser.ptr = new (std::nothrow) parser();
   if (g_thread_parser.ptr == nullptr) {
     PyErr_NoMemory();
@@ -2698,6 +2745,7 @@ struct OrjsonEncoder {
       return -1;
     }
     if (keys == nullptr) {
+      register_thread_cleanup();
       keys = g_thread_parser.encoded_keys = new (std::nothrow) EncodedKey[ENCODED_KEY_CACHE_SIZE];
     }
     int rc = 0;
@@ -3428,12 +3476,7 @@ PyObject *parse_only(PyObject *, PyObject *arg) {
 }
 
 PyObject *release(PyObject *, PyObject *) {
-  release_parser();
-  delete g_thread_parser.spare;
-  g_thread_parser.spare = nullptr;
-  clear_cache(g_thread_parser.key_cache);
-  clear_cache(g_thread_parser.value_cache);
-  g_thread_parser.clear_encoded_keys();
+  release_thread_state();
   Py_RETURN_NONE;
 }
 

@@ -406,10 +406,13 @@ its time.
 
 * The simdjson parser and the key and string caches are thread-local.
   `release()` frees the parser and the cached strings retained by the calling
-  thread. A parser that grows past 64 MB is freed on its own at the end of
-  that call; its caches stay. A thread that exits without `release()` leaves
-  its cached strings behind.
+  thread, and they are freed when a Python thread exits. A parser that grows
+  past 64 MB is freed on its own at the end of that call; its caches stay.
 * The module is marked free-threading compatible (`Py_MOD_GIL_NOT_USED` on
   Python 3.13 and newer), so importing it on a free-threaded build does not
-  re-enable the GIL. On a free-threaded build, `bytearray` and `memoryview`
-  inputs are copied before parsing. Subinterpreters are not supported.
+  re-enable the GIL. It is tested with many threads parsing, serializing and
+  sharing views and stream iterators on free-threaded Python 3.14 and 3.15.
+  On a free-threaded build, `bytearray` and `memoryview` inputs are copied
+  before parsing, and `dumps` and `dumpb` hold references to the items of the
+  containers they serialize, since other threads may change them.
+  Subinterpreters are not supported.
