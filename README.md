@@ -25,8 +25,8 @@ With uv:
 uv pip install fastsimdjson      # in a uv project: uv add fastsimdjson
 ```
 
-Wheels are available for Linux, macOS and Windows, for Python 3.10 to 3.14,
-including free-threaded Python 3.14.
+Wheels are available for Linux, macOS and Windows, for Python 3.10 to 3.15,
+including free-threaded Python 3.14 and 3.15.
 
 ## Usage
 
