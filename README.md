@@ -267,7 +267,7 @@ calling thread. Views returned by `parse` remain valid.
 ## Build and test
 
 Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
-5.0.2 and simdutf 9.2.1 amalgamations, and zmij 1.2 (shortest float
+5.0.7 and simdutf 9.2.1 amalgamations, and zmij 1.2 (shortest float
 formatting, MIT license), are already in `vendor/`.
 
 pip:
