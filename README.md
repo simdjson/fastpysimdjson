@@ -375,6 +375,21 @@ They are built on
 [simdjson_msgpack](https://github.com/simdjson/simdjson_msgpack), a C++ library
 (vendored).
 
+### Threads and free-threaded Python
+
+The module is marked free-threading compatible (`Py_MOD_GIL_NOT_USED` on
+Python 3.13 and newer), so importing it on a free-threaded build does not
+re-enable the GIL. It is tested with many threads parsing, serializing and
+sharing views and stream iterators on free-threaded Python 3.14 and 3.15.
+
+`bytes` and `str` inputs are read in place. A `bytearray` or `memoryview`
+could be changed by another thread while we read it, so it is copied first:
+always by `loads_many`, `parse_many` and `map_many` (the iterator outlives
+the call) and by `loads_arrow`, `json_to_msgpack` and `msgpack_to_json`
+(which release the GIL), and only on a free-threaded build by `loads` and
+`parse`. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
+references to the items of the containers they serialize.
+
 ### `release`
 
 `release()` frees the simdjson parser and the string caches kept by the
@@ -766,11 +781,5 @@ just created, which takes about 0.1 s here, with or without threads.
   `release()` frees the parser and the cached strings retained by the calling
   thread, and they are freed when a Python thread exits. A parser that grows
   past 64 MB is freed on its own at the end of that call; its caches stay.
-* The module is marked free-threading compatible (`Py_MOD_GIL_NOT_USED` on
-  Python 3.13 and newer), so importing it on a free-threaded build does not
-  re-enable the GIL. It is tested with many threads parsing, serializing and
-  sharing views and stream iterators on free-threaded Python 3.14 and 3.15.
-  On a free-threaded build, `bytearray` and `memoryview` inputs are copied
-  before parsing, and `dumps` and `dumpb` hold references to the items of the
-  containers they serialize, since other threads may change them.
-  Subinterpreters are not supported.
+* Subinterpreters are not supported: the module keeps per-process state (its
+  types, and per-thread parsers and string caches).
