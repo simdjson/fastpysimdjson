@@ -155,7 +155,9 @@ META_ARROW = ("fastsimdjson 0.10.0  ·  pyarrow 26.0  ·  polars 2.1  ·  DuckDB
 
 
 def gbps(v):
-    """The value as given (we pass rounded numbers): 0.12, 1.95, 4.0, 13.9."""
+    """The value as given (we pass rounded numbers): 0.12, 0.20, 1.95, 4.0, 13.9."""
+    if v < 1:
+        return f"{v:.2f}"
     text = f"{v:g}"
     return text if "." in text else text + ".0"
 
