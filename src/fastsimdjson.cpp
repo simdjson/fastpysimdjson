@@ -5412,8 +5412,11 @@ PyObject *json_to_msgpack(PyObject *, PyObject *args, PyObject *kwargs) {
       st = ndjson ? writer.write_ndjson(json) : writer.write_json(json);
     }
     if (st.ok()) {
-      writer.release(&size);
-      released = true;
+      // Null when the allocator cannot shrink the buffer (it is then lost).
+      released = writer.release(&size) != nullptr;
+      if (!released) {
+        st.message = "out of memory";
+      }
     }
   } catch (const std::bad_alloc &) {
     st.message = "out of memory";
@@ -5470,8 +5473,11 @@ PyObject *msgpack_to_json(PyObject *, PyObject *args, PyObject *kwargs) {
     st = stream ? writer.write_msgpack_stream(in.data, in.size)
                 : writer.write_msgpack(in.data, in.size);
     if (st.ok()) {
-      writer.release(&size);
-      released = true;
+      // Null when the allocator cannot shrink the buffer (it is then lost).
+      released = writer.release(&size) != nullptr;
+      if (!released) {
+        st.message = "out of memory";
+      }
     }
   } catch (const std::bad_alloc &) {
     st.message = "out of memory";

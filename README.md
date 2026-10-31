@@ -398,11 +398,13 @@ calling thread. Views returned by `parse` remain valid.
 ## Build and test
 
 Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
-5.1.0 and simdutf 9.2.1 amalgamations and simdjson_arrow 0.1.1 (NDJSON to
-Arrow and back, Apache-2.0 license: `simdjson_arrow.h` and
-`simdjson_arrow.cpp`) are already in `vendor/`. simdjson_arrow includes zmij
-1.2 (shortest float formatting, MIT license), which `dumps` and `dumpb` also
-use (`vendor/zmij.h`).
+5.1.0 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.1 (NDJSON to Arrow
+and back: `simdjson_arrow.h` and `simdjson_arrow.cpp`) and simdjson_msgpack
+0.1.1 (JSON to MessagePack and back: `simdjson_msgpack.h` and
+`simdjson_msgpack.cpp`), both under the Apache-2.0 license, are already in
+`vendor/`. simdjson_arrow includes zmij 1.2 (shortest float formatting, MIT
+license), which simdjson_msgpack, `dumps` and `dumpb` also use
+(`vendor/zmij.h`).
 The tests of the Arrow functions (`tests/test_arrow.py`) run when pyarrow is
 installed (and polars, for one of them); otherwise they are skipped.
 
