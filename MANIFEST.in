@@ -1,2 +1,2 @@
-include vendor/*.h vendor/*.cpp vendor/zmij-LICENSE vendor/simdjson_arrow-LICENSE src/*.cpp
+include vendor/*.h vendor/*.cpp vendor/zmij-LICENSE vendor/simdjson_arrow-LICENSE vendor/simdjson_msgpack-LICENSE src/*.cpp
 recursive-include tests *.py

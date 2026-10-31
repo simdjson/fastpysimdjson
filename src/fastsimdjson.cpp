@@ -33,6 +33,7 @@
 #include "simdjson.h"
 #include "simdjson.cpp"
 #include "simdjson_arrow.h" // NDJSON to Arrow and back (vendor/simdjson_arrow.cpp)
+#include "simdjson_msgpack.h" // JSON to MessagePack and back (vendor/simdjson_msgpack.cpp)
 #include "simdutf.h"
 #include "zmij.h" // shortest float digits for dumps and dumpb (in vendor/simdjson_arrow.cpp)
 
@@ -5290,6 +5291,182 @@ PyObject *dumpb_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
   return bytes.take(size);
 }
 
+// ---------------------------------------------------------------------------
+// MessagePack: json_to_msgpack(data) converts JSON (a document, or NDJSON) to
+// MessagePack, msgpack_to_json(data) converts MessagePack (a value, or a
+// sequence of values) to JSON. simdjson_msgpack does the work, without the
+// GIL, on several threads if asked, into a bytes object (BytesAllocator: no
+// final copy). No Python object is made from the data.
+// ---------------------------------------------------------------------------
+
+// The bytes of data (any contiguous buffer, or a str with text), held while we
+// read them without the GIL (a bytearray cannot be resized meanwhile).
+struct InputBytes {
+  Py_buffer view{};
+  bool held = false;
+  const char *data = nullptr;
+  size_t size = 0;
+
+  bool get(PyObject *o, bool text) {
+    if (text && PyUnicode_Check(o)) {
+      Py_ssize_t len;
+      data = PyUnicode_AsUTF8AndSize(o, &len);
+      size = size_t(len);
+      return data != nullptr;
+    }
+    if (!PyObject_CheckBuffer(o)) {
+      PyErr_Format(PyExc_TypeError,
+                   text ? "Input must be bytes, bytearray, memoryview, or str, not %.200s"
+                        : "Input must be bytes, bytearray or memoryview, not %.200s",
+                   Py_TYPE(o)->tp_name);
+      return false;
+    }
+    if (PyObject_GetBuffer(o, &view, PyBUF_SIMPLE) < 0) {
+      return false;
+    }
+    held = true;
+    data = static_cast<const char *>(view.buf);
+    size = size_t(view.len);
+    return true;
+  }
+  InputBytes() = default;
+  InputBytes(const InputBytes &) = delete;
+  InputBytes &operator=(const InputBytes &) = delete;
+  ~InputBytes() {
+    if (held) {
+      PyBuffer_Release(&view);
+    }
+  }
+};
+
+// The result of a writer: the bytes object, or ValueError (MemoryError).
+PyObject *msgpack_result(const simdjson_msgpack::status &st, bool released, BytesAllocator &bytes,
+                         size_t size) {
+  if (!st.ok() || !released) {
+    if (st.message == "out of memory") {
+      return PyErr_NoMemory();
+    }
+    PyErr_SetString(PyExc_ValueError, st.message.c_str());
+    return nullptr;
+  }
+  return bytes.take(size);
+}
+
+// json_to_msgpack(data, *, ndjson=False, threads=None)
+PyObject *json_to_msgpack(PyObject *, PyObject *args, PyObject *kwargs) {
+  Py_ssize_t threads;
+  bool given;
+  PyObject *rest = take_threads(kwargs, &threads, &given);
+  if (rest == nullptr && PyErr_Occurred()) {
+    return nullptr;
+  }
+  static const char *kwlist[] = {"", "ndjson", "block_size", nullptr};
+  PyObject *data;
+  int ndjson = 0;
+  simdjson_msgpack::msgpack_options options;
+  Py_ssize_t block_size = Py_ssize_t(options.block_size);
+  int ok = PyArg_ParseTupleAndKeywords(args, rest, "O|$pn:json_to_msgpack",
+                                       const_cast<char **>(kwlist), &data, &ndjson, &block_size);
+  Py_XDECREF(rest);
+  if (!ok) {
+    return nullptr;
+  }
+  if (block_size <= 0) {
+    PyErr_SetString(PyExc_ValueError, "block_size must be positive");
+    return nullptr;
+  }
+  options.threads = given ? size_t(threads) : 1;
+  options.block_size = size_t(block_size);
+  InputBytes in;
+  if (!in.get(data, true)) {
+    return nullptr;
+  }
+  BytesAllocator bytes;
+  const simdjson_msgpack::allocator allocator{BytesAllocator::reallocate,
+                                              BytesAllocator::deallocate, &bytes};
+  simdjson_msgpack::status st;
+  size_t size = 0;
+  bool released = false;
+  Py_BEGIN_ALLOW_THREADS
+  try {
+    simdjson_msgpack::msgpack_writer writer(options, allocator);
+    if (needs_unpadded(in.data, in.size)) {
+      // simdjson reads SIMDJSON_PADDING bytes past the end: the writer copies.
+      st = ndjson ? writer.write_ndjson(in.data, in.size) : writer.write_json(in.data, in.size);
+    } else {
+      // The padding stays on the page of the last byte: we read in place.
+      simdjson::padded_string_view json(in.data, in.size, in.size + simdjson::SIMDJSON_PADDING);
+      st = ndjson ? writer.write_ndjson(json) : writer.write_json(json);
+    }
+    if (st.ok()) {
+      writer.release(&size);
+      released = true;
+    }
+  } catch (const std::bad_alloc &) {
+    st.message = "out of memory";
+  }
+  Py_END_ALLOW_THREADS
+  return msgpack_result(st, released, bytes, size);
+}
+
+// msgpack_to_json(data, *, stream=False, validate_utf8=True,
+// binary_as_base64=True, ext_as_null=False, threads=None)
+PyObject *msgpack_to_json(PyObject *, PyObject *args, PyObject *kwargs) {
+  Py_ssize_t threads;
+  bool given;
+  PyObject *rest = take_threads(kwargs, &threads, &given);
+  if (rest == nullptr && PyErr_Occurred()) {
+    return nullptr;
+  }
+  static const char *kwlist[] = {"",           "stream",      "validate_utf8", "binary_as_base64",
+                                 "ext_as_null", "block_size", nullptr};
+  PyObject *data;
+  int stream = 0, validate_utf8 = 1, binary_as_base64 = 1, ext_as_null = 0;
+  simdjson_msgpack::json_options options;
+  Py_ssize_t block_size = Py_ssize_t(options.block_size);
+  int ok = PyArg_ParseTupleAndKeywords(args, rest, "O|$ppppn:msgpack_to_json",
+                                       const_cast<char **>(kwlist), &data, &stream,
+                                       &validate_utf8, &binary_as_base64, &ext_as_null,
+                                       &block_size);
+  Py_XDECREF(rest);
+  if (!ok) {
+    return nullptr;
+  }
+  if (block_size <= 0) {
+    PyErr_SetString(PyExc_ValueError, "block_size must be positive");
+    return nullptr;
+  }
+  options.validate_utf8 = validate_utf8 != 0;
+  options.binary_as_base64 = binary_as_base64 != 0;
+  options.ext = ext_as_null ? simdjson_msgpack::ext_policy::null : simdjson_msgpack::ext_policy::error;
+  options.threads = given ? size_t(threads) : 1;
+  options.block_size = size_t(block_size);
+  InputBytes in;
+  if (!in.get(data, false)) {
+    return nullptr;
+  }
+  BytesAllocator bytes;
+  const simdjson_msgpack::allocator allocator{BytesAllocator::reallocate,
+                                              BytesAllocator::deallocate, &bytes};
+  simdjson_msgpack::status st;
+  size_t size = 0;
+  bool released = false;
+  Py_BEGIN_ALLOW_THREADS
+  try {
+    simdjson_msgpack::json_writer writer(options, allocator);
+    st = stream ? writer.write_msgpack_stream(in.data, in.size)
+                : writer.write_msgpack(in.data, in.size);
+    if (st.ok()) {
+      writer.release(&size);
+      released = true;
+    }
+  } catch (const std::bad_alloc &) {
+    st.message = "out of memory";
+  }
+  Py_END_ALLOW_THREADS
+  return msgpack_result(st, released, bytes, size);
+}
+
 // Benchmarking helper: run simdjson without building Python objects.
 PyObject *parse_only(PyObject *, PyObject *arg) {
   if (!PyBytes_Check(arg)) {
@@ -5356,6 +5533,19 @@ PyMethodDef methods[] = {
      METH_VARARGS | METH_KEYWORDS,
      "dumpb_arrow(data, /, *, write_nulls=True, threads=None)\n--\n\n"
      "Arrow data (a pyarrow.Table, a polars.DataFrame...) as NDJSON bytes: one object per row."},
+    {"json_to_msgpack",
+     reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(json_to_msgpack)),
+     METH_VARARGS | METH_KEYWORDS,
+     "json_to_msgpack(data, /, *, ndjson=False, block_size=1048576, threads=None)\n--\n\n"
+     "JSON (bytes, bytearray, memoryview or str) as MessagePack bytes, in the most compact "
+     "encoding. With ndjson, each document of the input becomes one MessagePack value."},
+    {"msgpack_to_json",
+     reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(msgpack_to_json)),
+     METH_VARARGS | METH_KEYWORDS,
+     "msgpack_to_json(data, /, *, stream=False, validate_utf8=True, binary_as_base64=True, "
+     "ext_as_null=False, block_size=1048576, threads=None)\n--\n\n"
+     "MessagePack (a bytes-like object) as compact JSON bytes. With stream, each of the "
+     "values of the input becomes one line of NDJSON."},
     {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
      METH_VARARGS | METH_KEYWORDS,
      "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default): the list of "
