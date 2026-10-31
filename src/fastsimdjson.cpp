@@ -32,8 +32,9 @@
 // float-to-decimal routine, dtoa_impl::dragonbox, directly.
 #include "simdjson.h"
 #include "simdjson.cpp"
+#include "simdjson_arrow.h" // NDJSON to Arrow and back (vendor/simdjson_arrow.cpp)
 #include "simdutf.h"
-#include "zmij.h" // shortest float digits for dumps and dumpb (vendor/zmij.cc)
+#include "zmij.h" // shortest float digits for dumps and dumpb (in vendor/simdjson_arrow.cpp)
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -4722,6 +4723,580 @@ PyObject *dumpb_many(PyObject *, PyObject *args, PyObject *kwargs) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Arrow: loads_arrow(data) and load_arrow_file(path) read NDJSON into Arrow
+// record batches, dumpb_arrow(table) writes Arrow data as NDJSON. Arrow data
+// goes in and out through the Arrow PyCapsule interface (__arrow_c_stream__,
+// __arrow_c_schema__, __arrow_c_array__), so that pyarrow, polars, DuckDB...
+// take it without a copy. simdjson_arrow does the work, without the GIL, on
+// threads of its own.
+// ---------------------------------------------------------------------------
+PyTypeObject *ArrowStreamType = nullptr;
+
+// The result of loads_arrow: record batches, handed over once.
+struct ArrowStreamObject {
+  PyObject_HEAD
+  simdjson_arrow::field *schema;
+  std::vector<ArrowArray> *batches; // nullptr once handed over
+};
+
+void arrow_stream_dealloc(PyObject *self) {
+  ArrowStreamObject *s = reinterpret_cast<ArrowStreamObject *>(self);
+  PyTypeObject *tp = Py_TYPE(self);
+  if (s->batches != nullptr) {
+    for (ArrowArray &b : *s->batches) {
+      b.release(&b);
+    }
+    delete s->batches;
+  }
+  delete s->schema;
+  PyObject_Free(self);
+  Py_DECREF(tp);
+}
+
+void release_schema_capsule(PyObject *capsule) {
+  auto *schema = static_cast<ArrowSchema *>(PyCapsule_GetPointer(capsule, "arrow_schema"));
+  if (schema != nullptr && schema->release != nullptr) {
+    schema->release(schema);
+  }
+  delete schema;
+}
+
+void release_stream_capsule(PyObject *capsule) {
+  auto *stream =
+      static_cast<ArrowArrayStream *>(PyCapsule_GetPointer(capsule, "arrow_array_stream"));
+  if (stream != nullptr && stream->release != nullptr) {
+    stream->release(stream);
+  }
+  delete stream;
+}
+
+// __arrow_c_schema__(): the schema of the records, as a capsule.
+PyObject *arrow_stream_schema(PyObject *self, PyObject *) {
+  ArrowStreamObject *s = reinterpret_cast<ArrowStreamObject *>(self);
+  auto *schema = new (std::nothrow) ArrowSchema();
+  if (schema == nullptr) {
+    return PyErr_NoMemory();
+  }
+  simdjson_arrow::status st = simdjson_arrow::export_schema(*s->schema, schema);
+  if (!st.ok()) {
+    delete schema;
+    PyErr_SetString(PyExc_ValueError, st.message.c_str());
+    return nullptr;
+  }
+  PyObject *capsule = PyCapsule_New(schema, "arrow_schema", release_schema_capsule);
+  if (capsule == nullptr) {
+    schema->release(schema);
+    delete schema;
+  }
+  return capsule;
+}
+
+// __arrow_c_stream__(requested_schema=None): the record batches, as a
+// capsule. The batches are handed over: a second call raises ValueError. We
+// cannot cast: requested_schema must be None or a schema capsule, which we
+// ignore, as the interface allows (the consumer checks the schema it gets).
+PyObject *arrow_stream_stream(PyObject *self, PyObject *args, PyObject *kwargs) {
+  static const char *kwlist[] = {"requested_schema", nullptr};
+  PyObject *requested = nullptr;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O:__arrow_c_stream__",
+                                   const_cast<char **>(kwlist), &requested)) {
+    return nullptr;
+  }
+  if (requested != nullptr && requested != Py_None &&
+      !PyCapsule_IsValid(requested, "arrow_schema")) {
+    PyErr_Format(PyExc_TypeError,
+                 "requested_schema must be None or an arrow_schema capsule, not %.200s",
+                 Py_TYPE(requested)->tp_name);
+    return nullptr;
+  }
+  ArrowStreamObject *s = reinterpret_cast<ArrowStreamObject *>(self);
+  auto *stream = new (std::nothrow) ArrowArrayStream();
+  if (stream == nullptr) {
+    return PyErr_NoMemory();
+  }
+  std::vector<ArrowArray> *batches;
+  Py_BEGIN_CRITICAL_SECTION(self);
+  batches = s->batches;
+  s->batches = nullptr;
+  Py_END_CRITICAL_SECTION();
+  if (batches == nullptr) {
+    delete stream;
+    PyErr_SetString(PyExc_ValueError,
+                    "the record batches of this stream were already taken: read the "
+                    "JSON again to get them once more");
+    return nullptr;
+  }
+  try {
+    simdjson_arrow::make_stream(*s->schema, std::move(*batches), stream);
+  } catch (const std::bad_alloc &) {
+    for (ArrowArray &b : *batches) {
+      b.release(&b);
+    }
+    delete batches;
+    delete stream;
+    return PyErr_NoMemory();
+  }
+  delete batches;
+  PyObject *capsule = PyCapsule_New(stream, "arrow_array_stream", release_stream_capsule);
+  if (capsule == nullptr) {
+    stream->release(stream);
+    delete stream;
+  }
+  return capsule;
+}
+
+// The number of records (rows), before the batches are taken.
+PyObject *arrow_stream_num_rows(PyObject *self, void *) {
+  ArrowStreamObject *s = reinterpret_cast<ArrowStreamObject *>(self);
+  int64_t rows = 0;
+  Py_BEGIN_CRITICAL_SECTION(self);
+  if (s->batches != nullptr) {
+    for (const ArrowArray &b : *s->batches) {
+      rows += b.length;
+    }
+  } else {
+    rows = -1;
+  }
+  Py_END_CRITICAL_SECTION();
+  if (rows < 0) {
+    Py_RETURN_NONE;
+  }
+  return PyLong_FromLongLong(rows);
+}
+
+PyMethodDef arrow_stream_methods[] = {
+    {"__arrow_c_schema__", arrow_stream_schema, METH_NOARGS,
+     "The schema of the records, as an Arrow PyCapsule."},
+    {"__arrow_c_stream__",
+     reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(arrow_stream_stream)),
+     METH_VARARGS | METH_KEYWORDS,
+     "The record batches, as an Arrow PyCapsule (once)."},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+PyGetSetDef arrow_stream_getset[] = {
+    {"num_rows", arrow_stream_num_rows, nullptr,
+     "The number of records, or None once the batches are taken.", nullptr},
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
+};
+
+PyType_Slot arrow_stream_slots[] = {
+    {Py_tp_dealloc, reinterpret_cast<void *>(arrow_stream_dealloc)},
+    {Py_tp_methods, arrow_stream_methods},
+    {Py_tp_getset, arrow_stream_getset},
+    {Py_tp_doc, const_cast<char *>(
+                    "Record batches read by loads_arrow, for any library that takes the "
+                    "Arrow PyCapsule interface: pyarrow.table(s), polars.DataFrame(s)...")},
+    {0, nullptr},
+};
+
+PyType_Spec arrow_stream_spec = {
+    "fastsimdjson.ArrowStream", sizeof(ArrowStreamObject), 0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION, arrow_stream_slots,
+};
+
+// Calls obj.<method>() and returns the pointer of the capsule it returns.
+// *owner gets the capsule (a new reference), which owns the pointer.
+void *capsule_of(PyObject *obj, const char *method, const char *name, PyObject **owner) {
+  *owner = PyObject_CallMethod(obj, method, nullptr);
+  if (*owner == nullptr) {
+    return nullptr;
+  }
+  void *p = PyCapsule_GetPointer(*owner, name);
+  if (p == nullptr) {
+    Py_CLEAR(*owner);
+  }
+  return p;
+}
+
+// The schema given to loads_arrow: an object with __arrow_c_schema__ (a
+// pyarrow.Schema...) or an "arrow_schema" capsule.
+bool arrow_schema_argument(PyObject *arg, simdjson_arrow::field *out) {
+  PyObject *owner = nullptr;
+  const ArrowSchema *schema;
+  if (PyCapsule_CheckExact(arg)) {
+    schema = static_cast<const ArrowSchema *>(PyCapsule_GetPointer(arg, "arrow_schema"));
+  } else if (PyObject_HasAttrString(arg, "__arrow_c_schema__")) {
+    schema = static_cast<const ArrowSchema *>(
+        capsule_of(arg, "__arrow_c_schema__", "arrow_schema", &owner));
+  } else {
+    PyErr_Format(PyExc_TypeError,
+                 "schema must support the Arrow PyCapsule interface (__arrow_c_schema__), "
+                 "like a pyarrow.Schema, not %.200s",
+                 Py_TYPE(arg)->tp_name);
+    return false;
+  }
+  if (schema == nullptr) {
+    return false;
+  }
+  simdjson_arrow::status st;
+  try {
+    st = simdjson_arrow::import_schema(schema, out);
+  } catch (const std::bad_alloc &) {
+    st.message = "out of memory";
+  }
+  Py_XDECREF(owner);
+  if (!st.ok()) {
+    PyErr_Format(PyExc_ValueError, "unsupported schema: %s", st.message.c_str());
+    return false;
+  }
+  return true;
+}
+
+struct ArrowReadArguments {
+  simdjson_arrow::field schema;
+  bool infer = true;
+  simdjson_arrow::ndjson_options options;
+};
+
+// Parses the arguments of loads_arrow and load_arrow_file, but the first.
+// *first gets the first argument (borrowed).
+bool arrow_read_arguments(const char *function, PyObject *args, PyObject *kwargs,
+                          PyObject **first, ArrowReadArguments *out) {
+  Py_ssize_t threads;
+  bool given;
+  PyObject *rest = take_threads(kwargs, &threads, &given);
+  if (rest == nullptr && PyErr_Occurred()) {
+    return false;
+  }
+  static const char *kwlist[] = {"",           "schema", "block_size", "error_on_unknown_fields",
+                                 "validate_skipped", nullptr};
+  PyObject *schema = Py_None;
+  Py_ssize_t block_size = Py_ssize_t(out->options.block_size);
+  int error_on_unknown_fields = 0, validate_skipped = 1;
+  std::string format = std::string("O|O$npp:") + function;
+  int ok = PyArg_ParseTupleAndKeywords(args, rest, format.c_str(),
+                                       const_cast<char **>(kwlist), first, &schema,
+                                       &block_size, &error_on_unknown_fields,
+                                       &validate_skipped);
+  Py_XDECREF(rest);
+  if (!ok) {
+    return false;
+  }
+  if (block_size <= 0) {
+    PyErr_SetString(PyExc_ValueError, "block_size must be positive");
+    return false;
+  }
+  out->options.block_size = size_t(block_size);
+  out->options.threads = given ? size_t(threads) : 1;
+  out->options.error_on_unknown_fields = error_on_unknown_fields != 0;
+  out->options.validate_skipped = validate_skipped != 0;
+  if (schema != Py_None) {
+    out->infer = false;
+    return arrow_schema_argument(schema, &out->schema);
+  }
+  return true;
+}
+
+// Reads json[0, length) (without padding) into a new ArrowStream, without the
+// GIL.
+PyObject *read_arrow(const char *json, size_t length, ArrowReadArguments &a) {
+  auto *batches = new (std::nothrow) std::vector<ArrowArray>();
+  auto *schema = new (std::nothrow) simdjson_arrow::field(std::move(a.schema));
+  if (batches == nullptr || schema == nullptr) {
+    delete batches;
+    delete schema;
+    return PyErr_NoMemory();
+  }
+  simdjson_arrow::status st;
+  Py_BEGIN_ALLOW_THREADS
+  try {
+    st = a.infer ? simdjson_arrow::read_ndjson(json, length, schema, batches, a.options)
+                 : simdjson_arrow::read_ndjson(*schema, json, length, batches, a.options);
+  } catch (const std::bad_alloc &) {
+    st.message = "out of memory";
+  }
+  Py_END_ALLOW_THREADS
+  if (!st.ok()) {
+    for (ArrowArray &b : *batches) {
+      b.release(&b);
+    }
+    delete batches;
+    delete schema;
+    if (st.message == "out of memory") {
+      return PyErr_NoMemory();
+    }
+    PyErr_SetString(PyExc_ValueError, st.message.c_str());
+    return nullptr;
+  }
+  ArrowStreamObject *s = PyObject_New(ArrowStreamObject, ArrowStreamType);
+  if (s == nullptr) {
+    for (ArrowArray &b : *batches) {
+      b.release(&b);
+    }
+    delete batches;
+    delete schema;
+    return nullptr;
+  }
+  s->schema = schema;
+  s->batches = batches;
+  return reinterpret_cast<PyObject *>(s);
+}
+
+// Reads the bytes of data (any contiguous buffer, or a str) into an
+// ArrowStream. The buffer is held (a bytearray cannot be resized) while we
+// read it without the GIL. We read a copy of a bytearray or a memoryview,
+// whose bytes another thread could change meanwhile.
+PyObject *read_arrow_input(PyObject *data, ArrowReadArguments &a) {
+  if (PyUnicode_Check(data)) {
+    Py_ssize_t len;
+    const char *s = PyUnicode_AsUTF8AndSize(data, &len);
+    if (s == nullptr) {
+      return nullptr;
+    }
+    return read_arrow(s, size_t(len), a);
+  }
+  if (!PyObject_CheckBuffer(data)) {
+    PyErr_Format(PyExc_TypeError,
+                 "Input must be bytes, bytearray, memoryview, or str, not %.200s",
+                 Py_TYPE(data)->tp_name);
+    return nullptr;
+  }
+  if (PyByteArray_Check(data) || PyMemoryView_Check(data)) {
+    PyObject *copy = PyBytes_FromObject(data);
+    if (copy == nullptr) {
+      return nullptr;
+    }
+    PyObject *r = read_arrow(PyBytes_AS_STRING(copy), size_t(PyBytes_GET_SIZE(copy)), a);
+    Py_DECREF(copy);
+    return r;
+  }
+  Py_buffer view;
+  if (PyObject_GetBuffer(data, &view, PyBUF_SIMPLE) < 0) {
+    return nullptr;
+  }
+  PyObject *r = read_arrow(static_cast<const char *>(view.buf), size_t(view.len), a);
+  PyBuffer_Release(&view);
+  return r;
+}
+
+PyObject *loads_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
+  ArrowReadArguments a;
+  PyObject *data;
+  if (!arrow_read_arguments("loads_arrow", args, kwargs, &data, &a)) {
+    return nullptr;
+  }
+  return read_arrow_input(data, a);
+}
+
+PyObject *mmap_mmap = nullptr; // mmap.mmap, set when the module loads
+PyObject *mmap_ACCESS_READ = nullptr;
+
+// The file at path, mapped in memory (an mmap object), or b"" if it is empty:
+// the threads that read it load its pages, instead of one thread copying it.
+PyObject *map_file(PyObject *path) {
+  PyObject *f = PyObject_CallFunction(io_open, "Os", path, "rb");
+  if (f == nullptr) {
+    return nullptr;
+  }
+  PyObject *mapped = nullptr;
+  PyObject *fileno = PyObject_CallMethod(f, "fileno", nullptr);
+  PyObject *size = PyObject_CallMethod(f, "seek", "ii", 0, 2);
+  if (fileno != nullptr && size != nullptr) {
+    if (PyObject_IsTrue(size)) {
+      PyObject *args = Py_BuildValue("(Oi)", fileno, 0);
+      PyObject *kwargs = Py_BuildValue("{sO}", "access", mmap_ACCESS_READ);
+      if (args != nullptr && kwargs != nullptr) {
+        mapped = PyObject_Call(mmap_mmap, args, kwargs);
+      }
+      Py_XDECREF(args);
+      Py_XDECREF(kwargs);
+    } else {
+      mapped = PyBytes_FromStringAndSize(nullptr, 0); // mmap cannot map an empty file
+    }
+  }
+  Py_XDECREF(fileno);
+  Py_XDECREF(size);
+  PyObject *r = PyObject_CallMethod(f, "close", nullptr); // the mapping stays valid
+  Py_DECREF(f);
+  if (r == nullptr) {
+    Py_XDECREF(mapped);
+    return nullptr;
+  }
+  Py_DECREF(r);
+  return mapped;
+}
+
+PyObject *load_arrow_file(PyObject *, PyObject *args, PyObject *kwargs) {
+  ArrowReadArguments a;
+  PyObject *path;
+  if (!arrow_read_arguments("load_arrow_file", args, kwargs, &path, &a)) {
+    return nullptr;
+  }
+  PyObject *mapped = map_file(path);
+  if (mapped == nullptr) {
+    return nullptr;
+  }
+  PyObject *r = read_arrow_input(mapped, a);
+  if (!PyBytes_Check(mapped)) {
+    PyObject *type, *value, *tb;
+    PyErr_Fetch(&type, &value, &tb); // the error of the read, if any
+    PyObject *c = PyObject_CallMethod(mapped, "close", nullptr);
+    if (c == nullptr) {
+      Py_CLEAR(r);
+      Py_XDECREF(type);
+      Py_XDECREF(value);
+      Py_XDECREF(tb);
+    } else {
+      Py_DECREF(c);
+      PyErr_Restore(type, value, tb);
+    }
+  }
+  Py_DECREF(mapped);
+  return r;
+}
+
+// The output of dumpb_arrow: a bytes object that the writer grows (taking
+// the GIL, which it does not hold otherwise), handed over without a copy.
+struct BytesAllocator {
+  PyObject *bytes = nullptr;
+  size_t capacity = 0;
+
+  static char *reallocate(void *context, char *, size_t, size_t size) {
+    BytesAllocator *self = static_cast<BytesAllocator *>(context);
+    if (size > size_t(PY_SSIZE_T_MAX)) {
+      return nullptr;
+    }
+    PyGILState_STATE gil = PyGILState_Ensure();
+    if (self->bytes == nullptr) {
+      self->bytes = PyBytes_FromStringAndSize(nullptr, Py_ssize_t(size));
+    } else if (_PyBytes_Resize(&self->bytes, Py_ssize_t(size)) < 0) {
+      self->bytes = nullptr;
+    }
+    char *p = nullptr;
+    if (self->bytes == nullptr) {
+      PyErr_Clear(); // the writer reports that it is out of memory
+      self->capacity = 0;
+    } else {
+      p = PyBytes_AS_STRING(self->bytes);
+      self->capacity = size;
+    }
+    PyGILState_Release(gil);
+    return p;
+  }
+  static void deallocate(void *context, char *) {
+    BytesAllocator *self = static_cast<BytesAllocator *>(context);
+    PyGILState_STATE gil = PyGILState_Ensure();
+    Py_CLEAR(self->bytes);
+    PyGILState_Release(gil);
+  }
+  // The bytes object, cut to its first size bytes (after release).
+  PyObject *take(size_t size) {
+    if (size >= capacity / 2) {
+      // At least half full: keep the allocation, as OutBuf does.
+      Py_SET_SIZE(bytes, Py_ssize_t(size));
+      PyBytes_AS_STRING(bytes)[size] = '\0';
+    } else if (_PyBytes_Resize(&bytes, Py_ssize_t(size)) < 0) {
+      bytes = nullptr;
+      return nullptr;
+    }
+    PyObject *r = bytes;
+    bytes = nullptr;
+    return r;
+  }
+  ~BytesAllocator() { Py_XDECREF(bytes); }
+};
+
+// dumpb_arrow(data, *, write_nulls=True, threads=None): data (an object with
+// __arrow_c_stream__ or __arrow_c_array__) as NDJSON bytes.
+PyObject *dumpb_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
+  Py_ssize_t threads;
+  bool given;
+  PyObject *rest = take_threads(kwargs, &threads, &given);
+  if (rest == nullptr && PyErr_Occurred()) {
+    return nullptr;
+  }
+  static const char *kwlist[] = {"", "write_nulls", nullptr};
+  PyObject *data;
+  int write_nulls = 1;
+  int ok = PyArg_ParseTupleAndKeywords(args, rest, "O|$p:dumpb_arrow",
+                                       const_cast<char **>(kwlist), &data, &write_nulls);
+  Py_XDECREF(rest);
+  if (!ok) {
+    return nullptr;
+  }
+  simdjson_arrow::ndjson_write_options options;
+  options.write_nulls = write_nulls != 0;
+  options.threads = given ? size_t(threads) : 1;
+  // A stream we take over, or a schema and a batch that their capsules own.
+  ArrowArrayStream stream{};
+  const ArrowSchema *schema = nullptr;
+  const ArrowArray *batch = nullptr;
+  PyObject *owner = nullptr;
+  if (PyObject_HasAttrString(data, "__arrow_c_stream__")) {
+    auto *p = static_cast<ArrowArrayStream *>(
+        capsule_of(data, "__arrow_c_stream__", "arrow_array_stream", &owner));
+    if (p == nullptr) {
+      return nullptr;
+    }
+    if (p->release == nullptr) {
+      Py_DECREF(owner);
+      PyErr_SetString(PyExc_ValueError, "the Arrow stream was released");
+      return nullptr;
+    }
+    stream = *p; // we move the stream out of its capsule
+    p->release = nullptr;
+    Py_CLEAR(owner);
+  } else if (PyObject_HasAttrString(data, "__arrow_c_array__")) {
+    owner = PyObject_CallMethod(data, "__arrow_c_array__", nullptr);
+    if (owner == nullptr) {
+      return nullptr;
+    }
+    if (!PyTuple_Check(owner) || PyTuple_GET_SIZE(owner) != 2) {
+      Py_DECREF(owner);
+      PyErr_SetString(PyExc_TypeError, "__arrow_c_array__ must return a pair of capsules");
+      return nullptr;
+    }
+    schema = static_cast<const ArrowSchema *>(
+        PyCapsule_GetPointer(PyTuple_GET_ITEM(owner, 0), "arrow_schema"));
+    batch = static_cast<const ArrowArray *>(
+        schema ? PyCapsule_GetPointer(PyTuple_GET_ITEM(owner, 1), "arrow_array") : nullptr);
+    if (batch == nullptr) {
+      Py_DECREF(owner);
+      return nullptr;
+    }
+  } else {
+    PyErr_Format(PyExc_TypeError,
+                 "dumpb_arrow takes Arrow data (an object with __arrow_c_stream__ or "
+                 "__arrow_c_array__: a pyarrow.Table, a polars.DataFrame...), not %.200s",
+                 Py_TYPE(data)->tp_name);
+    return nullptr;
+  }
+  BytesAllocator bytes;
+  simdjson_arrow::ndjson_allocator allocator{BytesAllocator::reallocate,
+                                             BytesAllocator::deallocate, &bytes};
+  simdjson_arrow::status st;
+  size_t size = 0;
+  bool released = false;
+  bool handed = false; // write(&stream) releases the stream
+  Py_BEGIN_ALLOW_THREADS
+  try {
+    simdjson_arrow::ndjson_writer writer(options, allocator);
+    handed = true;
+    st = batch != nullptr ? writer.write(schema, batch) : writer.write(&stream);
+    if (st.ok()) {
+      writer.release(&size);
+      released = true;
+    }
+  } catch (const std::bad_alloc &) {
+    st.message = "out of memory";
+  }
+  if (!handed && stream.release != nullptr) {
+    stream.release(&stream);
+  }
+  Py_END_ALLOW_THREADS
+  Py_XDECREF(owner);
+  if (!st.ok() || !released) {
+    if (st.message == "out of memory") {
+      return PyErr_NoMemory();
+    }
+    PyErr_SetString(PyExc_ValueError, st.message.c_str());
+    return nullptr;
+  }
+  return bytes.take(size);
+}
+
 // Benchmarking helper: run simdjson without building Python objects.
 PyObject *parse_only(PyObject *, PyObject *arg) {
   if (!PyBytes_Check(arg)) {
@@ -4773,6 +5348,21 @@ PyMethodDef methods[] = {
      "dumpb_many(records, /, default=None, option=None, *, threads=None)\n--\n\n"
      "The records as NDJSON bytes: each as dumpb writes it, then a newline.\n"
      "With threads (free-threaded Python), the records are encoded on several threads."},
+    {"loads_arrow", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(loads_arrow)),
+     METH_VARARGS | METH_KEYWORDS,
+     "loads_arrow(data, /, schema=None, *, block_size=1048576, error_on_unknown_fields=False, "
+     "validate_skipped=True, threads=None)\n--\n\n"
+     "Read NDJSON into Arrow record batches (an ArrowStream), given a schema or inferring it."},
+    {"load_arrow_file",
+     reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(load_arrow_file)),
+     METH_VARARGS | METH_KEYWORDS,
+     "load_arrow_file(path, /, schema=None, *, block_size=1048576, "
+     "error_on_unknown_fields=False, validate_skipped=True, threads=None)\n--\n\n"
+     "Read the NDJSON file at path into Arrow record batches, like loads_arrow."},
+    {"dumpb_arrow", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumpb_arrow)),
+     METH_VARARGS | METH_KEYWORDS,
+     "dumpb_arrow(data, /, *, write_nulls=True, threads=None)\n--\n\n"
+     "Arrow data (a pyarrow.Table, a polars.DataFrame...) as NDJSON bytes: one object per row."},
     {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
      METH_VARARGS | METH_KEYWORDS,
      "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default): the list of "
@@ -4860,6 +5450,20 @@ int exec_fastsimdjson(PyObject *module) {
       return -1;
     }
   }
+  if (mmap_mmap == nullptr) {
+    PyObject *module = PyImport_ImportModule("mmap");
+    if (module == nullptr) {
+      return -1;
+    }
+    mmap_ACCESS_READ = PyObject_GetAttrString(module, "ACCESS_READ");
+    mmap_mmap = PyObject_GetAttrString(module, "mmap");
+    Py_DECREF(module);
+    if (mmap_ACCESS_READ == nullptr || mmap_mmap == nullptr) {
+      Py_CLEAR(mmap_ACCESS_READ);
+      Py_CLEAR(mmap_mmap);
+      return -1;
+    }
+  }
   struct {
     const char *name;
     long value;
@@ -4891,7 +5495,7 @@ int exec_fastsimdjson(PyObject *module) {
     PyType_Spec *spec;
   } types[] = {{&DocumentType, &document_spec}, {&ObjectType, &object_spec},
                {&ArrayType, &array_spec},       {&IterType, &iter_spec},
-               {&StreamType, &stream_spec}};
+               {&StreamType, &stream_spec},     {&ArrowStreamType, &arrow_stream_spec}};
   for (auto &t : types) {
     if (*t.type == nullptr) {
       *t.type = reinterpret_cast<PyTypeObject *>(PyType_FromSpec(t.spec));
@@ -4913,7 +5517,9 @@ int exec_fastsimdjson(PyObject *module) {
   // isinstance(x, Mapping) / isinstance(x, Sequence) hold for the views.
   if (register_abc("Mapping", ObjectType) < 0 || register_abc("Sequence", ArrayType) < 0 ||
       PyModule_AddObjectRef(module, "Object", reinterpret_cast<PyObject *>(ObjectType)) < 0 ||
-      PyModule_AddObjectRef(module, "Array", reinterpret_cast<PyObject *>(ArrayType)) < 0) {
+      PyModule_AddObjectRef(module, "Array", reinterpret_cast<PyObject *>(ArrayType)) < 0 ||
+      PyModule_AddObjectRef(module, "ArrowStream",
+                            reinterpret_cast<PyObject *>(ArrowStreamType)) < 0) {
     return -1;
   }
   return 0;

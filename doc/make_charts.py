@@ -1,9 +1,11 @@
 """Bar charts for the README, in the style of simdjson's (light and dark).
 
 The numbers are those of the README's benchmark section. Run from the
-repository root: python doc/make_charts.py (needs matplotlib).
+repository root: python doc/make_charts.py (needs matplotlib), or
+python doc/make_charts.py arrow for the Arrow charts only.
 """
 import os
+import sys
 
 import matplotlib
 
@@ -13,6 +15,7 @@ import matplotlib.ticker
 from matplotlib import font_manager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ARROW_ONLY = sys.argv[1:] == ["arrow"]
 MACHINE = "Intel Xeon Gold 6548N (Emerald Rapids)"
 PYTHON = "Python 3.14.6"
 
@@ -34,6 +37,8 @@ def pick_font():
 
 def chart(name, title, subtitle, meta, rows, xlabel, xunit, unit, fmt="{:.2f}", lower_is_better=False):
     """rows: (label, sublabel, value, ours) from top to bottom."""
+    if ARROW_ONLY:
+        return
     font = pick_font()
     n = len(rows)
     top = 1.45  # inches above the plot for the titles
@@ -140,3 +145,94 @@ chart("perf_ndjson",
        ("jiter", "each line, no string cache", 0.20, False),
        ("json", "loads on each line", 0.12, False)],
       "Parsing speed", "GB/s", " GB/s")
+
+# NDJSON to Arrow and back: bench_arrow.py, Python 3.13, the result as a
+# pyarrow.Table (reading) or bytes (writing).
+META_ARROW = ("fastsimdjson 0.10.0  ·  pyarrow 26.0  ·  polars 2.1  ·  DuckDB 2.0  ·  "
+              "Python 3.13  ·  Xeon Gold 6548N")
+
+
+def gbps(v):
+    """The value as given (we pass rounded numbers): 0.12, 1.95, 4.0, 13.9."""
+    text = f"{v:g}"
+    return text if "." in text else text + ".0"
+
+
+def grouped_chart(name, title, subtitle, meta, groups, xlabel):
+    """groups: (heading, [(label, sublabel, value, ours)]) from top to bottom."""
+    font = pick_font()
+    slots = []  # (kind, payload) from top to bottom
+    for heading, rows in groups:
+        slots.append(("heading", heading))
+        slots.extend(("bar", r) for r in rows)
+    n = len(slots)
+    top = 1.45
+    height = top + 0.5 * n + 0.95
+    vmax = max(r[2] for _, rows in groups for r in rows)
+    for theme, c in THEMES.items():
+        plt.rcParams["font.family"] = font
+        fig = plt.figure(figsize=(10, height), dpi=200, facecolor=c["bg"])
+        left, right = 0.235, 0.955
+        ax = fig.add_axes([left, 0.9 / height, right - left, (0.5 * n) / height], facecolor=c["bg"])
+        for y, (kind, payload) in zip(list(range(n))[::-1], slots):
+            if kind == "heading":
+                ax.text(-vmax * 0.022, y - 0.05, payload, va="center", ha="right", fontsize=15,
+                        fontweight="bold", color=c["text"], clip_on=False)
+                continue
+            label, sub, value, ours = payload
+            ax.barh(y, value, height=0.66, color=c["ours"] if ours else c["bar"], zorder=3)
+            ax.text(value + vmax * 0.012, y, gbps(value) + " GB/s", va="center", ha="left",
+                    fontsize=14, color=c["value_ours"] if ours else c["value"], zorder=4)
+            ax.text(-vmax * 0.022, y + 0.12, label, va="center", ha="right", fontsize=14,
+                    color=c["text"], clip_on=False)
+            ax.text(-vmax * 0.022, y - 0.26, sub, va="center", ha="right", fontsize=11,
+                    color=c["meta"], clip_on=False)
+        ax.set_xlim(0, vmax * 1.2)
+        ax.set_ylim(-0.6, n - 0.4)
+        ax.set_yticks([])
+        ax.tick_params(axis="x", colors=c["meta"], labelsize=12, length=0, pad=8)
+        ax.grid(axis="x", color=c["grid"], linewidth=1, zorder=0)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color(c["axis"])
+        ax.set_xlabel(f"{xlabel} (GB/s, higher is better)", color=c["sub"], fontsize=13,
+                      labelpad=10)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:g}"))
+        fig.text(0.04, 1 - 0.42 / height, title, fontsize=25, color=c["text"], va="center")
+        fig.text(0.04, 1 - 0.85 / height, subtitle, fontsize=14, color=c["sub"], va="center")
+        fig.text(0.04, 1 - 1.15 / height, meta, fontsize=12.5, color=c["meta"], va="center")
+        suffix = "" if theme == "light" else "_dark"
+        fig.savefig(os.path.join(HERE, f"{name}{suffix}.png"), facecolor=c["bg"])
+        plt.close(fig)
+
+
+def threads_text(threads):
+    return "one thread" if threads == 1 else f"{threads} threads"
+
+
+def arrow_read(threads, flat, gh, inferred):
+    """Each argument but threads: (fastsimdjson, pyarrow, polars) in GB/s."""
+    who = (("fastsimdjson", "loads_arrow"), ("pyarrow", "json.read_json"), ("polars", "read_ndjson"))
+    groups = [(heading, [(w, call, v, w == "fastsimdjson") for (w, call), v in zip(who, values)])
+              for heading, values in (("flat", flat), ("GH Archive", gh),
+                                      ("flat, inferred schema", inferred))]
+    grouped_chart(f"perf_arrow_read_{threads}", "Reading NDJSON into Arrow",
+                  f"into a pyarrow.Table, on {threads_text(threads)}", META_ARROW, groups,
+                  "Reading speed")
+
+
+def arrow_write(threads, flat, gh):
+    """Each argument but threads: (fastsimdjson, polars, DuckDB) in GB/s."""
+    who = (("fastsimdjson", "dumpb_arrow"), ("polars", "write_ndjson"),
+           ("DuckDB", "COPY ... (FORMAT json)"))
+    groups = [(heading, [(w, call, v, w == "fastsimdjson") for (w, call), v in zip(who, values)])
+              for heading, values in (("flat", flat), ("GH Archive", gh))]
+    grouped_chart(f"perf_arrow_write_{threads}", "Writing Arrow as NDJSON",
+                  f"from a pyarrow.Table, on {threads_text(threads)}", META_ARROW, groups,
+                  "Writing speed")
+
+
+arrow_read(1, (0.70, 0.18, 0.27), (1.95, 0.45, 0.53), (0.72, 0.17, 0.08))
+arrow_read(32, (13.9, 5.1, 4.0), (28.4, 12.1, 3.8), (13.3, 4.8, 0.12))
+arrow_write(1, (0.96, 0.46, 0.30), (1.07, 0.47, 0.31))
+arrow_write(32, (7.8, 1.3, 2.8), (4.7, 1.1, 0.79))
