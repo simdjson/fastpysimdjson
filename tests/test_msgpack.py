@@ -79,11 +79,15 @@ def test_inputs():
         fastsimdjson.msgpack_to_json("not bytes")
     with pytest.raises(TypeError):
         fastsimdjson.json_to_msgpack(12)
-    # Inputs of all lengths (ending anywhere on their page): read in place
-    # when the padding stays on the page, copied otherwise.
+    # Inputs of all lengths (ending anywhere on their page): bytes are read in
+    # place when the padding stays on the page, copied otherwise; other
+    # buffers (which another thread could change meanwhile) are always copied.
     for n in range(1, 400):
         doc = ("[" + "1," * n + '"' + "x" * (n % 7) + '"]').encode()
-        assert fastsimdjson.json_to_msgpack(doc) == msgpack.packb(json.loads(doc))
+        expected = msgpack.packb(json.loads(doc))
+        assert fastsimdjson.json_to_msgpack(doc) == expected
+        assert fastsimdjson.json_to_msgpack(bytearray(doc)) == expected
+        assert fastsimdjson.msgpack_to_json(bytearray(expected)) == doc
 
 
 @pytest.mark.parametrize("threads", [None, 1, 3, 8])

@@ -5299,13 +5299,15 @@ PyObject *dumpb_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
 // final copy). No Python object is made from the data.
 // ---------------------------------------------------------------------------
 
-// The bytes of data (any contiguous buffer, or a str with text), held while we
-// read them without the GIL (a bytearray cannot be resized meanwhile).
+// The bytes of data (any contiguous buffer, or a str with text), read without
+// the GIL. bytes and str cannot change, so we read them in place. Any other
+// buffer (bytearray, memoryview, array...) could be written by another thread
+// meanwhile: we copy it first, with the padding simdjson reads past the end.
 struct InputBytes {
-  Py_buffer view{};
-  bool held = false;
+  simdjson::padded_string copy;
   const char *data = nullptr;
   size_t size = 0;
+  bool padded = false;  // data is followed by SIMDJSON_PADDING bytes we own
 
   bool get(PyObject *o, bool text) {
     if (text && PyUnicode_Check(o)) {
@@ -5314,6 +5316,11 @@ struct InputBytes {
       size = size_t(len);
       return data != nullptr;
     }
+    if (PyBytes_Check(o)) {
+      data = PyBytes_AS_STRING(o);
+      size = size_t(PyBytes_GET_SIZE(o));
+      return true;
+    }
     if (!PyObject_CheckBuffer(o)) {
       PyErr_Format(PyExc_TypeError,
                    text ? "Input must be bytes, bytearray, memoryview, or str, not %.200s"
@@ -5321,21 +5328,20 @@ struct InputBytes {
                    Py_TYPE(o)->tp_name);
       return false;
     }
+    Py_buffer view;
     if (PyObject_GetBuffer(o, &view, PyBUF_SIMPLE) < 0) {
       return false;
     }
-    held = true;
-    data = static_cast<const char *>(view.buf);
-    size = size_t(view.len);
-    return true;
-  }
-  InputBytes() = default;
-  InputBytes(const InputBytes &) = delete;
-  InputBytes &operator=(const InputBytes &) = delete;
-  ~InputBytes() {
-    if (held) {
-      PyBuffer_Release(&view);
+    copy = simdjson::padded_string(static_cast<const char *>(view.buf), size_t(view.len));
+    PyBuffer_Release(&view);
+    if (copy.data() == nullptr) {
+      PyErr_NoMemory();
+      return false;
     }
+    data = copy.data();
+    size = copy.size();
+    padded = true;
+    return true;
   }
 };
 
@@ -5390,7 +5396,7 @@ PyObject *json_to_msgpack(PyObject *, PyObject *args, PyObject *kwargs) {
   Py_BEGIN_ALLOW_THREADS
   try {
     simdjson_msgpack::msgpack_writer writer(options, allocator);
-    if (needs_unpadded(in.data, in.size)) {
+    if (!in.padded && needs_unpadded(in.data, in.size)) {
       // simdjson reads SIMDJSON_PADDING bytes past the end: the writer copies.
       st = ndjson ? writer.write_ndjson(in.data, in.size) : writer.write_json(in.data, in.size);
     } else {
