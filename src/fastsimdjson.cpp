@@ -4794,12 +4794,20 @@ PyObject *arrow_stream_schema(PyObject *self, PyObject *) {
 
 // __arrow_c_stream__(requested_schema=None): the record batches, as a
 // capsule. The batches are handed over: a second call raises ValueError. We
-// ignore requested_schema, as the interface allows.
+// cannot cast: requested_schema must be None or a schema capsule, which we
+// ignore, as the interface allows (the consumer checks the schema it gets).
 PyObject *arrow_stream_stream(PyObject *self, PyObject *args, PyObject *kwargs) {
   static const char *kwlist[] = {"requested_schema", nullptr};
   PyObject *requested = nullptr;
   if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O:__arrow_c_stream__",
                                    const_cast<char **>(kwlist), &requested)) {
+    return nullptr;
+  }
+  if (requested != nullptr && requested != Py_None &&
+      !PyCapsule_IsValid(requested, "arrow_schema")) {
+    PyErr_Format(PyExc_TypeError,
+                 "requested_schema must be None or an arrow_schema capsule, not %.200s",
+                 Py_TYPE(requested)->tp_name);
     return nullptr;
   }
   ArrowStreamObject *s = reinterpret_cast<ArrowStreamObject *>(self);
@@ -5028,7 +5036,8 @@ PyObject *read_arrow(const char *json, size_t length, ArrowReadArguments &a) {
 
 // Reads the bytes of data (any contiguous buffer, or a str) into an
 // ArrowStream. The buffer is held (a bytearray cannot be resized) while we
-// read it without the GIL.
+// read it without the GIL. We read a copy of a bytearray or a memoryview,
+// whose bytes another thread could change meanwhile.
 PyObject *read_arrow_input(PyObject *data, ArrowReadArguments &a) {
   if (PyUnicode_Check(data)) {
     Py_ssize_t len;
@@ -5043,6 +5052,15 @@ PyObject *read_arrow_input(PyObject *data, ArrowReadArguments &a) {
                  "Input must be bytes, bytearray, memoryview, or str, not %.200s",
                  Py_TYPE(data)->tp_name);
     return nullptr;
+  }
+  if (PyByteArray_Check(data) || PyMemoryView_Check(data)) {
+    PyObject *copy = PyBytes_FromObject(data);
+    if (copy == nullptr) {
+      return nullptr;
+    }
+    PyObject *r = read_arrow(PyBytes_AS_STRING(copy), size_t(PyBytes_GET_SIZE(copy)), a);
+    Py_DECREF(copy);
+    return r;
   }
   Py_buffer view;
   if (PyObject_GetBuffer(data, &view, PyBUF_SIMPLE) < 0) {
@@ -5062,28 +5080,12 @@ PyObject *loads_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
   return read_arrow_input(data, a);
 }
 
-PyObject *mmap_mmap = nullptr; // mmap.mmap
+PyObject *mmap_mmap = nullptr; // mmap.mmap, set when the module loads
 PyObject *mmap_ACCESS_READ = nullptr;
 
 // The file at path, mapped in memory (an mmap object), or b"" if it is empty:
 // the threads that read it load its pages, instead of one thread copying it.
 PyObject *map_file(PyObject *path) {
-  if (mmap_mmap == nullptr) {
-    PyObject *module = PyImport_ImportModule("mmap");
-    if (module == nullptr) {
-      return nullptr;
-    }
-    PyObject *access = PyObject_GetAttrString(module, "ACCESS_READ");
-    PyObject *mapper = PyObject_GetAttrString(module, "mmap");
-    Py_DECREF(module);
-    if (access == nullptr || mapper == nullptr) {
-      Py_XDECREF(access);
-      Py_XDECREF(mapper);
-      return nullptr;
-    }
-    mmap_ACCESS_READ = access;
-    mmap_mmap = mapper;
-  }
   PyObject *f = PyObject_CallFunction(io_open, "Os", path, "rb");
   if (f == nullptr) {
     return nullptr;
@@ -5267,9 +5269,11 @@ PyObject *dumpb_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
   simdjson_arrow::status st;
   size_t size = 0;
   bool released = false;
+  bool handed = false; // write(&stream) releases the stream
   Py_BEGIN_ALLOW_THREADS
   try {
     simdjson_arrow::ndjson_writer writer(options, allocator);
+    handed = true;
     st = batch != nullptr ? writer.write(schema, batch) : writer.write(&stream);
     if (st.ok()) {
       writer.release(&size);
@@ -5277,6 +5281,9 @@ PyObject *dumpb_arrow(PyObject *, PyObject *args, PyObject *kwargs) {
     }
   } catch (const std::bad_alloc &) {
     st.message = "out of memory";
+  }
+  if (!handed && stream.release != nullptr) {
+    stream.release(&stream);
   }
   Py_END_ALLOW_THREADS
   Py_XDECREF(owner);
@@ -5440,6 +5447,20 @@ int exec_fastsimdjson(PyObject *module) {
     EnumType = enum_module ? PyObject_GetAttrString(enum_module, "Enum") : nullptr;
     Py_XDECREF(enum_module);
     if (EnumType == nullptr) {
+      return -1;
+    }
+  }
+  if (mmap_mmap == nullptr) {
+    PyObject *module = PyImport_ImportModule("mmap");
+    if (module == nullptr) {
+      return -1;
+    }
+    mmap_ACCESS_READ = PyObject_GetAttrString(module, "ACCESS_READ");
+    mmap_mmap = PyObject_GetAttrString(module, "mmap");
+    Py_DECREF(module);
+    if (mmap_ACCESS_READ == nullptr || mmap_mmap == nullptr) {
+      Py_CLEAR(mmap_ACCESS_READ);
+      Py_CLEAR(mmap_mmap);
       return -1;
     }
   }

@@ -116,6 +116,11 @@ def test_stream_object():
         fastsimdjson.dumpb_arrow(s)
     pa.schema(s)  # the schema stays
     fastsimdjson.loads_arrow(b'{"a": 1}\n')  # dropped without being read
+    with pytest.raises(TypeError, match="requested_schema"):
+        fastsimdjson.loads_arrow(b'{"a": 1}\n').__arrow_c_stream__(42)
+    s = fastsimdjson.loads_arrow(b'{"a": 1}\n')
+    capsule = s.__arrow_c_stream__(pa.schema([("a", pa.int64())]).__arrow_c_schema__())
+    assert pa.RecordBatchReader._import_from_c_capsule(capsule).read_all().num_rows == 1
     with pytest.raises(TypeError):
         fastsimdjson.ArrowStream()
 
