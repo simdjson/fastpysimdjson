@@ -13,6 +13,9 @@ fields you need from each document. It writes JSON in two ways: `dumps` returns 
 as orjson; `dumpb_many` writes NDJSON, on many threads with free-threaded
 Python. `loads_arrow` and `dumpb_arrow` convert NDJSON to Apache Arrow
 tables and back, for pyarrow, polars or DuckDB, on many threads with any
+Python. `json_to_msgpack` and `msgpack_to_json` convert JSON to
+[MessagePack](https://msgpack.org/) and back without building Python objects,
+3 to 4 times as fast as orjson with ormsgpack, on many threads with any
 Python.
 
 With pip:
@@ -324,6 +327,54 @@ or without free threading. They are built on
 [simdjson_arrow](https://github.com/simdjson/simdjson_arrow), a C++ library
 (vendored).
 
+### MessagePack: `json_to_msgpack` and `msgpack_to_json`
+
+```python
+packed = fastsimdjson.json_to_msgpack(b'{"id": 1, "tags": ["a", "b"], "score": 2.5}')
+# b'\x83\xa2id\x01\xa4tags\x92\xa1a\xa1b\xa5score\xcb@\x04\x00\x00\x00\x00\x00\x00'
+msgpack.unpackb(packed)              # {'id': 1, 'tags': ['a', 'b'], 'score': 2.5}
+fastsimdjson.msgpack_to_json(packed)  # b'{"id":1,"tags":["a","b"],"score":2.5}'
+stream = fastsimdjson.json_to_msgpack(ndjson, ndjson=True, threads=8)  # one value per document
+lines = fastsimdjson.msgpack_to_json(stream, stream=True, threads=8)   # NDJSON again
+```
+
+`json_to_msgpack(data, *, ndjson=False, block_size=1048576, threads=None)`
+converts JSON (`bytes`, `bytearray`, `memoryview` or `str`, read in place) to
+MessagePack `bytes` in the most compact encoding: the same bytes as
+`msgpack.packb(json.loads(data))` (but for duplicate keys, which
+`json.loads` drops, and integers beyond 64 bits). Integers take the smallest integer encoding
+(integers beyond 64 bits become doubles), other numbers are doubles, and
+strings, arrays and objects take the smallest header for their size; keys keep
+their order, duplicates too. With `ndjson=True`, the input holds documents
+separated by whitespace (NDJSON, JSON Lines), and each becomes one MessagePack
+value, one after the other.
+
+`msgpack_to_json(data, *, stream=False, validate_utf8=True,
+binary_as_base64=True, ext_as_null=False, block_size=1048576, threads=None)`
+converts MessagePack (any bytes-like object) to compact JSON `bytes`. Floats
+get the shortest representation that gives them back, as Python's `repr`
+(`1.0`, not `1`; `1e-05`; NaN and infinities as `null`), binary values as base64 strings, map keys that are not strings as
+strings (`"1"`, `"true"`, `"null"`); extension values (timestamps too) raise
+`ValueError`, or become `null` with `ext_as_null=True`. Strings must be valid
+UTF-8 (unless `validate_utf8=False`). With `stream=True`, the input holds a
+sequence of values (what `json_to_msgpack(..., ndjson=True)` or several
+`msgpack.packb` calls give), and each becomes one line of NDJSON.
+
+* Invalid input raises `ValueError`: `"TAPE_ERROR: ... (document 12)"` for
+  JSON, `"truncated string (byte 1234)"` for MessagePack.
+* With `threads=N` (`threads=0` or `None`: one per processor), NDJSON and
+  streams are converted on N threads, in blocks of about `block_size` bytes.
+  A JSON document must then fit on one line; when that fails, the input is
+  converted again on one thread, so that errors are the same with any number
+  of threads. Single documents use one thread.
+* The functions release the GIL and run their threads outside Python, with or
+  without free threading, and write their result straight into the `bytes`
+  object (no copy). No Python object is made from the data.
+
+They are built on
+[simdjson_msgpack](https://github.com/simdjson/simdjson_msgpack), a C++ library
+(vendored).
+
 ### `release`
 
 `release()` frees the simdjson parser and the string caches kept by the
@@ -620,6 +671,50 @@ flat file comes from
 and the events from GH Archive
 (`curl -sSfL https://data.gharchive.org/2024-03-13-12.json.gz | gunzip > gharchive.ndjson`).
 The charts come from `python doc/make_charts.py arrow`.
+
+### JSON to MessagePack and back
+
+From JSON bytes to MessagePack bytes, and back, against the usual ways in
+Python, which decode into Python objects, then encode them:
+`ormsgpack.packb(orjson.loads(s))`, `msgspec.msgpack.encode(msgspec.json.decode(s))`
+and so on. The 22 files of simdjson-data, geometric means of the speeds, in
+GB/s of JSON (read when writing MessagePack, written when writing JSON).
+Python 3.14, msgpack 1.2, orjson 3.13, ormsgpack 1.13, msgspec 0.22, Intel
+Xeon Gold 6338 (Ice Lake), one core.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_msgpack_encode_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_msgpack_encode.png" width="80%" alt="JSON to MessagePack in Python, geometric mean over the 22 files of simdjson-data: fastsimdjson json_to_msgpack 1.37 GB/s, orjson with ormsgpack 0.35, msgspec 0.34, fastsimdjson loads with msgpack 0.28, orjson with msgpack 0.25, json with msgpack 0.13">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_msgpack_decode_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_msgpack_decode.png" width="80%" alt="MessagePack to JSON in Python, geometric mean over the 22 files of simdjson-data: fastsimdjson msgpack_to_json 0.94 GB/s, ormsgpack with orjson 0.27, msgspec 0.25, msgpack with orjson 0.20, msgpack with fastsimdjson dumpb 0.20, msgpack with json 0.07">
+</picture>
+
+Streams: the 304,929 events of an hour of GH Archive (886 MB of NDJSON), with
+`json_to_msgpack(data, ndjson=True, threads=N)` and
+`msgpack_to_json(packed, stream=True, threads=N)`, against orjson with
+ormsgpack (each document) and `msgpack.Unpacker` with orjson (each value), on
+one thread (one thread per core of one socket up to 32 threads, then both
+sockets):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_msgpack_ndjson_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_msgpack_ndjson.png" width="80%" alt="GH Archive NDJSON to MessagePack: fastsimdjson 15.0 GB/s on 64 threads, 10.8 on 32, 6.8 on 8, 1.18 on one thread, orjson with ormsgpack 0.29 on one thread; MessagePack to NDJSON: fastsimdjson 5.0 GB/s on 8 threads, 1.05 on one thread, msgpack with orjson 0.20">
+</picture>
+
+| threads | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| NDJSON to MessagePack | 1.18 | 1.88 | 4.2 | 6.8 | 8.6 | 10.8 | 15.0 |
+| MessagePack to NDJSON | 1.05 | 1.67 | 3.3 | 5.0 | 3.4 | 4.2 | 3.5 |
+
+MessagePack to NDJSON stops scaling at about eight threads: one thread must
+find where the values end (MessagePack has no line ends) before the others
+can convert them. The benchmark is `python bench_msgpack.py` (the files of
+`JSONDIR`, by default `simdjson-data/jsonexamples`) and
+`python bench_msgpack.py --ndjson gharchive.ndjson 1 8 32`; the charts come
+from `python doc/make_charts.py msgpack`.
 
 ### Streams with `loads_many`
 

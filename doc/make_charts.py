@@ -2,7 +2,8 @@
 
 The numbers are those of the README's benchmark section. Run from the
 repository root: python doc/make_charts.py (needs matplotlib), or
-python doc/make_charts.py arrow for the Arrow charts only.
+python doc/make_charts.py arrow (msgpack) for the Arrow (MessagePack) charts
+only.
 """
 import os
 import sys
@@ -15,7 +16,7 @@ import matplotlib.ticker
 from matplotlib import font_manager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ARROW_ONLY = sys.argv[1:] == ["arrow"]
+ONLY = sys.argv[1] if len(sys.argv) > 1 else None  # "arrow", "msgpack" or None
 MACHINE = "Intel Xeon Gold 6548N (Emerald Rapids)"
 PYTHON = "Python 3.14.6"
 
@@ -35,9 +36,10 @@ def pick_font():
     return "sans-serif"
 
 
-def chart(name, title, subtitle, meta, rows, xlabel, xunit, unit, fmt="{:.2f}", lower_is_better=False):
+def chart(name, title, subtitle, meta, rows, xlabel, xunit, unit, fmt="{:.2f}", lower_is_better=False,
+          kind=None, left=0.205):
     """rows: (label, sublabel, value, ours) from top to bottom."""
-    if ARROW_ONLY:
+    if ONLY is not None and kind != ONLY:
         return
     font = pick_font()
     n = len(rows)
@@ -46,7 +48,7 @@ def chart(name, title, subtitle, meta, rows, xlabel, xunit, unit, fmt="{:.2f}", 
     for theme, c in THEMES.items():
         plt.rcParams["font.family"] = font
         fig = plt.figure(figsize=(10, height), dpi=200, facecolor=c["bg"])
-        left, right = 0.205, 0.955
+        right = 0.955
         ax = fig.add_axes([left, 0.9 / height, right - left, (0.58 * n) / height], facecolor=c["bg"])
         vmax = max(r[2] for r in rows)
         ys = list(range(n))[::-1]
@@ -158,8 +160,10 @@ def gbps(v):
     return text if "." in text else text + ".0"
 
 
-def grouped_chart(name, title, subtitle, meta, groups, xlabel):
+def grouped_chart(name, title, subtitle, meta, groups, xlabel, kind="arrow", left=0.235):
     """groups: (heading, [(label, sublabel, value, ours)]) from top to bottom."""
+    if ONLY is not None and kind != ONLY:
+        return
     font = pick_font()
     slots = []  # (kind, payload) from top to bottom
     for heading, rows in groups:
@@ -172,7 +176,7 @@ def grouped_chart(name, title, subtitle, meta, groups, xlabel):
     for theme, c in THEMES.items():
         plt.rcParams["font.family"] = font
         fig = plt.figure(figsize=(10, height), dpi=200, facecolor=c["bg"])
-        left, right = 0.235, 0.955
+        right = 0.955
         ax = fig.add_axes([left, 0.9 / height, right - left, (0.5 * n) / height], facecolor=c["bg"])
         for y, (kind, payload) in zip(list(range(n))[::-1], slots):
             if kind == "heading":
@@ -236,3 +240,49 @@ arrow_read(1, (0.70, 0.18, 0.27), (1.95, 0.45, 0.53), (0.72, 0.17, 0.08))
 arrow_read(32, (13.9, 5.1, 4.0), (28.4, 12.1, 3.8), (13.3, 4.8, 0.12))
 arrow_write(1, (0.96, 0.46, 0.30), (1.07, 0.47, 0.31))
 arrow_write(32, (7.8, 1.3, 2.8), (4.7, 1.1, 0.79))
+
+# JSON to MessagePack and back: bench_msgpack.py, bytes in, bytes out, on one
+# core (the others decode, then encode).
+META_MSGPACK = ("fastsimdjson 0.10.0  ·  msgpack 1.2  ·  orjson 3.13  ·  ormsgpack 1.13  ·  "
+                "msgspec 0.22  ·  Python 3.14  ·  Xeon Gold 6338")
+
+chart("perf_msgpack_encode",
+      "JSON to MessagePack in Python",
+      "the 22 files of simdjson-data, from JSON bytes to MessagePack bytes (geometric mean)",
+      META_MSGPACK,
+      [("fastsimdjson", "json_to_msgpack", 1.37, True),
+       ("orjson + ormsgpack", "ormsgpack.packb(orjson.loads(s))", 0.35, False),
+       ("msgspec", "msgpack.encode(json.decode(s))", 0.34, False),
+       ("fastsimdjson + msgpack", "msgpack.packb(fastsimdjson.loads(s))", 0.28, False),
+       ("orjson + msgpack", "msgpack.packb(orjson.loads(s))", 0.25, False),
+       ("json + msgpack", "msgpack.packb(json.loads(s))", 0.13, False)],
+      "Speed", "GB/s of JSON", " GB/s", kind="msgpack", left=0.37)
+
+chart("perf_msgpack_decode",
+      "MessagePack to JSON in Python",
+      "the 22 files of simdjson-data, from MessagePack bytes to JSON bytes (geometric mean)",
+      META_MSGPACK,
+      [("fastsimdjson", "msgpack_to_json", 0.94, True),
+       ("ormsgpack + orjson", "orjson.dumps(ormsgpack.unpackb(b))", 0.27, False),
+       ("msgspec", "json.encode(msgpack.decode(b))", 0.25, False),
+       ("msgpack + orjson", "orjson.dumps(msgpack.unpackb(b))", 0.20, False),
+       ("msgpack + fastsimdjson", "fastsimdjson.dumpb(msgpack.unpackb(b))", 0.20, False),
+       ("msgpack + json", "json.dumps(msgpack.unpackb(b)).encode()", 0.07, False)],
+      "Speed", "GB/s of JSON", " GB/s", kind="msgpack", left=0.37)
+
+grouped_chart("perf_msgpack_ndjson",
+              "NDJSON and MessagePack streams",
+              "GH Archive (886 MB, 304,929 events), on several threads",
+              META_MSGPACK,
+              [("NDJSON to MessagePack",
+                [("fastsimdjson", "64 threads", 15.0, True),
+                 ("fastsimdjson", "32 threads", 10.8, True),
+                 ("fastsimdjson", "8 threads", 6.8, True),
+                 ("fastsimdjson", "one thread", 1.18, True),
+                 ("orjson + ormsgpack", "each document, one thread", 0.29, False)]),
+               ("MessagePack to NDJSON",
+                [("fastsimdjson", "8 threads", 5.0, True),
+                 ("fastsimdjson", "one thread", 1.05, True),
+                 ("msgpack + orjson", "Unpacker, each value, one thread", 0.20, False)])],
+              "Speed", kind="msgpack", left=0.33)
+
