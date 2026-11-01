@@ -30,22 +30,30 @@ FILES = sys.argv[1:] or sorted(glob.glob(os.path.join(DATA, "*.json")))
 COMPACT = {"separators": (",", ":"), "ensure_ascii": False}
 
 
-def best(fn, obj, target=0.02, rounds=11):
+def best(fn, s, target=0.02, rounds=11):
     n = 1
     while True:
         t0 = time.perf_counter()
         for _ in range(n):
-            fn(obj)
-        if time.perf_counter() - t0 > target:
+            json.loads(s)
+        t1 = time.perf_counter()
+        for _ in range(n):
+            fn(json.loads(s))
+        if time.perf_counter() - t1 - (t1 - t0) > target:
             break
         n *= 2
+    a = float("inf")
     b = float("inf")
     for _ in range(rounds):
         t0 = time.perf_counter()
         for _ in range(n):
-            fn(obj)
-        b = min(b, (time.perf_counter() - t0) / n)
-    return b * 1e6
+            json.loads(s)
+        t1 = time.perf_counter()
+        for _ in range(n):
+            fn(json.loads(s))
+        a = min(a, (t1 - t0) / n)
+        b = min(b, (time.perf_counter() - t1) / n)
+    return (b - a) * 1e6
 
 
 def main():
@@ -57,17 +65,18 @@ def main():
     print(f"{'file':36s} " + " ".join(f"{c:>11s}" for c in cols) + "   (us)")
     logs = [0.0] * len(cols)
     for f in FILES:
-        obj = json.loads(open(f, "rb").read())
+        s = open(f, "rb").read()
+        obj = json.loads(s)
         assert fastsimdjson.dumps(obj) == json.dumps(obj)
         if orjson:
             assert fastsimdjson.dumpb(obj) == orjson.dumps(obj)
-        row = [best(json.dumps, obj), best(fastsimdjson.dumps, obj),
-               best(lambda o: json.dumps(o, **COMPACT).encode(), obj),
-               best(fastsimdjson.dumpb, obj)]
+        row = [best(json.dumps, s), best(fastsimdjson.dumps, s),
+               best(lambda o: json.dumps(o, **COMPACT).encode(), s),
+               best(fastsimdjson.dumpb, s)]
         if orjson:
-            row.append(best(orjson.dumps, obj))
+            row.append(best(orjson.dumps, s))
         if msgspec:
-            row.append(best(msgspec.json.encode, obj))
+            row.append(best(msgspec.json.encode, s))
         for i, t in enumerate(row):
             logs[i] += math.log(t)
         print(f"{os.path.basename(f):36s} " + " ".join(f"{t:11.1f}" for t in row))
