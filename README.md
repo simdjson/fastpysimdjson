@@ -398,7 +398,7 @@ calling thread. Views returned by `parse` remain valid.
 ## Build and test
 
 Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
-5.1.0 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.1 (NDJSON to Arrow
+5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.1 (NDJSON to Arrow
 and back: `simdjson_arrow.h` and `simdjson_arrow.cpp`) and simdjson_msgpack
 0.1.1 (JSON to MessagePack and back: `simdjson_msgpack.h` and
 `simdjson_msgpack.cpp`), both under the Apache-2.0 license, are already in
