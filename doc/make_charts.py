@@ -148,10 +148,10 @@ chart("perf_ndjson",
        ("json", "loads on each line", 0.12, False)],
       "Parsing speed", "GB/s", " GB/s")
 
-# NDJSON to Arrow and back: bench_arrow.py, Python 3.13, the result as a
+# NDJSON to Arrow and back: bench_arrow.py, Python 3.14, the result as a
 # pyarrow.Table (reading) or bytes (writing).
-META_ARROW = ("fastsimdjson 0.10.0  ·  pyarrow 26.0  ·  polars 2.1  ·  DuckDB 2.0  ·  "
-              "Python 3.13  ·  Xeon Gold 6548N")
+META_ARROW = ("fastsimdjson 0.10.1  ·  pyarrow 26.0  ·  polars 2.1  ·  DuckDB 2.0  ·  "
+              "Python 3.14  ·  Xeon Gold 6548N")
 
 
 def gbps(v):
@@ -238,10 +238,10 @@ def arrow_write(threads, flat, gh):
                   "Writing speed")
 
 
-arrow_read(1, (0.70, 0.18, 0.27), (1.95, 0.45, 0.53), (0.72, 0.17, 0.08))
-arrow_read(32, (13.9, 5.1, 4.0), (28.4, 12.1, 3.8), (13.3, 4.8, 0.12))
-arrow_write(1, (0.96, 0.46, 0.30), (1.07, 0.47, 0.31))
-arrow_write(32, (7.8, 1.3, 2.8), (4.7, 1.1, 0.79))
+arrow_read(1, (0.75, 0.18, 0.27), (2.08, 0.46, 0.55), (0.77, 0.18, 0.09))
+arrow_read(32, (14.7, 5.3, 4.3), (29.7, 12.3, 4.0), (16.0, 5.0, 0.12))
+arrow_write(1, (0.90, 0.45, 0.30), (1.09, 0.46, 0.31))
+arrow_write(32, (10.3, 1.6, 3.0), (4.5, 1.1, 0.82))
 
 # JSON to MessagePack and back: bench_msgpack.py, bytes in, bytes out, on one
 # core (the others decode, then encode).

@@ -1,22 +1,55 @@
 # fastsimdjson
 
-A Python binding for [simdjson](https://github.com/simdjson/simdjson) that
-parses JSON into native Python objects (`dict`, `list`, `str`, `int`,
-`float`, `bool`, `None`) and serializes them back. It is a drop-in
-replacement for the `json` module's `loads`, `load`, `dumps` and `dump`, and
-it can be over 3 times faster than the standard `json.loads` and
-`json.dumps`. When you only need part of a document, its lazy `parse`
-function is faster still. It also reads streams of documents (NDJSON, JSON
-Lines), on many threads with free-threaded Python, and can extract only the
-fields you need from each document. It writes JSON in two ways: `dumps` returns the same `str` as
-`json.dumps`, and `dumpb` returns the same `bytes` as `orjson.dumps`, as fast
-as orjson; `dumpb_many` writes NDJSON, on many threads with free-threaded
-Python. `loads_arrow` and `dumpb_arrow` convert NDJSON to Apache Arrow
-tables and back, for pyarrow, polars or DuckDB, on many threads with any
-Python. `json_to_msgpack` and `msgpack_to_json` convert JSON to
-[MessagePack](https://msgpack.org/) and back without building Python objects,
-3 to 4 times as fast as orjson with ormsgpack, on many threads with any
-Python.
+Fast JSON for Python, built on [simdjson](https://github.com/simdjson/simdjson),
+the parser that reads JSON at gigabytes per second. fastsimdjson is a drop-in
+replacement for the `json` module (`loads`, `load`, `dumps`, `dump`) that
+gives the same results 3.5 to 4.6 times faster, and it goes further: lazy
+parsing, streams of documents on many threads, Apache Arrow tables and
+MessagePack, in one package with no dependencies.
+
+## How it compares
+
+On every task we measured, fastsimdjson matches or beats the fastest Python
+library we know for that task, often by a factor of two to four. Python 3.14,
+one core of an Intel Xeon Gold 6548N (Emerald Rapids) unless stated;
+MessagePack on an Intel Xeon Gold 6338 (Ice Lake):
+
+| task | fastsimdjson | alternative | speedup |
+|---|---|---|---:|
+| JSON to Python objects | `loads`: 0.78 GB/s | orjson: 0.60 GB/s | 1.3× |
+| a few fields of a document | `parse`: 158 µs | msgspec (typed `Struct`): 336 µs; orjson: 1009 µs | 2.1× and 6.4× |
+| Python objects to JSON `str` | `dumps` | `json.dumps`, same `str` | 4.6× |
+| Python objects to JSON `bytes` | `dumpb` | `orjson.dumps`, same bytes | on par (1.04×) |
+| NDJSON to Python objects | `loads_many`: 0.38 GB/s | msgspec: 0.37 GB/s | on par (1.03×) |
+| NDJSON to Arrow, one thread | `loads_arrow`: 0.75 and 2.1 GB/s | polars: 0.27 and 0.55 GB/s | 2.8× and 3.8× |
+| NDJSON to Arrow, 32 threads | `loads_arrow`: 14.7 and 29.7 GB/s | pyarrow: 5.3 and 12.3 GB/s | 2.8× and 2.4× |
+| Arrow to NDJSON, one thread | `dumpb_arrow`: 0.90 and 1.09 GB/s | polars: 0.45 and 0.46 GB/s | 2.0× and 2.4× |
+| JSON to MessagePack | `json_to_msgpack`: 1.37 GB/s | orjson with ormsgpack: 0.35 GB/s | 3.9× |
+| MessagePack to JSON | `msgpack_to_json`: 0.94 GB/s | ormsgpack with orjson: 0.27 GB/s | 3.5× |
+
+Against the standard `json` module, `loads` is 3.5 times faster and `parse`
+25 times faster. The Arrow rows give flat records, then GH Archive events.
+The files, the versions and the scripts are under [Benchmarks](#benchmarks).
+
+* **Same results.** `loads` returns what `json.loads` returns, `dumps` the
+  same `str` as `json.dumps`, character for character, and `dumpb` the same
+  bytes as `orjson.dumps`. Switching changes the speed, not the output.
+* **Only what you need.** `parse` gives lazy views and builds only the
+  values you read; `fields=` extracts only some fields from each document of
+  a stream.
+* **Many threads.** On free-threaded Python, streams of documents (NDJSON,
+  JSON Lines) are read and written on many threads: up to 28 GB/s on 64
+  cores. Arrow and MessagePack conversions release the GIL and use many
+  threads on any Python.
+* **Arrow without pyarrow.** `loads_arrow` and `dumpb_arrow` convert NDJSON
+  to Arrow tables and back, for pyarrow, polars or DuckDB, without a copy.
+* **MessagePack without Python objects.** `json_to_msgpack` and
+  `msgpack_to_json` convert directly, without building Python objects.
+* **Everywhere.** No dependencies; wheels for Linux (x64 and ARM), macOS
+  (Intel and Apple silicon) and Windows, Python 3.10 to 3.15, including
+  free-threaded Python.
+
+## Installation
 
 With pip:
 
@@ -398,7 +431,7 @@ calling thread. Views returned by `parse` remain valid.
 ## Build and test
 
 Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
-5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.1 (NDJSON to Arrow
+5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.3 (NDJSON to Arrow
 and back: `simdjson_arrow.h` and `simdjson_arrow.cpp`) and simdjson_msgpack
 0.1.1 (JSON to MessagePack and back: `simdjson_msgpack.h` and
 `simdjson_msgpack.cpp`), both under the Apache-2.0 license, are already in
@@ -635,52 +668,52 @@ structs; the rest of each event is skipped), or inferring the schema. Reading
 gives a `pyarrow.Table` (`pyarrow.table(fastsimdjson.loads_arrow(data,
 schema, threads=N))`); the time includes the import into pyarrow. Writing
 starts from that table: fastsimdjson `dumpb_arrow`, polars `write_ndjson` and
-DuckDB `COPY ... TO` (on tmpfs). Python 3.13, pyarrow 26.0, polars 2.1, DuckDB
-2.0, simdjson 5.1.0, Intel Xeon Gold 6548N (up to 32 threads on the 32 cores
-of one socket; 64 threads on both sockets).
+DuckDB `COPY ... TO` (on tmpfs). Python 3.14, pyarrow 26.0, polars 2.1, DuckDB
+2.0, fastsimdjson 0.10.1 (the manylinux wheel), Intel Xeon Gold 6548N (up to
+32 threads on the 32 cores of one socket; 64 threads on both sockets).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_read_1_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_read_1.png" width="80%" alt="Reading NDJSON into a pyarrow.Table on one thread: flat, fastsimdjson 0.70 GB/s, pyarrow 0.18, polars 0.27; GH Archive, fastsimdjson 1.95, pyarrow 0.45, polars 0.53; flat with an inferred schema, fastsimdjson 0.72, pyarrow 0.17, polars 0.08">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_read_1.png" width="80%" alt="Reading NDJSON into a pyarrow.Table on one thread: flat, fastsimdjson 0.75 GB/s, pyarrow 0.18, polars 0.27; GH Archive, fastsimdjson 2.08, pyarrow 0.46, polars 0.55; flat with an inferred schema, fastsimdjson 0.77, pyarrow 0.18, polars 0.09">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_read_32_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_read_32.png" width="80%" alt="Reading NDJSON into a pyarrow.Table on 32 threads: flat, fastsimdjson 13.9 GB/s, pyarrow 5.1, polars 4.0; GH Archive, fastsimdjson 28.4, pyarrow 12.1, polars 3.8; flat with an inferred schema, fastsimdjson 13.3, pyarrow 4.8, polars 0.12">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_read_32.png" width="80%" alt="Reading NDJSON into a pyarrow.Table on 32 threads: flat, fastsimdjson 14.7 GB/s, pyarrow 5.3, polars 4.3; GH Archive, fastsimdjson 29.7, pyarrow 12.3, polars 4.0; flat with an inferred schema, fastsimdjson 16.0, pyarrow 5.0, polars 0.12">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_write_1_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_write_1.png" width="80%" alt="Writing a pyarrow.Table as NDJSON on one thread: flat, fastsimdjson 0.96 GB/s, polars 0.46, DuckDB 0.30; GH Archive, fastsimdjson 1.07, polars 0.47, DuckDB 0.31">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_write_1.png" width="80%" alt="Writing a pyarrow.Table as NDJSON on one thread: flat, fastsimdjson 0.90 GB/s, polars 0.45, DuckDB 0.30; GH Archive, fastsimdjson 1.09, polars 0.46, DuckDB 0.31">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_write_32_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_write_32.png" width="80%" alt="Writing a pyarrow.Table as NDJSON on 32 threads: flat, fastsimdjson 7.8 GB/s, polars 1.3, DuckDB 2.8; GH Archive, fastsimdjson 4.7, polars 1.1, DuckDB 0.79">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_arrow_write_32.png" width="80%" alt="Writing a pyarrow.Table as NDJSON on 32 threads: flat, fastsimdjson 10.3 GB/s, polars 1.6, DuckDB 3.0; GH Archive, fastsimdjson 4.5, polars 1.1, DuckDB 0.82">
 </picture>
 
 All the numbers, in GB/s:
 
 | | threads | 1 | 8 | 32 | 64 |
 |---|---|---:|---:|---:|---:|
-| flat, read | fastsimdjson `loads_arrow` | **0.70** | **5.3** | **13.9** | **16.2** |
-| | pyarrow `read_json` | 0.18 | 1.4 | 5.1 | 7.7 |
-| | polars `read_ndjson` | 0.27 | 2.0 | 4.0 | 2.8 |
-| flat, read, inferring the schema | fastsimdjson `loads_arrow` | **0.72** | **5.2** | **13.3** | **12.7** |
-| | pyarrow `read_json` | 0.17 | 1.3 | 4.8 | 6.6 |
-| | polars `read_ndjson` | 0.08 | 0.12 | 0.12 | 0.12 |
-| GH Archive, read | fastsimdjson `loads_arrow` | **1.95** | **12.9** | **28.4** | **25.3** |
-| | pyarrow `read_json` | 0.45 | 3.5 | 12.1 | 15.4 |
-| | polars `read_ndjson` | 0.53 | 3.9 | 3.8 | 3.0 |
-| flat, write | fastsimdjson `dumpb_arrow` | **0.96** | **3.9** | **7.8** | **12.6** |
-| | polars | 0.46 | 1.1 | 1.3 | 1.6 |
-| | DuckDB | 0.30 | 1.8 | 2.8 | 2.3 |
-| GH Archive, write | fastsimdjson `dumpb_arrow` | **1.07** | **2.9** | **4.7** | **4.5** |
-| | polars | 0.47 | 0.78 | 1.1 | 0.91 |
-| | DuckDB | 0.31 | 0.95 | 0.79 | 0.66 |
+| flat, read | fastsimdjson `loads_arrow` | **0.75** | **5.6** | **14.7** | **17.9** |
+| | pyarrow `read_json` | 0.18 | 1.4 | 5.3 | 7.9 |
+| | polars `read_ndjson` | 0.27 | 2.0 | 4.3 | 3.2 |
+| flat, read, inferring the schema | fastsimdjson `loads_arrow` | **0.77** | **5.7** | **16.0** | **16.9** |
+| | pyarrow `read_json` | 0.18 | 1.4 | 5.0 | 6.7 |
+| | polars `read_ndjson` | 0.09 | 0.12 | 0.12 | 0.12 |
+| GH Archive, read | fastsimdjson `loads_arrow` | **2.08** | **13.8** | **29.7** | **25.8** |
+| | pyarrow `read_json` | 0.46 | 3.5 | 12.3 | 16.0 |
+| | polars `read_ndjson` | 0.55 | 3.7 | 4.0 | 3.2 |
+| flat, write | fastsimdjson `dumpb_arrow` | **0.90** | **3.6** | **10.3** | **13.8** |
+| | polars | 0.45 | 1.5 | 1.6 | 1.5 |
+| | DuckDB | 0.30 | 2.0 | 3.0 | 2.4 |
+| GH Archive, write | fastsimdjson `dumpb_arrow` | **1.09** | **3.1** | **4.5** | **4.5** |
+| | polars | 0.46 | 1.1 | 1.1 | 0.99 |
+| | DuckDB | 0.31 | 1.7 | 0.82 | 0.83 |
 
-`load_arrow_file` on the same files, from the page cache, reads at 0.67 and
-1.6 GB/s on one thread, 9.8 and 14.8 GB/s on 32 threads. The benchmark is
+`load_arrow_file` on the same files, from the page cache, reads at 0.68 and
+1.5 GB/s on one thread, 9.0 and 13.6 GB/s on 32 threads. The benchmark is
 `THREADS=N python bench_arrow.py flat.ndjson:flat gharchive.ndjson:gh
 flat.ndjson:infer`; `path:infer` times any NDJSON file without a schema. The
 flat file comes from
