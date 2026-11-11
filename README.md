@@ -9,27 +9,16 @@ MessagePack, in one package with no dependencies.
 
 ## How it compares
 
-On every task we measured, fastsimdjson matches or beats the fastest Python
-library we know for that task, often by a factor of two to four. Python 3.14,
-one core of an Intel Xeon Gold 6548N (Emerald Rapids) unless stated;
-MessagePack on an Intel Xeon Gold 6338 (Ice Lake):
+fastsimdjson is often two to four times faster than the alternatives:
 
-| task | fastsimdjson | alternative | speedup |
-|---|---|---|---:|
-| JSON to Python objects | `loads`: 0.78 GB/s | orjson: 0.60 GB/s | 1.3× |
-| a few fields of a document | `parse`: 158 µs | msgspec (typed `Struct`): 336 µs; orjson: 1009 µs | 2.1× and 6.4× |
-| Python objects to JSON `str` | `dumps` | `json.dumps`, same `str` | 4.6× |
-| Python objects to JSON `bytes` | `dumpb` | `orjson.dumps`, same bytes | on par (1.04×) |
-| NDJSON to Python objects | `loads_many`: 0.38 GB/s | msgspec: 0.37 GB/s | on par (1.03×) |
-| NDJSON to Arrow, one thread | `loads_arrow`: 0.75 and 2.1 GB/s | polars: 0.27 and 0.55 GB/s | 2.8× and 3.8× |
-| NDJSON to Arrow, 32 threads | `loads_arrow`: 14.7 and 29.7 GB/s | pyarrow: 5.3 and 12.3 GB/s | 2.8× and 2.4× |
-| Arrow to NDJSON, one thread | `dumpb_arrow`: 0.90 and 1.09 GB/s | polars: 0.45 and 0.46 GB/s | 2.0× and 2.4× |
-| JSON to MessagePack | `json_to_msgpack`: 1.37 GB/s | orjson with ormsgpack: 0.35 GB/s | 3.9× |
-| MessagePack to JSON | `msgpack_to_json`: 0.94 GB/s | ormsgpack with orjson: 0.27 GB/s | 3.5× |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_summary_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_summary.png" width="80%" alt="fastsimdjson against the competition, speed on one core relative to a fast alternative: Python objects to JSON str, 4.6 times json.dumps; JSON to MessagePack, 3.9 times orjson with ormsgpack; NDJSON to Arrow, 3.8 times polars; MessagePack to JSON, 3.5 times ormsgpack with orjson; Arrow to NDJSON, 2.4 times polars; a few fields of a document, 2.1 times msgspec; JSON to Python objects, 1.3 times orjson">
+</picture>
 
 Against the standard `json` module, `loads` is 3.5 times faster and `parse`
-25 times faster. The Arrow rows give flat records, then GH Archive events.
-The files, the versions and the scripts are under [Benchmarks](#benchmarks).
+25 times faster. The files, the versions and the scripts are under
+[Benchmarks](#benchmarks).
 
 * **Same results.** `loads` returns what `json.loads` returns, `dumps` the
   same `str` as `json.dumps`, character for character, and `dumpb` the same
@@ -40,7 +29,8 @@ The files, the versions and the scripts are under [Benchmarks](#benchmarks).
 * **Many threads.** On free-threaded Python, streams of documents (NDJSON,
   JSON Lines) are read and written on many threads: up to 28 GB/s on 64
   cores. Arrow and MessagePack conversions release the GIL and use many
-  threads on any Python.
+  threads on any Python: on 32 cores, `loads_arrow` reads NDJSON into Arrow
+  at up to 29.7 GB/s, 2.4 to 2.8 times as fast as pyarrow.
 * **Arrow without pyarrow.** `loads_arrow` and `dumpb_arrow` convert NDJSON
   to Arrow tables and back, for pyarrow, polars or DuckDB, without a copy.
 * **MessagePack without Python objects.** `json_to_msgpack` and

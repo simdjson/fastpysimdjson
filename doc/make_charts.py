@@ -288,3 +288,63 @@ grouped_chart("perf_msgpack_ndjson",
                  ("msgpack + orjson", "Unpacker, each value, one thread", 0.20, False)])],
               "Speed", kind="msgpack", left=0.33)
 
+
+
+def summary_chart(name, title, subtitle, meta, rows, kind="summary", left=0.33):
+    """rows: (task, call, speedup, alternative) from top to bottom; the alternative is 1x."""
+    if ONLY is not None and kind != ONLY:
+        return
+    font = pick_font()
+    n = len(rows)
+    top = 1.45
+    pitch = 0.78  # inches per task
+    height = top + pitch * n + 0.95
+    vmax = max(r[2] for r in rows)
+    for theme, c in THEMES.items():
+        plt.rcParams["font.family"] = font
+        fig = plt.figure(figsize=(10, height), dpi=200, facecolor=c["bg"])
+        right = 0.955
+        ax = fig.add_axes([left, 0.9 / height, right - left, (pitch * n) / height], facecolor=c["bg"])
+        for y, (task, call, speedup, alternative) in zip(list(range(n))[::-1], rows):
+            ax.barh(y + 0.19, speedup, height=0.34, color=c["ours"], zorder=3)
+            ax.barh(y - 0.19, 1, height=0.34, color=c["bar"], zorder=3)
+            ax.text(speedup + vmax * 0.012, y + 0.19, f"{speedup:g}×", va="center", ha="left",
+                    fontsize=15, fontweight="bold", color=c["value_ours"], zorder=4)
+            ax.text(1 + vmax * 0.012, y - 0.19, alternative, va="center", ha="left",
+                    fontsize=12, color=c["value"], zorder=4)
+            ax.text(-vmax * 0.022, y + 0.13, task, va="center", ha="right", fontsize=14.5,
+                    color=c["text"], clip_on=False)
+            ax.text(-vmax * 0.022, y - 0.24, call, va="center", ha="right", fontsize=11.5,
+                    color=c["meta"], clip_on=False)
+        ax.set_xlim(0, vmax * 1.12)
+        ax.set_ylim(-0.6, n - 0.4)
+        ax.set_yticks([])
+        ax.set_xticks(range(0, int(vmax) + 1))
+        ax.tick_params(axis="x", colors=c["meta"], labelsize=12, length=0, pad=8)
+        ax.grid(axis="x", color=c["grid"], linewidth=1, zorder=0)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color(c["axis"])
+        ax.set_xlabel("Speed relative to the alternative (higher is better)",
+                      color=c["sub"], fontsize=13, labelpad=10)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:g}×"))
+        fig.text(0.04, 1 - 0.42 / height, title, fontsize=25, color=c["text"], va="center")
+        fig.text(0.04, 1 - 0.85 / height, subtitle, fontsize=14, color=c["sub"], va="center")
+        fig.text(0.04, 1 - 1.15 / height, meta, fontsize=12.5, color=c["meta"], va="center")
+        suffix = "" if theme == "light" else "_dark"
+        fig.savefig(os.path.join(HERE, f"{name}{suffix}.png"), facecolor=c["bg"])
+        plt.close(fig)
+
+
+# The README's summary: each task against a fast alternative (1x), one core.
+summary_chart("perf_summary",
+              "fastsimdjson against the competition",
+              "speed on one core, relative to a fast Python alternative for each task (1×)",
+              "Python 3.14  ·  Intel Xeon Gold 6548N (MessagePack: Xeon Gold 6338)",
+              [("Python objects to JSON str", "dumps, same str as json.dumps", 4.6, "json.dumps"),
+               ("JSON to MessagePack", "json_to_msgpack", 3.9, "orjson + ormsgpack"),
+               ("NDJSON to Arrow", "loads_arrow, GH Archive", 3.8, "polars"),
+               ("MessagePack to JSON", "msgpack_to_json", 3.5, "ormsgpack + orjson"),
+               ("Arrow to NDJSON", "dumpb_arrow, GH Archive", 2.4, "polars"),
+               ("A few fields of a document", "parse (lazy)", 2.1, "msgspec, typed Struct"),
+               ("JSON to Python objects", "loads", 1.3, "orjson")])
