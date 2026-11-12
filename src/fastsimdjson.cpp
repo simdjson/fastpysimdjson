@@ -5535,15 +5535,16 @@ PyObject *minify(PyObject *, PyObject *arg) {
     if (buf == nullptr) {
       return nullptr;
     }
-  } else if (PyByteArray_Check(arg)) {
-    copy = PyBytes_FromStringAndSize(PyByteArray_AS_STRING(arg), PyByteArray_GET_SIZE(arg));
-  } else if (PyMemoryView_Check(arg)) {
-    Py_buffer *view = PyMemoryView_GET_BUFFER(arg);
-    if (!PyBuffer_IsContiguous(view, 'C')) {
+  } else if (PyByteArray_Check(arg) || PyMemoryView_Check(arg)) {
+    copy = PyBytes_FromObject(arg);
+    if (copy == nullptr) {
+      return nullptr;
+    }
+    if (PyMemoryView_Check(arg) && !PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(arg), 'C')) {
+      Py_DECREF(copy);
       PyErr_SetString(PyExc_TypeError, "memoryview must be contiguous");
       return nullptr;
     }
-    copy = PyBytes_FromStringAndSize(static_cast<const char *>(view->buf), view->len);
   } else {
     PyErr_Format(PyExc_TypeError,
                  "Input must be bytes, bytearray, memoryview, or str, not %.200s",
@@ -5553,8 +5554,6 @@ PyObject *minify(PyObject *, PyObject *arg) {
   if (copy != nullptr) {
     buf = PyBytes_AS_STRING(copy);
     len = PyBytes_GET_SIZE(copy);
-  } else if (buf == nullptr) {
-    return nullptr;
   }
   PyObject *out = PyBytes_FromStringAndSize(nullptr, len);
   if (out == nullptr) {
@@ -5573,12 +5572,6 @@ PyObject *minify(PyObject *, PyObject *arg) {
     return nullptr;
   }
   Py_XDECREF(copy);
-  // The minifier writes at most one output byte per input byte.
-  if (dst_len > size_t(len)) {
-    Py_DECREF(out);
-    PyErr_SetString(PyExc_SystemError, "minify wrote past the input length");
-    return nullptr;
-  }
   if (dst_len != size_t(len) && _PyBytes_Resize(&out, Py_ssize_t(dst_len)) < 0) {
     return nullptr;
   }

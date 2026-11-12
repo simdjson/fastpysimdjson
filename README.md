@@ -665,6 +665,11 @@ serialize it again, which also validates it and rewrites numbers. Geometric
 mean over the 22 files, one core of an Intel Xeon Gold 6548N, Python 3.14.10,
 GCC 16.2, orjson 3.13.0 (`bench_minify.py`):
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_minify_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_minify.png" width="80%" alt="Minifying JSON in Python: fastsimdjson minify 18.49 GB/s, fastsimdjson dumpb(loads(s)) 0.53, orjson dumps(loads(s)) 0.44, json dumps(loads(s)) 0.11">
+</picture>
+
 | method | GB/s |
 |---|---:|
 | **fastsimdjson `minify`** | **18.49** |

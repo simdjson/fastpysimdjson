@@ -133,6 +133,13 @@ def test_input_types():
         fastsimdjson.minify(memoryview(bytearray(doc))[::2])
 
 
+def test_released_memoryview():
+    view = memoryview(bytearray(b"[ 1 , 2 ]" * 1000))
+    view.release()
+    with pytest.raises(ValueError):
+        fastsimdjson.minify(view)
+
+
 @pytest.mark.parametrize(
     "doc",
     [b'"', b'"abc', b'{"a": "hi', b'   "unterminated', b'"foo\\"', b'"abc\\', b'[ "ok", "'],
