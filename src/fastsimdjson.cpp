@@ -3896,18 +3896,26 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
 }
 
 // ---------------------------------------------------------------------------
-// Streams over several threads (threads=N): the input is cut into chunks at
-// document boundaries (after a newline; before a record separator for
-// json_seq), and threads take the chunks in turn, each building the
-// documents of its chunk (and calling fn on them, for map_many). Without
-// the GIL (free-threaded Python), the threads run in parallel; with it, the
-// calling thread does all the work.
+// Streams over several threads (threads=N). The workers share one counter.
+// Each claims the next kSlice bytes with fetch_add and snaps both ends
+// forward to a delimiter that cannot occur inside a document: just after a
+// line feed, or just before a record separator (json_seq). The slices are
+// adjacent and do not overlap, so concatenating them in index order is the
+// input order. A claim that falls inside a document longer than the slice
+// snaps to an empty range; that document belongs to the preceding slice and
+// is parsed once. Each worker has its own parser (threaded off: the
+// parallelism is across slices) and its own list.
 //
-// The result is that of one thread: at the first chunk where anything other
+// Without the GIL (free-threaded Python), the workers run at the same time.
+// With it, the calling thread does all the work.
+//
+// The result is that of one thread: at the first slice where anything other
 // than plain documents shows up (an error, a document that only json
 // accepts), the documents before it are kept and the calling thread goes on
 // from there as a stream without threads would. (fn may then have been
-// called on documents after that point, in other threads.)
+// called on documents after that point, in other threads.) A raw line feed
+// inside a whitespace-delimited document is such a case: the slice stops and
+// the calling thread finishes the document.
 // ---------------------------------------------------------------------------
 
 // A stream over [from, to) of the input of `whole`, sharing its buffer. A
@@ -3974,9 +3982,14 @@ struct PoolTask {
 };
 
 struct ParallelRun : PoolTask {
+  // 256 KiB. Past this, slices run out and a long record keeps one worker
+  // busy while the others have nothing left to claim.
+  static constexpr size_t kSlice = 256 << 10;
+
   StreamObject *whole;
   PyObject *fn; // borrowed, or nullptr
-  std::vector<size_t> bounds; // chunk i is [bounds[i], bounds[i + 1])
+  char delimiter = '\n';
+  bool snap_after = true; // false: the next slice starts on the delimiter
   struct Chunk {
     PyObject *items = nullptr; // list of the chunk's results
     bool failed = false;       // stopped before the end of the chunk
@@ -3987,6 +4000,33 @@ struct ParallelRun : PoolTask {
   std::atomic<size_t> next{0};
   std::atomic<size_t> first_failure{SIZE_MAX};
 
+  struct Range {
+    size_t begin;
+    size_t end;
+  };
+
+  // Slice i is [snap(i * kSlice), snap((i + 1) * kSlice)), and [0, snap(kSlice))
+  // for the first. snap moves forward to the delimiter: just past it, or onto
+  // it when the next slice must start there.
+  Range slice_bounds(size_t index) const {
+    const char *data = whole->buf;
+    const size_t size = whole->len;
+    const size_t raw = index * kSlice;
+    auto snap = [&](size_t want) -> size_t {
+      if (want >= size) {
+        return size;
+      }
+      const void *hit = memchr(data + want, delimiter, size - want);
+      if (hit == nullptr) {
+        return size;
+      }
+      size_t at = size_t(static_cast<const char *>(hit) - data);
+      return snap_after ? at + 1 : at;
+    };
+    size_t want_end = raw > SIZE_MAX - kSlice ? size : raw + kSlice;
+    return {raw == 0 ? 0 : snap(raw), snap(want_end)};
+  }
+
   void note_failure(size_t i) {
     size_t f = first_failure.load();
     while (i < f && !first_failure.compare_exchange_weak(f, i)) {
@@ -3996,8 +4036,12 @@ struct ParallelRun : PoolTask {
   // On an attached thread.
   void run_chunk(size_t i) {
     Chunk &c = chunks[i];
-    c.resume_at = bounds[i];
-    StreamObject *st = stream_over(whole, bounds[i], bounds[i + 1], true);
+    Range range = slice_bounds(i);
+    c.resume_at = range.begin;
+    if (range.begin >= range.end) {
+      return; // inside a document longer than the slice: parsed with the previous one
+    }
+    StreamObject *st = stream_over(whole, range.begin, range.end, true);
     c.items = st ? PyList_New(0) : nullptr;
     if (c.items == nullptr) {
       PyErr_Clear(); // the one-thread run will report it
@@ -4231,27 +4275,6 @@ void pool_after_fork() {
 #endif
 #endif
 
-// Chunk boundaries: about `n` chunks, each ending just after a newline (or
-// just before a record separator, for json_seq).
-std::vector<size_t> chunk_bounds(const StreamObject *w, size_t n) {
-  std::vector<size_t> b{0};
-  size_t step = std::max<size_t>(w->len / std::max<size_t>(n, 1), 1 << 16);
-  bool seq = w->format == simdjson::stream_format::json_sequence;
-  for (size_t at = step; at < w->len; at = b.back() + step) {
-    const void *hit = memchr(w->buf + at, seq ? '\x1e' : '\n', w->len - at);
-    if (hit == nullptr) {
-      break;
-    }
-    size_t cut = size_t(static_cast<const char *>(hit) - w->buf) + (seq ? 0 : 1);
-    if (cut >= w->len) {
-      break;
-    }
-    b.push_back(cut);
-  }
-  b.push_back(w->len);
-  return b;
-}
-
 // All the results (documents, or fn of each) of the stream `whole`, as a
 // list, using up to `threads` threads.
 PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
@@ -4265,8 +4288,13 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     ParallelRun run;
     run.whole = whole;
     run.fn = fn;
-    run.bounds = chunk_bounds(whole, threads * 8);
-    run.chunks.resize(run.bounds.size() - 1);
+    // json_seq snaps onto the record separator so the next slice starts with
+    // it. Stage 1 finds a scalar value from that separator; a slice that
+    // started after it would drop the separator and mis-parse the scalar.
+    bool seq = whole->format == simdjson::stream_format::json_sequence;
+    run.delimiter = seq ? '\x1e' : '\n';
+    run.snap_after = !seq;
+    run.chunks.resize((whole->len - 1) / ParallelRun::kSlice + 1);
     // Starting a thread costs about as much as building 512 KB of documents.
     size_t nthreads = std::min({threads, run.chunks.size(), std::max<size_t>(whole->len >> 19, 1)});
     run_on_pool(&run, nthreads);

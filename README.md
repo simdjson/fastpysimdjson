@@ -237,9 +237,11 @@ documents instead of an iterator. `map_many(fn, data, **kw)` returns
 `[fn(doc) for doc in loads_many(data, **kw)]` (`parse_many` with
 `lazy=True`), with `fn` called in the threads. `threads=0` (or `None`) uses
 one thread per processor; small inputs use fewer threads (about one per
-512 KB). The input is cut into chunks at newlines (before each `\x1e` for
-`json_seq`), so `threads` works with the formats `"whitespace"`, `"lines"`
-and `"json_seq"`.
+512 KB). The workers share one counter. Each claims the next 256 KB and
+moves both ends forward to a newline (to the next `\x1e` for `json_seq`);
+the pieces are adjacent. On `lines` and `json_seq` a document is never cut,
+and one longer than 256 KB is parsed with the piece that started before it.
+`threads` works with the formats `"whitespace"`, `"lines"` and `"json_seq"`.
 
 The results, and the exceptions, are those of one thread: when a chunk
 contains an error or a document that only `json` accepts, the documents

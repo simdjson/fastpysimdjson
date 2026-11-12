@@ -269,6 +269,34 @@ def test_threads_match_one_thread(fmt, seed):
     assert mapped == (_outcome(lambda: [json.dumps(d) for d in expected[1]]) if expected[0] == "ok" else expected)
 
 
+def _framed(parts, fmt):
+    sep = b"\n\x1e" if fmt == "json_seq" else b"\n"
+    data = sep.join(parts)
+    return b"\x1e" + data if fmt == "json_seq" else data
+
+
+@pytest.mark.parametrize("fmt", ["whitespace", "lines", "json_seq"])
+def test_threads_long_record(fmt):
+    # A record longer than the 256 KB slice falls across several claims. Those
+    # claims are empty and the record is parsed once, with the claim that
+    # started before it. An error after it is reported at the same place as
+    # one thread, which is the resume point.
+    small = [json.dumps({"i": i, "s": "x" * (i % 40)}).encode() for i in range(80)]
+    huge = json.dumps({"i": -1, "s": "z" * (1500 * 1024)}).encode()
+    tail = [json.dumps({"i": 10000 + i}).encode() for i in range(80)]
+    data = _framed(small + [huge] + tail + [huge] + small, fmt)
+    expected = list(fastsimdjson.loads_many(data, format=fmt))
+    for threads in (2, 4, 7):
+        assert fastsimdjson.loads_many(data, format=fmt, threads=threads) == expected
+        assert fastsimdjson.loads_many(data, format=fmt, threads=threads,
+                                       batch_size=4096) == expected
+        assert fastsimdjson.loads_many(data, format=fmt, threads=threads,
+                                       fields="/i") == [d["i"] for d in expected]
+    broken = _framed(small + [huge] + [b'{"broken": [1'] + tail, fmt)
+    assert _outcome(lambda: fastsimdjson.loads_many(broken, format=fmt, threads=4)) == \
+        _outcome(lambda: list(fastsimdjson.loads_many(broken, format=fmt)))
+
+
 def test_threads_api():
     data = b"\n".join(b'{"n": %d}' % i for i in range(30000))
     docs = fastsimdjson.loads_many(data, threads=4)
