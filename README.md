@@ -315,7 +315,7 @@ once the batches are taken). fastsimdjson does not depend on pyarrow.
 
 * The schema is a `pyarrow.Schema` (or any object with `__arrow_c_schema__`)
   whose fields are booleans, 64-bit integers, unsigned 64-bit integers,
-  doubles, strings, structs and lists of these, or null. A field absent from a
+  doubles, strings, timestamps, structs and lists of these, or null. A field absent from a
   record is null; a key absent from the schema is skipped, or an error with
   `error_on_unknown_fields=True`. Skipped values are checked to be valid
   JSON, unless `validate_skipped=False` (then only their structure is).
@@ -326,6 +326,17 @@ once the batches are taken). fastsimdjson does not depend on pyarrow.
   type of its other values and integers become doubles next to other
   numbers; other mixes of types raise `ValueError`. Strings stay strings (no
   timestamps).
+* A timestamp field (`pa.timestamp("us", tz="UTC")`, any unit, with or
+  without a time zone) reads ISO 8601 strings, such as the `created_at` of
+  GH Archive events (`"2015-01-01T15:00:00Z"`): a date, then optionally a
+  time (`T` or a space, then `15`, `15:00`, `15:00:00` or
+  `15:00:00.123456`), then optionally `Z` or an offset (`+05:00`). A time
+  without `Z` or an offset is UTC. An integer is a count of units since 1970.
+  As with `pyarrow.json.read_json` (which returns the same table), a fraction
+  with more digits than the unit raises `ValueError`, as does an invalid
+  date. Reading the timestamps costs next to nothing: GH Archive with
+  `created_at` as `timestamp[us, UTC]` reads at 2.11 GB/s on one core, as
+  with strings, against 0.45 GB/s for pyarrow and 0.21 GB/s for polars.
 * A new batch starts every `block_size` bytes of input. With `threads=N`
   (`threads=0` or `None`: one per processor), N threads read blocks of
   `block_size` bytes, cut at line ends: a record must then fit on one line.
@@ -339,8 +350,11 @@ NDJSON `bytes`, one object per row: a `pyarrow.Table`, `RecordBatch`,
 relation, an `ArrowStream`, or any object with `__arrow_c_stream__` or
 `__arrow_c_array__`. It writes integers of 8 to 64 bits, floats and doubles
 (as `dumpb` writes them, NaN and infinities as `null`), booleans, strings
-(including large strings and string views), structs and lists (including
-large and fixed-size lists); other types raise `ValueError`. With
+(including large strings and string views), timestamps (ISO 8601 in UTC,
+`"2015-01-01T15:00:00.250000Z"`, with `Z` when the timestamp has a time zone
+and the fraction when it is not zero), dates (`"2015-01-01"`), structs and
+lists (including large and fixed-size lists); other types raise
+`ValueError`. With
 `write_nulls=False`, null fields are omitted. With `threads=N`, N threads
 write ranges of rows into the result. The output reads back with
 `loads_arrow`, and with `loads_many(data, format="lines")`.
@@ -421,7 +435,7 @@ calling thread. Views returned by `parse` remain valid.
 ## Build and test
 
 Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
-5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.4 (NDJSON to Arrow
+5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.5 (NDJSON to Arrow
 and back: `simdjson_arrow.h` and `simdjson_arrow.cpp`) and simdjson_msgpack
 0.1.1 (JSON to MessagePack and back: `simdjson_msgpack.h` and
 `simdjson_msgpack.cpp`), both under the Apache-2.0 license, are already in
