@@ -2,8 +2,8 @@
 
 The numbers are those of the README's benchmark section. Run from the
 repository root: python doc/make_charts.py (needs matplotlib), or
-python doc/make_charts.py arrow (msgpack) for the Arrow (MessagePack) charts
-only.
+python doc/make_charts.py arrow (msgpack, typed) for the Arrow (MessagePack,
+typed decoding) charts only.
 """
 import os
 import sys
@@ -348,3 +348,26 @@ summary_chart("perf_summary",
                ("Arrow to NDJSON", "dumpb_arrow, GH Archive", 2.4, "polars"),
                ("A few fields of a document", "parse (lazy)", 2.1, "msgspec, typed Struct"),
                ("JSON to Python objects", "loads", 1.3, "orjson")])
+
+
+META_TYPED = ("fastsimdjson 0.10.3+  ·  msgspec 0.22  ·  pydantic 2.14  ·  cattrs 26.2  ·  "
+              "Python 3.14  ·  Xeon Gold 6548N")
+
+
+def typed_rows(ours, struct, dataclass, pydantic, cattrs, call="loads(data, type=T)"):
+    return [("fastsimdjson", call, ours, True),
+            ("msgspec", "Decoder(T), msgspec.Struct", struct, False),
+            ("msgspec", "Decoder(T), the same dataclasses", dataclass, False),
+            ("pydantic", "TypeAdapter(T).validate_json", pydantic, False),
+            ("orjson + cattrs", "structure(orjson.loads(data), T)", cattrs, False)]
+
+
+grouped_chart("perf_typed",
+              "JSON to dataclasses",
+              "typed decoding, with the types checked, on one core",
+              META_TYPED,
+              [("twitter.json, a few fields", typed_rows(2.65, 1.54, 1.42, 0.68, 0.56)),
+               ("citm_catalog.json, typed in full", typed_rows(1.03, 0.64, 0.47, 0.19, 0.19)),
+               ("GH Archive NDJSON, 6 fields", typed_rows(1.93, 1.30, 1.16, 0.51, 0.43,
+                                                                 "loads_many(data, type=T)"))],
+              "Speed", kind="typed", left=0.36)

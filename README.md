@@ -118,6 +118,11 @@ on the way. It builds dataclasses straight from the simdjson tape, without
 an intermediate dict, and is 1.5 to 2.2 times as fast as msgspec on one core
 (see [Typed decoding](#typed-decoding)).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed.png" width="80%" alt="JSON to dataclasses on one core, GB/s. twitter.json, a few fields: fastsimdjson 2.65, msgspec Struct 1.54, msgspec dataclasses 1.42, pydantic 0.68, orjson with cattrs 0.56. citm_catalog.json typed in full: fastsimdjson 1.03, msgspec Struct 0.64, msgspec dataclasses 0.47, pydantic 0.19, orjson with cattrs 0.19. GH Archive NDJSON, 6 fields: fastsimdjson 1.93, msgspec Struct 1.30, msgspec dataclasses 1.16, pydantic 0.51, orjson with cattrs 0.43">
+</picture>
+
 ```python
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -680,6 +685,11 @@ same dataclasses, and with the equivalent `msgspec.Struct` classes), pydantic
 MB/s, one core of an Intel Xeon Gold 6548N, Python 3.14, the manylinux
 wheels, best of 3 runs of 7 (`python bench_typed.py simdjson-data/jsonexamples
 gharchive.ndjson`):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed.png" width="80%" alt="JSON to dataclasses on one core, GB/s. twitter.json, a few fields: fastsimdjson 2.65, msgspec Struct 1.54, msgspec dataclasses 1.42, pydantic 0.68, orjson with cattrs 0.56. citm_catalog.json typed in full: fastsimdjson 1.03, msgspec Struct 0.64, msgspec dataclasses 0.47, pydantic 0.19, orjson with cattrs 0.19. GH Archive NDJSON, 6 fields: fastsimdjson 1.93, msgspec Struct 1.30, msgspec dataclasses 1.16, pydantic 0.51, orjson with cattrs 0.43">
+</picture>
 
 | | twitter | citm | gh |
 |---|---:|---:|---:|
