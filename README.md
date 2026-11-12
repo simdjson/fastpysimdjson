@@ -144,8 +144,10 @@ events = list(fastsimdjson.loads_many(ndjson, type=Repo))
 
 `type` accepts:
 
-* `int`, `float` (an integer becomes a float), `str`, `bool`, `None`, and
-  `Any` or `object` (no check: the value as `loads` returns it);
+* `int`, `float` (an integer becomes a float), `str`, `bool`, `type(None)`
+  (JSON `null`; `None` too inside a type, as in `list[None]`), and `Any` or
+  `object` (no check: the value as `loads` returns it). `type=None`, the
+  default, means no type;
 * `list`, `tuple` (fixed length or `tuple[T, ...]`), `set`, `frozenset`,
   `dict` with `str` keys, and their abstract counterparts (`Sequence`,
   `Mapping`, ...);

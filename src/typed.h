@@ -104,6 +104,24 @@ def mask(t):
     return 0
 
 
+def is_any(t):
+    return t is typing.Any or t is object
+
+
+def display_mask(t):
+    """The kinds named in error messages: those of mask(t), but an int that
+    only a float accepts is not named."""
+    t = strip(t)
+    if t is float:
+        return FLOAT
+    if typing.get_origin(t) in UNIONS:
+        m = 0
+        for a in typing.get_args(t):
+            m |= display_mask(a)
+        return m
+    return mask(t)
+
+
 def describe(root):
     nodes = []
     memo = {}
@@ -126,8 +144,9 @@ def describe(root):
         if isinstance(t, (str, typing.ForwardRef)):
             raise TypeError(f"Unresolved forward reference {t!r}")
         t = strip(t)
-        m = mask(t)
-        if m == ANY:
+        m = mask(t) | display_mask(t) << 8
+        if is_any(t) or (typing.get_origin(t) in UNIONS and
+                         any(is_any(strip(a)) for a in typing.get_args(t))):
             return ("any", m)
         for scalar, name in ((None, "none"), (type(None), "none"), (bool, "bool"),
                              (int, "int"), (float, "float"), (str, "str")):
@@ -236,6 +255,7 @@ struct TField {
 struct TNode {
   TKind kind = TKind::Any;
   uint8_t mask = 127; // JSON kinds accepted (bit k: json_kind_names[k])
+  uint8_t shown = 127; // the kinds that error messages name
   int32_t child = -1;
   int32_t dispatch[7] = {-1, -1, -1, -1, -1, -1, -1};
   std::vector<int32_t> items;
@@ -376,7 +396,9 @@ TypePlan *compile_plan(PyObject *type) {
         n.kind = k.kind;
       }
     }
-    n.mask = uint8_t(PyLong_AsLong(PyTuple_GET_ITEM(t, 1)));
+    long m = PyLong_AsLong(PyTuple_GET_ITEM(t, 1));
+    n.mask = uint8_t(m & 0xFF);
+    n.shown = uint8_t(m >> 8);
     switch (n.kind) {
     case TKind::Optional:
     case TKind::List:
@@ -496,6 +518,10 @@ struct PathItem {
   const char *key; // nullptr for an index
   size_t n;        // the key's length, or the index
 };
+
+inline PathItem key_item(const char *s, size_t len) {
+  return s != nullptr ? PathItem{s, len} : PathItem{"?", 1};
+}
 
 struct TypedError {
   std::string msg;   // our message (no Python exception set), when ours
@@ -632,7 +658,15 @@ struct PySource {
     while (PyDict_Next(o, &pos, &k, &v)) {
       Py_ssize_t len;
       const char *s = PyUnicode_AsUTF8AndSize(k, &len);
-      if (s == nullptr || !f(s, size_t(len), k, v)) {
+      if (s == nullptr) {
+        // A lone surrogate: no field has this key, a dict keeps it as it is.
+        if (!PyErr_ExceptionMatches(PyExc_UnicodeEncodeError)) {
+          return false;
+        }
+        PyErr_Clear();
+        len = 0;
+      }
+      if (!f(s, size_t(len), k, v)) {
         return false;
       }
     }
@@ -641,8 +675,12 @@ struct PySource {
   PyObject *key(PyObject *k) { return Py_NewRef(k); }
 };
 
+// s is nullptr for a key that UTF-8 cannot encode: it matches no field.
 inline size_t find_field(const TNode &n, const char *s, size_t len, size_t guess) {
   size_t nf = n.fields.size();
+  if (s == nullptr) {
+    return nf;
+  }
   if (guess < nf && n.fields[guess].key_len == len && memcmp(n.fields[guess].key, s, len) == 0) {
     return guess;
   }
@@ -688,8 +726,7 @@ template <class Src> struct TypedDecoder {
     std::string m = "Expected `";
     bool first = true;
     for (int j = 0; j < 7; j++) {
-      // float accepts int: it shows as float only.
-      if ((n.mask >> j & 1) && !(j == 2 && (n.mask & 8))) {
+      if (n.shown >> j & 1) {
         m += first ? "" : " | ";
         m += json_kind_names[j];
         first = false;
@@ -833,7 +870,7 @@ template <class Src> struct TypedDecoder {
       bool ok = src.members(v, [&](const char *s, size_t len, Ref kr, Ref e) {
         PyObject *x = decode(n.child, e);
         if (x == nullptr) {
-          err.path.push_back({s, len});
+          err.path.push_back(key_item(s, len));
           return false;
         }
         // The keys come with their hash (make_key, or the keys of a dict).
@@ -911,7 +948,7 @@ template <class Src> struct TypedDecoder {
       guess = f + 1;
       PyObject *x = decode(n.fields[f].node, e);
       if (x == nullptr) {
-        err.path.push_back({s, len});
+        err.path.push_back(key_item(s, len));
         return false;
       }
       Py_XSETREF(vals.v[f], x);

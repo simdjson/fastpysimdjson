@@ -170,6 +170,38 @@ def test_unions_and_literals():
         loads(b"1", type=Literal["a", "b"])
 
 
+def test_union_of_every_kind_still_checks():
+    # Every JSON kind is accepted, but the parts of the union are still checked.
+    t = Union[Dict[str, int], List[int], str, int, float, bool, None]
+    assert loads(b'{"a": 1}', type=t) == {"a": 1}
+    with pytest.raises(ValidationError, match=r"at `\$\[0\]`"):
+        loads(b'["z"]', type=t)
+    with pytest.raises(ValidationError, match=r"at `\$.a`"):
+        loads(b'{"a": "z"}', type=t)
+    u = loads(b'{"id": 1, "name": "a"}', type=Union[User, int, str, float, bool, None, list])
+    assert u == User(1, "a")
+
+
+def test_error_names():
+    with pytest.raises(ValidationError, match=r"^Expected `int \| float`, got `str`$"):
+        loads(b'"s"', type=Union[int, float])
+    with pytest.raises(ValidationError, match=r"^Expected `null \| float`, got `str`$"):
+        loads(b'"s"', type=Optional[float])
+    with pytest.raises(ValidationError, match=r"^Expected `float`, got `str`$"):
+        loads(b'"s"', type=float)
+
+
+def test_lone_surrogate_keys():
+    # Only json accepts this document (NaN), and its first key is a lone
+    # surrogate, which UTF-8 cannot encode.
+    data = b'{"\\ud800": 1, "id": 3, "name": "a", "x": NaN}'
+    assert list(loads(data, type=dict)) == ["\ud800", "id", "name", "x"]
+    assert loads(data, type=Dict[str, Any])["\ud800"] == 1
+    assert loads(data, type=User) == User(3, "a")
+    with pytest.raises(ValidationError, match=r"at `\$.\?`"):
+        loads(b'{"\\ud800": "s", "x": NaN}', type=Dict[str, int])
+
+
 def test_enums():
     assert loads(b'"red"', type=Color) is Color.RED
     assert loads(b"2", type=Level) is Level.HIGH
