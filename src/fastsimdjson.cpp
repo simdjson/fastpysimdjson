@@ -831,7 +831,22 @@ PyObject *parse_typed(const char *buf, size_t len, PyObject *original, PyObject 
     Py_DECREF(value);
     return r;
   }
-  PyObject *res = typed_build(g_thread_parser.ptr->doc, plan);
+  // The decoding runs the user's code (__post_init__, an enum's _missing_,
+  // default factories), which may call loads on this thread: that call must
+  // not parse into the document being read, nor free it (release()). So the
+  // parser is taken from the thread while it is read; such a call makes a
+  // parser of its own, and the smaller of the two is kept.
+  parser *p = g_thread_parser.ptr;
+  g_thread_parser.ptr = nullptr;
+  PyObject *res = typed_build(p->doc, plan);
+  if (g_thread_parser.ptr == nullptr) {
+    g_thread_parser.ptr = p;
+  } else if (g_thread_parser.ptr->capacity() > p->capacity()) {
+    std::swap(g_thread_parser.ptr, p);
+    delete p;
+  } else {
+    delete p;
+  }
   release_large_parser();
   return res;
 }
@@ -3521,6 +3536,7 @@ struct StreamObject {
   simdjson::stream_format format;
   bool lazy;
   bool done;
+  bool running; // in stream_next: the user's code (type=) may call next again
   bool active;     // a simdjson stream is running from `base`
   size_t base;     // offset of the running stream in buf
   size_t last_end; // offset just past the last document returned
@@ -3818,8 +3834,13 @@ PyObject *stream_next(PyObject *self) {
   StreamObject *s = reinterpret_cast<StreamObject *>(self);
   PyObject *r = nullptr;
   Py_BEGIN_CRITICAL_SECTION(self);
-  if (!s->done) {
+  if (s->running) {
+    // From __post_init__ (or the like) while this stream builds a document.
+    PyErr_SetString(PyExc_RuntimeError, "stream already executing");
+  } else if (!s->done) {
+    s->running = true;
     r = stream_next_locked(s);
+    s->running = false;
     s->done = r == nullptr; // the end, or an error: the stream is over
   }
   Py_END_CRITICAL_SECTION();
@@ -3926,7 +3947,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   s->active = false;
   s->base = 0;
   s->last_end = 0;
-  s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  s->no_fallback = s->need_fallback = s->borrowed_parser = s->running = false;
   s->fields = nullptr;
   s->owns_fields = false;
   s->plan = nullptr;
@@ -4029,7 +4050,7 @@ StreamObject *stream_over(StreamObject *whole, size_t from, size_t to, bool chun
   s->prefix = whole->prefix;
   s->open = whole->open;
   s->close = whole->close;
-  s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  s->no_fallback = s->need_fallback = s->borrowed_parser = s->running = false;
   s->fields = whole->fields; // whole outlives its chunks
   s->owns_fields = false;
   s->plan = whole->plan;

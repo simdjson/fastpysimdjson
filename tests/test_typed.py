@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import sys
 import typing
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, TypedDict, Union
 
@@ -458,3 +459,171 @@ def test_twitter_against_msgspec():
 
     data = open(path, "rb").read()
     assert loads(data, type=Timeline) == msgspec.json.decode(data, type=Timeline)
+
+
+def test_typing_extensions_typeddict():
+    te = pytest.importorskip("typing_extensions")
+
+    class Movie(te.TypedDict):
+        title: str
+        year: te.NotRequired[int]
+
+    class Partial(te.TypedDict, total=False):
+        title: te.Required[str]
+        rating: float
+
+    assert loads(b'{"title": "x", "year": 1999}', type=Movie) == {"title": "x", "year": 1999}
+    assert loads(b'{"title": "x"}', type=Movie) == {"title": "x"}
+    assert loads(b'{"title": "x", "rating": 2}', type=Partial) == {"title": "x", "rating": 2.0}
+    with pytest.raises(ValidationError, match="missing required field `title`"):
+        loads(b'{"rating": 2}', type=Partial)
+    with pytest.raises(ValidationError, match=r"at `\$\.year`"):
+        loads(b'{"title": "x", "year": "1999"}', type=Movie)
+
+
+def test_empty_tuple_type():
+    for t in (tuple[()], Tuple[()]):
+        assert loads(b"[]", type=t) == ()
+        with pytest.raises(ValidationError, match="length 0, got 2"):
+            loads(b"[1, 2]", type=t)
+    for t in (tuple, Tuple):
+        assert loads(b"[1, 2]", type=t) == (1, 2)
+
+
+def test_literal_bools_are_not_ints():
+    assert loads(b"1", type=Literal[1, False]) == 1
+    assert loads(b"false", type=Literal[1, False]) is False
+    for data, t in [(b"0", Literal[1, False]), (b"true", Literal[1, False]),
+                    (b"1", Literal[True, 0]), (b"false", Literal[True, 0])]:
+        with pytest.raises(ValidationError, match="Invalid value"):
+            loads(data, type=t)
+
+
+def test_set_elements_must_be_hashable():
+    @dataclasses.dataclass
+    class Point:
+        x: int
+
+    @dataclasses.dataclass(frozen=True)
+    class FrozenPoint:
+        x: int
+
+    for t in (set[list[int]], frozenset[dict[str, int]], set[Point], typing.Set[set[int]],
+              set[Optional[List[int]]], frozenset[tuple[int, list[int]]]):
+        with pytest.raises(TypeError, match="Set elements must be hashable"):
+            loads(b"[]", type=t)
+    assert loads(b'[{"x": 1}, {"x": 1}]', type=frozenset[FrozenPoint]) == {FrozenPoint(1)}
+    assert loads(b"[[1, 2], [1, 2]]", type=set[tuple[int, ...]]) == {(1, 2)}
+
+
+def test_float_out_of_range():
+    with pytest.raises(ValidationError, match=r"out of range for `float` - at `\$\[1\]`"):
+        loads(b"[1, 1" + b"0" * 400 + b"]", type=list[float])
+    assert loads(b"[1" + b"0" * 30 + b"]", type=list[float]) == [1e30]
+
+
+@dataclasses.dataclass
+class Tree:
+    kids: List["Tree"]
+
+
+def test_deep_nesting_does_not_crash():
+    # Past simdjson's depth limit, json decodes the document; then the depth
+    # is checked as json checks it: a RecursionError, never a crash.
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, 5000))  # Python 3.10 and 3.11 count C levels there
+    try:
+        n = 1000  # 2000 levels
+        tree = loads(b'{"kids":[' * n + b']}' * n, type=Tree)
+        for _ in range(n - 1):
+            tree = tree.kids[0]
+        assert tree.kids == []
+        for n in (20000, 200000):
+            data = b'{"kids":[' * n + b']}' * n
+            try:
+                loads(data, type=Tree)
+            except RecursionError:
+                pass
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def test_union_that_contains_itself():
+    ns = {}
+    try:
+        exec("type Loop = Loop | None\ntype Self = Self", ns)
+    except SyntaxError:
+        pytest.skip("type statement needs Python 3.12")
+    with pytest.raises(TypeError, match="contains itself"):
+        loads(b"1", type=ns["Loop"])
+    with pytest.raises(TypeError, match="refers only to itself"):
+        loads(b"1", type=ns["Self"])
+
+
+def test_reentrant_loads():
+    # The user's code may call loads while a typed document is decoded: it
+    # must not reuse the parser, whose document is being read.
+    inner = b'{"xs": [' + b",".join(b"%d" % i for i in range(3000)) + b']}'
+
+    @dataclasses.dataclass
+    class Inner:
+        xs: List[int]
+
+    class Mood(enum.Enum):
+        HAPPY = "happy"
+
+        @classmethod
+        def _missing_(cls, value):
+            loads(inner)
+            fastsimdjson.release()
+            return cls.HAPPY
+
+    @dataclasses.dataclass
+    class A:
+        a: int
+
+        def __post_init__(self):
+            assert len(loads(inner, type=Inner).xs) == 3000
+            fastsimdjson.release()
+
+    @dataclasses.dataclass
+    class Outer:
+        first: A
+        mood: Mood
+        rest: str
+        tail: List[str]
+
+    doc = b'{"first": {"a": 1}, "mood": "sad", "rest": "a string that follows", "tail": ["x", "y"]}'
+    for _ in range(3):
+        assert loads(doc, type=Outer) == Outer(A(1), Mood.HAPPY, "a string that follows", ["x", "y"])
+    assert [o.rest for o in fastsimdjson.loads_many(doc + b"\n" + doc, type=Outer)] == \
+        ["a string that follows"] * 2
+
+
+def test_reentrant_stream_next():
+    stream = None
+
+    @dataclasses.dataclass
+    class Item:
+        i: int
+
+        def __post_init__(self):
+            next(stream)
+
+    stream = fastsimdjson.loads_many(b'{"i": 1}\n{"i": 2}\n', type=Item)
+    with pytest.raises(RuntimeError, match="already executing"):
+        next(stream)
+
+
+def test_type_cache_is_bounded():
+    for i in range(3000):
+        cls = dataclasses.make_dataclass(f"C{i}", [("x", int)])
+        assert loads(b'{"x": 1}', type=cls) == cls(1)
+    import weakref
+    ref = weakref.ref(cls)
+    for i in range(1100):
+        loads(b'{"x": 1}', type=dataclasses.make_dataclass(f"D{i}", [("x", int)]))
+    del cls
+    import gc
+    gc.collect()
+    assert ref() is None

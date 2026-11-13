@@ -12,6 +12,7 @@
 PyObject *ValidationError = nullptr;
 PyObject *typed_describe = nullptr; // the Python function below
 PyObject *typed_cache = nullptr;    // type -> capsule holding its TypePlan
+constexpr Py_ssize_t TYPED_CACHE_MAX = 1024;
 PyObject *typed_post_init = nullptr;
 PyObject *typed_empty_tuple = nullptr;
 
@@ -19,6 +20,7 @@ const char typed_describe_source[] = R"PY(
 import collections.abc as abc
 import dataclasses
 import enum
+import sys
 import typing
 import types
 
@@ -28,18 +30,39 @@ UNIONS = (typing.Union, getattr(types, "UnionType", typing.Union))
 LISTS = (list, abc.Sequence, abc.MutableSequence, abc.Collection, abc.Iterable)
 SETS = (set, abc.Set, abc.MutableSet)
 DICTS = (dict, abc.Mapping, abc.MutableMapping)
-WRAPPERS = tuple(getattr(typing, n) for n in ("Annotated", "Required", "NotRequired",
-                                              "ReadOnly", "Final") if hasattr(typing, n))
+WRAPPER_NAMES = ("Annotated", "Required", "NotRequired", "ReadOnly", "Final")
 KIND_NAMES = ("null", "bool", "int", "float", "str", "array", "object")
 
 
+def wrappers():
+    # typing's, and typing_extensions' when a type uses it (then it is
+    # imported): on older Pythons, its NotRequired and ReadOnly are its own.
+    w = {getattr(typing, n) for n in WRAPPER_NAMES if hasattr(typing, n)}
+    te = sys.modules.get("typing_extensions")
+    if te is not None:
+        w.update(getattr(te, n) for n in WRAPPER_NAMES if hasattr(te, n))
+    return w
+
+
+def is_typeddict(t):
+    # typing.is_typeddict is false for a typing_extensions.TypedDict: both
+    # make dict subclasses with __required_keys__.
+    return (isinstance(t, type) and issubclass(t, dict) and
+            hasattr(t, "__required_keys__") and hasattr(t, "__optional_keys__"))
+
+
 def strip(t):
+    w = wrappers()
+    aliases = []
     while True:
-        if typing.get_origin(t) in WRAPPERS:
+        if typing.get_origin(t) in w:
             t = typing.get_args(t)[0]
         elif hasattr(t, "__supertype__"):  # NewType
             t = t.__supertype__
         elif type(t).__name__ == "TypeAliasType":  # type X = ...
+            if any(a is t for a in aliases):
+                raise TypeError(f"Type alias {t!r} refers only to itself")
+            aliases.append(t)
             t = t.__value__
         else:
             return t
@@ -61,8 +84,10 @@ def base_of(t):
     return typing.get_origin(t) or t
 
 
-def mask(t):
+def mask(t, seen=()):
     t = strip(t)
+    if any(u is t or u == t for u in seen):
+        raise TypeError(f"Type {t!r} has a union that contains itself")
     if t is typing.Any or t is object:
         return ANY
     if t is None or t is type(None):
@@ -79,9 +104,9 @@ def mask(t):
     if origin in UNIONS:
         m = 0
         for a in typing.get_args(t):
-            m |= mask(a)
+            m |= mask(a, seen + (t,))
         return m
-    if origin is typing.Literal:
+    if is_literal(origin):
         m = 0
         for v in typing.get_args(t):
             m |= value_mask(v)
@@ -97,7 +122,7 @@ def mask(t):
             for member in t:
                 m |= value_mask(member.value)
             return m
-        if dataclasses.is_dataclass(t) or typing.is_typeddict(t):
+        if dataclasses.is_dataclass(t) or is_typeddict(t):
             return OBJECT
         if issubclass(t, tuple) and hasattr(t, "_fields"):
             return ARRAY
@@ -106,6 +131,36 @@ def mask(t):
 
 def is_any(t):
     return t is typing.Any or t is object
+
+
+def is_literal(origin):
+    te = sys.modules.get("typing_extensions")
+    return origin is typing.Literal or (te is not None and origin is getattr(te, "Literal", None))
+
+
+def unhashable(t, seen=None):
+    """True when the values decoded for t can never be set elements."""
+    t = strip(t)
+    seen = set() if seen is None else seen
+    if id(t) in seen:
+        return False
+    seen.add(id(t))
+    origin, args = typing.get_origin(t), typing.get_args(t)
+    if origin in UNIONS:
+        return any(unhashable(a, seen) for a in args)
+    base = base_of(t)
+    if base in LISTS or base in SETS or base in DICTS or is_typeddict(t):
+        return True
+    if base is tuple or base is frozenset:
+        return any(unhashable(a, seen) for a in args if a is not Ellipsis and a != ())
+    return isinstance(t, type) and getattr(t, "__hash__", None) is None
+
+
+def set_node(name, t, m, args, visit):
+    item = args[0] if args else typing.Any
+    if unhashable(item):
+        raise TypeError(f"Set elements must be hashable - {t!r} is not supported")
+    return (name, m, visit(item))
 
 
 def display_mask(t):
@@ -176,21 +231,23 @@ def describe(root):
                     table[k] = i
                     float_owner[k] = is_float
             return ("union", m, tuple(table))
-        if origin is typing.Literal:
-            return ("literal", m, frozenset(args))
+        if is_literal(origin):
+            # Two sets: 1 == True and 0 == False, but JSON 1 is not true.
+            return ("literal", m, frozenset(a for a in args if not isinstance(a, bool)),
+                    frozenset(a for a in args if isinstance(a, bool)))
         base = base_of(t)
         if base in LISTS:
             return ("list", m, visit(args[0] if args else typing.Any))
         if base in SETS:
-            return ("set", m, visit(args[0] if args else typing.Any))
+            return set_node("set", t, m, args, visit)
         if base is frozenset:
-            return ("frozenset", m, visit(args[0] if args else typing.Any))
+            return set_node("frozenset", t, m, args, visit)
         if base is tuple:
-            if not args:
+            if t is tuple or t is typing.Tuple:
                 return ("vartuple", m, visit(typing.Any))
             if len(args) == 2 and args[1] is Ellipsis:
                 return ("vartuple", m, visit(args[0]))
-            if args == ((),):
+            if not args or args == ((),):  # tuple[()]: no args from Python 3.11 on
                 return ("tuple", m, ())
             return ("tuple", m, tuple(visit(a) for a in args))
         if base in DICTS:
@@ -217,7 +274,7 @@ def describe(root):
                     child = visit(hints[f.name]) if f.init else -1
                     fields.append((f.name, child, kind, default))
                 return ("dataclass", m, t, tuple(fields), hasattr(t, "__post_init__"))
-            if typing.is_typeddict(t):
+            if is_typeddict(t):
                 hints = typing.get_type_hints(t)
                 required = t.__required_keys__
                 return ("typeddict", m, t,
@@ -261,7 +318,8 @@ struct TNode {
   std::vector<int32_t> items;
   std::vector<TField> fields;
   PyObject *cls = nullptr;      // borrowed
-  PyObject *values = nullptr;   // borrowed: literal values, enum value -> member
+  PyObject *values = nullptr;   // borrowed: literal values (not bools), enum value -> member
+  PyObject *bools = nullptr;    // borrowed: literal values that are bools
   PyObject *defaults = nullptr; // borrowed: NamedTuple defaults
   bool post_init = false;
 };
@@ -417,6 +475,7 @@ TypePlan *compile_plan(PyObject *type) {
     }
     case TKind::Literal:
       n.values = PyTuple_GET_ITEM(t, 2);
+      n.bools = PyTuple_GET_ITEM(t, 3);
       break;
     case TKind::Enum:
       n.cls = PyTuple_GET_ITEM(t, 2);
@@ -499,6 +558,11 @@ PyObject *get_plan(PyObject *type) {
     return nullptr;
   }
   if (hashable) {
+    // The cache keeps its types alive: a program that makes types as it
+    // runs would grow it without end, so it starts over when full.
+    if (PyDict_Size(typed_cache) >= TYPED_CACHE_MAX) {
+      PyDict_Clear(typed_cache);
+    }
     PyObject *kept = PyDict_SetDefault(typed_cache, type, capsule); // borrowed
     if (kept == nullptr) {
       Py_DECREF(capsule);
@@ -537,6 +601,7 @@ struct TypedError {
 // The source of the values: the tape of a document...
 struct TapeSource {
   using Ref = size_t;
+  static constexpr bool unbounded_depth = false; // simdjson's depth limit
   Builder b;
   explicit TapeSource(const document &doc) : b(doc) {}
 
@@ -618,6 +683,7 @@ struct TapeSource {
 // ... or the Python objects that json made.
 struct PySource {
   using Ref = PyObject *;
+  static constexpr bool unbounded_depth = true;
   int kind(PyObject *o) const {
     if (o == Py_None) {
       return 0;
@@ -752,9 +818,25 @@ template <class Src> struct TypedDecoder {
     return nullptr;
   }
 
-  PyObject *decode(int32_t ni, Ref v) {
-    const TNode &n = plan.nodes[size_t(ni)];
+  FSJ_ALWAYS_INLINE PyObject *decode(int32_t ni, Ref v) {
     int k = src.kind(v);
+    if (!Src::unbounded_depth || k < 5) {
+      return decode_as(ni, k, v);
+    }
+    // An array or an object from json: one level deeper in a document that
+    // may nest past simdjson's depth limit (which bounds the tape). The C
+    // stack is checked as json checks it, once per level.
+    if (Py_EnterRecursiveCall(" while decoding a typed value")) {
+      return nullptr;
+    }
+    PyObject *r = decode_as(ni, k, v);
+    Py_LeaveRecursiveCall();
+    return r;
+  }
+
+  // v, of JSON kind k, as node ni (an optional or a union passes it on).
+  PyObject *decode_as(int32_t ni, int k, Ref v) {
+    const TNode &n = plan.nodes[size_t(ni)];
     if (!(n.mask >> k & 1)) {
       return expected(n, k);
     }
@@ -765,18 +847,24 @@ template <class Src> struct TypedDecoder {
     case TKind::Int:
     case TKind::Str:
       return src.any(v);
-    case TKind::Float:
-      return src.real(v);
+    case TKind::Float: {
+      PyObject *r = src.real(v);
+      if (r == nullptr && PyErr_ExceptionMatches(PyExc_OverflowError)) {
+        PyErr_Clear();
+        err.set("Integer out of range for `float`");
+      }
+      return r;
+    }
     case TKind::Optional:
-      return k == 0 ? Py_NewRef(Py_None) : decode(n.child, v);
+      return k == 0 ? Py_NewRef(Py_None) : decode_as(n.child, k, v);
     case TKind::Union:
-      return decode(n.dispatch[k], v);
+      return decode_as(n.dispatch[k], k, v);
     case TKind::Literal: {
       PyObject *x = src.any(v);
       if (x == nullptr) {
         return nullptr;
       }
-      int c = PySet_Contains(n.values, x);
+      int c = PySet_Contains(k == 1 ? n.bools : n.values, x);
       if (c == 1) {
         return x;
       }

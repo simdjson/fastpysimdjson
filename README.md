@@ -25,7 +25,7 @@ Against the standard `json` module, `loads` is 3.5 times faster and `parse`
   bytes as `orjson.dumps`. Switching changes the speed, not the output.
 * **Typed.** `loads(data, type=T)` builds dataclasses, TypedDicts and
   other typed values straight from the parser, with the types checked: 1.5
-  to 2.2 times as fast as msgspec, 3.8 to 5.5 times as fast as pydantic.
+  to 2.2 times as fast as msgspec, 3.8 to 5.3 times as fast as pydantic.
 * **Only what you need.** `parse` gives lazy views and builds only the
   values you read; `fields=` extracts only some fields from each document of
   a stream.
@@ -157,14 +157,17 @@ events = list(fastsimdjson.loads_many(ndjson, type=Repo))
   `dict` with `str` keys, and their abstract counterparts (`Sequence`,
   `Mapping`, ...);
 * `Optional[T]`, unions (`int | str`, at most one type per JSON kind; an
-  integer goes to `int` rather than to `float`) and `Literal`;
-* enums (by value), dataclasses (including frozen ones and those with
-  `__slots__`), `TypedDict` and `NamedTuple` (from an array);
+  integer goes to `int` rather than to `float`) and `Literal` (of `str`,
+  `int`, `bool` and `None`: JSON `1` is not `True`);
+* enums (by value: `str`, `int`, `bool` or `None`), dataclasses (including
+  frozen ones and those with `__slots__`), `TypedDict` (from `typing` or
+  `typing_extensions`) and `NamedTuple` (from an array);
 * `Annotated`, `NewType` and `type` aliases, and recursive types.
 
 Dataclass fields take their defaults (and default factories) when the key
 is missing, keys that are not fields are ignored, `__post_init__` runs, and
-`init=False` fields get their default. A `TypedDict` becomes a `dict` with
+`init=False` fields get their default. The fields are set as the generated
+`__init__` sets them: an `__init__` of your own is not called. A `TypedDict` becomes a `dict` with
 its keys only. A value of the wrong type raises
 `fastsimdjson.ValidationError` (a `ValueError`) with its path:
 
@@ -176,8 +179,13 @@ A `ValueError` or `TypeError` raised by `__post_init__` becomes a
 `ValidationError` too, with the path. Invalid JSON raises
 `JSONDecodeError`, and the documents that only `json` accepts (`NaN`, a
 number that overflows a double) are converted the same way, from what
-`json` returns. The description of each type is computed once and cached.
-`load`, `load_file`, `loads_many` and `map_many` accept `type=` too; with
+`json` returns; past what Python's stack allows, those raise
+`RecursionError`, as `json` does. A set of values that cannot be hashed
+(`set[list[int]]`) or a union that contains itself is a `TypeError`. The
+description of each type is computed once and cached (the cache starts over
+past 1024 types, so that types made on the fly do not pile up). `load`,
+`load_file`, `loads_many` and `map_many` accept `type=` too; a
+`ValidationError` ends the iteration of `loads_many`, as any error does. With
 `threads=N` on free-threaded Python, the instances are built on N threads
 (not with `fields=` or `lazy=True`).
 
@@ -701,7 +709,7 @@ gharchive.ndjson`):
 | fastsimdjson `loads` (dicts, untyped) | 966 | 1112 | 439 |
 
 fastsimdjson is 1.5 to 1.7 times as fast as msgspec with Structs, 1.7 to 2.2
-times as fast with the same dataclasses, and 3.8 to 5.5 times as fast as
+times as fast with the same dataclasses, and 3.8 to 5.3 times as fast as
 pydantic. When most of the document is not needed (twitter, gh), typed
 decoding is also 2.7 to 4.4 times as fast as building the dicts.
 
