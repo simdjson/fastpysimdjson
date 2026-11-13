@@ -7,7 +7,8 @@ fastsimdjson.dumpb_arrow against polars.DataFrame.write_ndjson and DuckDB
     THREADS=8 python bench_arrow.py flat.ndjson:flat gharchive.ndjson:gh flat.ndjson:infer
 
 The schemas: flat (9 scalar fields), gh (6 fields of GH Archive events: two
-structs, the other fields skipped), infer (none given).
+structs, the other fields skipped), gh_ts (the same, with created_at as a
+timestamp[us, UTC] instead of a string), infer (none given).
 """
 import os
 import sys
@@ -43,6 +44,10 @@ SCHEMAS = {
                      ("actor", pa.struct([("id", pa.int64()), ("login", pa.string())])),
                      ("repo", pa.struct([("id", pa.int64()), ("name", pa.string())])),
                      ("public", pa.bool_()), ("created_at", pa.string())]),
+    "gh_ts": pa.schema([("id", pa.string()), ("type", pa.string()),
+                        ("actor", pa.struct([("id", pa.int64()), ("login", pa.string())])),
+                        ("repo", pa.struct([("id", pa.int64()), ("name", pa.string())])),
+                        ("public", pa.bool_()), ("created_at", pa.timestamp("us", tz="UTC"))]),
     "infer": None,
 }
 
