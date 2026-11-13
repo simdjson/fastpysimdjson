@@ -534,10 +534,16 @@ def test_deep_nesting_does_not_crash():
     sys.setrecursionlimit(max(limit, 5000))  # Python 3.10 and 3.11 count C levels there
     try:
         n = 1000  # 2000 levels
-        tree = loads(b'{"kids":[' * n + b']}' * n, type=Tree)
-        for _ in range(n - 1):
-            tree = tree.kids[0]
-        assert tree.kids == []
+        try:
+            tree = loads(b'{"kids":[' * n + b']}' * n, type=Tree)
+        except RecursionError:
+            # Python 3.14 measures the C stack: with a small one (musl gives
+            # the main thread about 1 MB), 2000 levels can be too many.
+            pass
+        else:
+            for _ in range(n - 1):
+                tree = tree.kids[0]
+            assert tree.kids == []
         for n in (20000, 200000):
             data = b'{"kids":[' * n + b']}' * n
             try:
