@@ -4212,10 +4212,13 @@ struct ParallelRun : PoolTask {
     size_t resume_at = 0;      // where the one-thread run goes on
   };
   std::vector<Chunk> chunks;
-  // Block b holds the slices [next, end) not yet claimed; one cache line each.
-  struct alignas(64) Block {
+  // Block b holds the slices [next, end) not yet claimed. Padded to 64 bytes
+  // so that the counters of two workers rarely share a cache line (alignas
+  // would need aligned new, missing before macOS 10.13).
+  struct Block {
     std::atomic<size_t> next{0};
     size_t end = 0;
+    char pad[64 - sizeof(std::atomic<size_t>) - sizeof(size_t)];
   };
   std::unique_ptr<Block[]> blocks;
   size_t nblocks = 0;
