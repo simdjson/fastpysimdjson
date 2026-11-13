@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <condition_variable>
 #include <deque>
@@ -4099,15 +4100,25 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
 }
 
 // ---------------------------------------------------------------------------
-// Streams over several threads (threads=N). The workers share one counter.
-// Each claims the next kSlice bytes with fetch_add and snaps both ends
-// forward to a delimiter that cannot occur inside a document: just after a
-// line feed, or just before a record separator (json_seq). The slices are
-// adjacent and do not overlap, so concatenating them in index order is the
-// input order. A claim that falls inside a document longer than the slice
-// snaps to an empty range; that document belongs to the preceding slice and
-// is parsed once. Each worker has its own parser (threaded off: the
-// parallelism is across slices) and its own list.
+// Streams over several threads (threads=N). The input is cut into slices of
+// kSlice bytes, whose ends snap forward to a delimiter that cannot occur
+// inside a document: just after a line feed, or just before a record
+// separator (json_seq). The slices are adjacent and do not overlap, so
+// concatenating them in index order is the input order. A slice that falls
+// inside a document longer than the slice snaps to an empty range; that
+// document belongs to the preceding slice and is parsed once. Each worker has
+// its own parser (threaded off: the parallelism is across slices) and its own
+// list.
+//
+// The slices are split into one contiguous block per worker. A worker claims
+// the slices of its own block in order (fetch_add on the block's counter),
+// then those left in the other blocks. Each worker thus reads one region of
+// the input, as it would with one chunk per worker, and the small slices
+// still balance the load at the end (a long record, a slow fn). Reading one
+// region also keeps the pages of the input near the core that reads them:
+// on two sockets, the kernel's NUMA balancing moves them there when the same
+// input is read again, which slices taken in turn by all the workers would
+// defeat.
 //
 // Without the GIL (free-threaded Python), the workers run at the same time.
 // With it, the calling thread does all the work.
@@ -4201,8 +4212,28 @@ struct ParallelRun : PoolTask {
     size_t resume_at = 0;      // where the one-thread run goes on
   };
   std::vector<Chunk> chunks;
-  std::atomic<size_t> next{0};
-  std::atomic<size_t> first_failure{SIZE_MAX};
+  // Block b holds the slices [next, end) not yet claimed. Padded to 64 bytes
+  // so that the counters of two workers rarely share a cache line (alignas
+  // would need aligned new, missing before macOS 10.13).
+  struct Block {
+    std::atomic<size_t> next{0};
+    size_t end = 0;
+    char pad[64 - sizeof(std::atomic<size_t>) - sizeof(size_t)];
+  };
+  std::unique_ptr<Block[]> blocks;
+  size_t nblocks = 0;
+  static inline std::atomic<size_t> g_next_worker{0}; // numbers the threads that ever worked
+  alignas(64) std::atomic<size_t> first_failure{SIZE_MAX};
+
+  // One block of adjacent slices per worker.
+  void split(size_t workers) {
+    nblocks = std::max<size_t>(1, std::min(workers, chunks.size()));
+    blocks.reset(new Block[nblocks]);
+    for (size_t b = 0; b < nblocks; b++) {
+      blocks[b].next.store(chunks.size() * b / nblocks, std::memory_order_relaxed);
+      blocks[b].end = chunks.size() * (b + 1) / nblocks;
+    }
+  }
 
   struct Range {
     size_t begin;
@@ -4311,17 +4342,26 @@ struct ParallelRun : PoolTask {
     }
   }
 
-  // Takes chunks until none is left, letting the garbage collector of
-  // other threads run between chunks.
+  // Takes the slices of its own block, then those left in the others, until
+  // none is left, letting the garbage collector of other threads run between
+  // slices. A block is left at its first slice past a failure: the failure
+  // only moves down, so the slices after it are not needed.
   void work() override {
-    for (;;) {
-      size_t i = next.fetch_add(1);
-      if (i >= chunks.size() || i > first_failure.load()) {
-        return;
+    // The same thread starts on the same block at every call: the pool keeps
+    // its threads, so each one keeps reading the same region of the input.
+    thread_local size_t worker = g_next_worker.fetch_add(1);
+    size_t me = worker % nblocks;
+    for (size_t k = 0; k < nblocks; k++) {
+      Block &b = blocks[(me + k) % nblocks];
+      for (;;) {
+        size_t i = b.next.fetch_add(1);
+        if (i >= b.end || i > first_failure.load()) {
+          break;
+        }
+        run_chunk(i);
+        Py_BEGIN_ALLOW_THREADS
+        Py_END_ALLOW_THREADS
       }
-      run_chunk(i);
-      Py_BEGIN_ALLOW_THREADS
-      Py_END_ALLOW_THREADS
     }
   }
 };
@@ -4514,6 +4554,7 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     run.chunks.resize((whole->len - 1) / ParallelRun::kSlice + 1);
     // Starting a thread costs about as much as building 512 KB of documents.
     size_t nthreads = std::min({threads, run.chunks.size(), std::max<size_t>(whole->len >> 19, 1)});
+    run.split(nthreads);
     run_on_pool(&run, nthreads);
     size_t f = run.first_failure.load();
     size_t total = 0;
