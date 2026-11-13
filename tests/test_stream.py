@@ -297,6 +297,29 @@ def test_threads_long_record(fmt):
         _outcome(lambda: list(fastsimdjson.loads_many(broken, format=fmt)))
 
 
+@pytest.mark.parametrize("fmt", ["lines", "json_seq"])
+@pytest.mark.parametrize("shift", [-2, -1, 0, 1, 2])
+def test_threads_delimiter_at_slice_edge(fmt, shift):
+    # The delimiter falls on the last byte of a 256 KB slice, on the first
+    # byte of the next, or near them; long records span whole slices too.
+    slice_size = 256 << 10
+    pad = 0 if fmt == "lines" else 1  # the leading record separator
+    parts, pos = [], pad
+    for k in range(1, 9):
+        target = k * slice_size + shift  # where this record's delimiter goes
+        if k % 3 == 0:
+            target += 2 * slice_size  # a record longer than a slice
+        doc = json.dumps({"k": k, "s": ""}).encode()
+        doc = doc[:-2] + b"x" * (target - pos - len(doc)) + doc[-2:]
+        parts.append(doc)
+        pos += len(doc) + (1 if fmt == "lines" else 2)  # "\n" or "\n\x1e"
+    data = _framed(parts, fmt)
+    expected = list(fastsimdjson.loads_many(data, format=fmt))
+    assert [d["k"] for d in expected] == list(range(1, 9))
+    for threads in (2, 5):
+        assert fastsimdjson.loads_many(data, format=fmt, threads=threads) == expected
+
+
 def test_threads_api():
     data = b"\n".join(b'{"n": %d}' % i for i in range(30000))
     docs = fastsimdjson.loads_many(data, threads=4)

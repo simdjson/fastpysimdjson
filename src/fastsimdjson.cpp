@@ -4012,19 +4012,32 @@ struct ParallelRun : PoolTask {
     const char *data = whole->buf;
     const size_t size = whole->len;
     const size_t raw = index * kSlice;
-    auto snap = [&](size_t want) -> size_t {
-      if (want >= size) {
-        return size;
+    // Just past (or onto) the first delimiter in [want, limit), or SIZE_MAX.
+    auto snap = [&](size_t want, size_t limit) -> size_t {
+      if (want >= limit) {
+        return SIZE_MAX;
       }
-      const void *hit = memchr(data + want, delimiter, size - want);
+      const void *hit = memchr(data + want, delimiter, limit - want);
       if (hit == nullptr) {
-        return size;
+        return SIZE_MAX;
       }
       size_t at = size_t(static_cast<const char *>(hit) - data);
       return snap_after ? at + 1 : at;
     };
-    size_t want_end = raw > SIZE_MAX - kSlice ? size : raw + kSlice;
-    return {raw == 0 ? 0 : snap(raw), snap(want_end)};
+    const size_t want_end = std::min(size, raw > SIZE_MAX - kSlice ? size : raw + kSlice);
+    size_t begin = 0;
+    if (raw != 0) {
+      // A slice with no delimiter in its own bytes is inside a document that
+      // started before it: begin and end would snap to the same place. Only
+      // the slice's bytes are searched, so the work stays linear (each slice
+      // within a long document would otherwise scan to its end).
+      begin = snap(raw, want_end);
+      if (begin == SIZE_MAX) {
+        return {raw, raw};
+      }
+    }
+    size_t end = snap(want_end, size);
+    return {begin, end == SIZE_MAX ? size : end};
   }
 
   void note_failure(size_t i) {
