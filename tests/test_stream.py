@@ -535,3 +535,90 @@ def test_fields_threads(fmt, seed):
                                                         threads=threads)) == expected
         assert _outcome(lambda: fastsimdjson.map_many(lambda t: t, data, format=fmt,
                                                       fields=pointers, threads=threads)) == expected
+
+
+# release() also frees the parsers and caches of the pool's workers (on a
+# free-threaded build). These check that the streams keep working after it,
+# that it does not wait for itself when called from fn, and that it can run
+# at the same time as threaded streams.
+def _pool_input():
+    objs = [{"i": i, "name": "n%d" % i, "tags": ["a", "b", i % 7]} for i in range(60000)]
+    return ndjson(objs).encode(), objs
+
+
+def _no_hang(target, timeout=120):
+    import threading
+
+    errors = []
+
+    def run():
+        try:
+            target()
+        except BaseException as exc:  # reported below
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "deadlock"
+    if errors:
+        raise errors[0]
+
+
+def test_release_after_threads():
+    data, objs = _pool_input()
+    assert fastsimdjson.loads_many(data, threads=4) == objs
+    assert fastsimdjson.release() is None
+    assert fastsimdjson.loads_many(data, threads=4) == objs
+    assert [to_py(v) for v in fastsimdjson.parse_many(data, threads=4)] == objs
+    assert fastsimdjson.release() is None
+    assert fastsimdjson.map_many(len, data, threads=8) == [len(o) for o in objs]
+
+
+def test_release_inside_map_many():
+    data, objs = _pool_input()
+
+    def fn(doc):
+        if doc["i"] % 5000 == 0:
+            fastsimdjson.release()
+        return doc["i"]
+
+    def body():
+        assert fastsimdjson.map_many(fn, data, threads=4) == [o["i"] for o in objs]
+
+    _no_hang(body)
+
+
+def test_release_during_threaded_runs():
+    import threading
+
+    data, objs = _pool_input()
+    stop = threading.Event()
+
+    def releaser():
+        while not stop.is_set():
+            fastsimdjson.release()
+
+    def body():
+        thread = threading.Thread(target=releaser)
+        thread.start()
+        try:
+            for _ in range(5):
+                assert fastsimdjson.loads_many(data, threads=4) == objs
+        finally:
+            stop.set()
+            thread.join()
+
+    _no_hang(body)
+
+
+def test_long_record_then_threads():
+    # A record past 64 MB grows the parser of the worker that reads it; the
+    # parser is freed after the run, and the next runs get a new one.
+    data, objs = _pool_input()
+    big = {"big": "x" * (65 << 20)}
+    text = data + json.dumps(big).encode() + b"\n" + data
+    out = fastsimdjson.loads_many(text, threads=4)
+    assert len(out) == 2 * len(objs) + 1 and out[len(objs)] == big
+    del out
+    assert fastsimdjson.loads_many(data, threads=4) == objs
