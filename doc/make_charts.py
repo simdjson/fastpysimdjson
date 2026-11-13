@@ -18,7 +18,7 @@ from matplotlib import font_manager
 HERE = os.path.dirname(os.path.abspath(__file__))
 ONLY = sys.argv[1] if len(sys.argv) > 1 else None  # "arrow", "msgpack", "minify" or None
 MACHINE = "Intel Xeon Gold 6548N (Emerald Rapids)"
-PYTHON = "Python 3.14.6"
+PYTHON = "Python 3.14.10"
 
 THEMES = {
     "light": dict(bg="#ffffff", text="#111111", sub="#555555", meta="#8a8a8a", grid="#e2e2e2",
@@ -81,22 +81,22 @@ def chart(name, title, subtitle, meta, rows, xlabel, xunit, unit, fmt="{:.2f}", 
         plt.close(fig)
 
 
-META = f"fastsimdjson 0.3.0  ·  {PYTHON}  ·  {MACHINE}"
+META = f"fastsimdjson 1.0.0  ·  {PYTHON}  ·  GCC 16.2  ·  {MACHINE}"
 
 chart("perf_loads",
       "Parsing JSON in Python",
       "the 22 files of simdjson-data into Python objects (geometric mean)",
       META,
-      [("fastsimdjson", "loads", 0.78, True),
-       ("orjson", "3.12.0", 0.60, False),
+      [("fastsimdjson", "loads", 0.77, True),
+       ("orjson", "3.13.0", 0.60, False),
+       ("jiter", "0.19.0, string cache", 0.54, False),
        ("msgspec", "0.22.0", 0.53, False),
-       ("jiter", "0.17.0, string cache", 0.48, False),
-       ("jiter", "0.17.0, no string cache", 0.44, False),
-       ("pysimdjson", "7.0.2", 0.44, False),
+       ("jiter", "0.19.0, no string cache", 0.44, False),
+       ("pysimdjson", "8.0.0", 0.44, False),
        ("cysimdjson", "26.27", 0.43, False),
-       ("ujson", "6.0.0", 0.37, False),
-       ("python-rapidjson", "1.25", 0.24, False),
-       ("simplejson", "4.2.0", 0.23, False),
+       ("ujson", "6.1.0", 0.37, False),
+       ("python-rapidjson", "1.26", 0.24, False),
+       ("simplejson", "4.3.0", 0.23, False),
        ("json", "standard library", 0.22, False)],
       "Parsing speed", "GB/s", " GB/s")
 
@@ -104,24 +104,24 @@ chart("perf_parse",
       "Reading part of a document",
       "the id and screen name of the 100 statuses of twitter.json",
       META,
-      [("fastsimdjson", "parse (lazy)", 158, True),
-       ("pysimdjson", "lazy", 179, False),
-       ("cysimdjson", "lazy", 229, False),
-       ("msgspec", "typed Struct", 336, False),
-       ("fastsimdjson", "loads", 861, True),
-       ("orjson", "loads", 1009, False),
-       ("jiter", "string cache", 1281, False),
-       ("jiter", "no string cache", 1592, False),
-       ("json", "loads", 3922, False)],
+      [("fastsimdjson", "parse (lazy)", 156, True),
+       ("pysimdjson", "lazy", 169, False),
+       ("cysimdjson", "lazy", 235, False),
+       ("msgspec", "typed Struct", 337, False),
+       ("fastsimdjson", "loads", 844, True),
+       ("orjson", "loads", 971, False),
+       ("jiter", "string cache", 1156, False),
+       ("jiter", "no string cache", 1602, False),
+       ("json", "loads", 3977, False)],
       "Time", "µs", " µs", fmt="{:.0f}", lower_is_better=True)
 
 chart("perf_dumpb",
       "Writing JSON as bytes",
       "compact UTF-8 bytes from the 22 files of simdjson-data (geometric mean)",
       META,
-      [("fastsimdjson", "dumpb", 10.09, True),
-       ("orjson", "3.12.0", 9.69, False),
-       ("msgspec", "0.22.0", 6.03, False),
+      [("fastsimdjson", "dumpb", 7.95, True),
+       ("orjson", "3.13.0", 7.38, False),
+       ("msgspec", "0.22.0", 5.26, False),
        ("json", "dumps(...).encode()", 1.00, False)],
       "Speed relative to json.dumps(...).encode()", "", "×")
 
@@ -129,7 +129,7 @@ chart("perf_dumps",
       "Writing JSON as str",
       "the same str as json.dumps, from the 22 files of simdjson-data (geometric mean)",
       META,
-      [("fastsimdjson", "dumps", 4.63, True),
+      [("fastsimdjson", "dumps", 4.21, True),
        ("json", "dumps", 1.00, False)],
       "Speed relative to json.dumps", "", "×")
 
@@ -137,21 +137,21 @@ chart("perf_ndjson",
       "Reading NDJSON",
       "20 MB, 5268 documents, one per line",
       META,
-      [("fastsimdjson", "parse_many (views)", 0.94, True),
-       ("fastsimdjson", "loads_many", 0.38, True),
-       ("msgspec", "decode_lines", 0.37, False),
-       ("fastsimdjson", "loads on each line", 0.33, True),
-       ("msgspec", "decode on each line", 0.27, False),
+      [("fastsimdjson", "parse_many (views)", 1.13, True),
+       ("fastsimdjson", "loads_many", 0.40, True),
+       ("msgspec", "decode_lines", 0.36, False),
+       ("fastsimdjson", "loads on each line", 0.34, True),
        ("orjson", "loads on each line", 0.26, False),
-       ("jiter", "each line, string cache", 0.22, False),
-       ("jiter", "each line, no string cache", 0.20, False),
+       ("msgspec", "decode on each line", 0.26, False),
+       ("jiter", "each line, string cache", 0.23, False),
+       ("jiter", "each line, no string cache", 0.21, False),
        ("json", "loads on each line", 0.12, False)],
       "Parsing speed", "GB/s", " GB/s")
 
 # NDJSON to Arrow and back: bench_arrow.py, Python 3.14, the result as a
 # pyarrow.Table (reading) or bytes (writing).
-META_ARROW = ("fastsimdjson 0.10.1  ·  pyarrow 26.0  ·  polars 2.1  ·  DuckDB 2.0  ·  "
-              "Python 3.14  ·  Xeon Gold 6548N")
+META_ARROW = ("fastsimdjson 1.0.0  ·  pyarrow 26.0  ·  polars 2.1  ·  DuckDB 2.0  ·  "
+              "Python 3.14.10  ·  Xeon Gold 6548N")
 
 
 def gbps(v):
@@ -238,38 +238,38 @@ def arrow_write(threads, flat, gh):
                   "Writing speed")
 
 
-arrow_read(1, (0.75, 0.18, 0.27), (2.08, 0.46, 0.55), (0.77, 0.18, 0.09))
-arrow_read(32, (14.7, 5.3, 4.3), (29.7, 12.3, 4.0), (16.0, 5.0, 0.12))
-arrow_write(1, (0.90, 0.45, 0.30), (1.09, 0.46, 0.31))
-arrow_write(32, (10.3, 1.6, 3.0), (4.5, 1.1, 0.82))
+arrow_read(1, (0.76, 0.18, 0.27), (1.96, 0.46, 0.54), (0.79, 0.18, 0.09))
+arrow_read(32, (15.0, 5.3, 4.3), (27.5, 12.1, 4.0), (14.4, 5.0, 0.12))
+arrow_write(1, (0.92, 0.45, 0.32), (1.08, 0.46, 0.32))
+arrow_write(32, (9.6, 1.6, 4.8), (4.8, 0.86, 1.1))
 
 # JSON to MessagePack and back: bench_msgpack.py, bytes in, bytes out, on one
 # core (the others decode, then encode).
-META_MSGPACK = ("fastsimdjson 0.10.0  ·  msgpack 1.2  ·  orjson 3.13  ·  ormsgpack 1.13  ·  "
-                "msgspec 0.22  ·  Python 3.14  ·  Xeon Gold 6338")
+META_MSGPACK = ("fastsimdjson 1.0.0  ·  msgpack 1.2  ·  orjson 3.13  ·  ormsgpack 1.13  ·  "
+                "msgspec 0.22  ·  Python 3.14  ·  Xeon Gold 6548N")
 
 chart("perf_msgpack_encode",
       "JSON to MessagePack in Python",
       "the 22 files of simdjson-data, from JSON bytes to MessagePack bytes (geometric mean)",
       META_MSGPACK,
-      [("fastsimdjson", "json_to_msgpack", 1.37, True),
-       ("orjson + ormsgpack", "ormsgpack.packb(orjson.loads(s))", 0.35, False),
-       ("msgspec", "msgpack.encode(json.decode(s))", 0.34, False),
-       ("fastsimdjson + msgpack", "msgpack.packb(fastsimdjson.loads(s))", 0.28, False),
-       ("orjson + msgpack", "msgpack.packb(orjson.loads(s))", 0.25, False),
-       ("json + msgpack", "msgpack.packb(json.loads(s))", 0.13, False)],
+      [("fastsimdjson", "json_to_msgpack", 1.67, True),
+       ("orjson + ormsgpack", "ormsgpack.packb(orjson.loads(s))", 0.46, False),
+       ("msgspec", "msgpack.encode(json.decode(s))", 0.42, False),
+       ("fastsimdjson + msgpack", "msgpack.packb(fastsimdjson.loads(s))", 0.34, False),
+       ("orjson + msgpack", "msgpack.packb(orjson.loads(s))", 0.32, False),
+       ("json + msgpack", "msgpack.packb(json.loads(s))", 0.17, False)],
       "Speed", "GB/s of JSON", " GB/s", kind="msgpack", left=0.37)
 
 chart("perf_msgpack_decode",
       "MessagePack to JSON in Python",
       "the 22 files of simdjson-data, from MessagePack bytes to JSON bytes (geometric mean)",
       META_MSGPACK,
-      [("fastsimdjson", "msgpack_to_json", 0.94, True),
-       ("ormsgpack + orjson", "orjson.dumps(ormsgpack.unpackb(b))", 0.27, False),
-       ("msgspec", "json.encode(msgpack.decode(b))", 0.25, False),
-       ("msgpack + orjson", "orjson.dumps(msgpack.unpackb(b))", 0.20, False),
-       ("msgpack + fastsimdjson", "fastsimdjson.dumpb(msgpack.unpackb(b))", 0.20, False),
-       ("msgpack + json", "json.dumps(msgpack.unpackb(b)).encode()", 0.07, False)],
+      [("fastsimdjson", "msgpack_to_json", 1.43, True),
+       ("ormsgpack + orjson", "orjson.dumps(ormsgpack.unpackb(b))", 0.35, False),
+       ("msgspec", "json.encode(msgpack.decode(b))", 0.32, False),
+       ("msgpack + fastsimdjson", "fastsimdjson.dumpb(msgpack.unpackb(b))", 0.26, False),
+       ("msgpack + orjson", "orjson.dumps(msgpack.unpackb(b))", 0.26, False),
+       ("msgpack + json", "json.dumps(msgpack.unpackb(b)).encode()", 0.10, False)],
       "Speed", "GB/s of JSON", " GB/s", kind="msgpack", left=0.37)
 
 grouped_chart("perf_msgpack_ndjson",
@@ -277,15 +277,15 @@ grouped_chart("perf_msgpack_ndjson",
               "GH Archive (886 MB, 304,929 events), on several threads",
               META_MSGPACK,
               [("NDJSON to MessagePack",
-                [("fastsimdjson", "64 threads", 15.0, True),
-                 ("fastsimdjson", "32 threads", 10.8, True),
-                 ("fastsimdjson", "8 threads", 6.8, True),
-                 ("fastsimdjson", "one thread", 1.18, True),
-                 ("orjson + ormsgpack", "each document, one thread", 0.29, False)]),
+                [("fastsimdjson", "64 threads", 22.7, True),
+                 ("fastsimdjson", "32 threads", 16.0, True),
+                 ("fastsimdjson", "8 threads", 8.7, True),
+                 ("fastsimdjson", "one thread", 1.31, True),
+                 ("orjson + ormsgpack", "each document, one thread", 0.36, False)]),
                ("MessagePack to NDJSON",
-                [("fastsimdjson", "8 threads", 5.0, True),
-                 ("fastsimdjson", "one thread", 1.05, True),
-                 ("msgpack + orjson", "Unpacker, each value, one thread", 0.20, False)])],
+                [("fastsimdjson", "8 threads", 6.0, True),
+                 ("fastsimdjson", "one thread", 1.51, True),
+                 ("msgpack + orjson", "Unpacker, each value, one thread", 0.25, False)])],
               "Speed", kind="msgpack", left=0.33)
 
 
@@ -340,18 +340,18 @@ def summary_chart(name, title, subtitle, meta, rows, kind="summary", left=0.33):
 summary_chart("perf_summary",
               "fastsimdjson against the competition",
               "speed on one core, relative to a fast Python alternative for each task (1×)",
-              "Python 3.14  ·  Intel Xeon Gold 6548N (MessagePack: Xeon Gold 6338)",
-              [("Python objects to JSON str", "dumps, same str as json.dumps", 4.6, "json.dumps"),
-               ("JSON to MessagePack", "json_to_msgpack", 3.9, "orjson + ormsgpack"),
-               ("NDJSON to Arrow", "loads_arrow, GH Archive", 3.8, "polars"),
-               ("MessagePack to JSON", "msgpack_to_json", 3.5, "ormsgpack + orjson"),
+              "fastsimdjson 1.0.0  ·  Python 3.14.10  ·  GCC 16.2  ·  Intel Xeon Gold 6548N",
+              [("Python objects to JSON str", "dumps, same str as json.dumps", 4.2, "json.dumps"),
+               ("MessagePack to JSON", "msgpack_to_json", 4.1, "ormsgpack + orjson"),
+               ("JSON to MessagePack", "json_to_msgpack", 3.6, "orjson + ormsgpack"),
+               ("NDJSON to Arrow", "loads_arrow, GH Archive", 3.6, "polars"),
                ("Arrow to NDJSON", "dumpb_arrow, GH Archive", 2.4, "polars"),
-               ("A few fields of a document", "parse (lazy)", 2.1, "msgspec, typed Struct"),
+               ("A few fields of a document", "parse (lazy)", 2.2, "msgspec, typed Struct"),
                ("JSON to Python objects", "loads", 1.3, "orjson")])
 
 
-META_TYPED = ("fastsimdjson 0.10.3+  ·  msgspec 0.22  ·  pydantic 2.14  ·  cattrs 26.2  ·  "
-              "Python 3.14  ·  Xeon Gold 6548N")
+META_TYPED = ("fastsimdjson 1.0.0  ·  msgspec 0.22  ·  pydantic 2.14  ·  cattrs 26.2  ·  "
+              "Python 3.14.10  ·  Xeon Gold 6548N")
 
 
 def typed_rows(ours, struct, dataclass, pydantic, cattrs, call="loads(data, type=T)"):
@@ -366,9 +366,9 @@ grouped_chart("perf_typed",
               "JSON to dataclasses",
               "typed decoding, with the types checked, on one core",
               META_TYPED,
-              [("twitter.json, a few fields", typed_rows(2.65, 1.54, 1.42, 0.68, 0.56)),
-               ("citm_catalog.json, typed in full", typed_rows(1.03, 0.64, 0.47, 0.19, 0.19)),
-               ("GH Archive NDJSON, 6 fields", typed_rows(1.93, 1.30, 1.16, 0.51, 0.43,
+              [("twitter.json, a few fields", typed_rows(2.60, 1.52, 1.43, 0.66, 0.55)),
+               ("citm_catalog.json, typed in full", typed_rows(0.98, 0.63, 0.47, 0.19, 0.19)),
+               ("GH Archive NDJSON, 6 fields", typed_rows(2.05, 1.30, 1.16, 0.51, 0.42,
                                                                  "loads_many(data, type=T)"))],
               "Speed", kind="typed", left=0.36)
 
@@ -376,9 +376,9 @@ grouped_chart("perf_typed",
 chart("perf_minify",
       "Minifying JSON in Python",
       "the 22 files of simdjson-data, from JSON bytes to compact JSON bytes (geometric mean)",
-      "orjson 3.13  ·  Python 3.14.10  ·  GCC 16.2  ·  Intel Xeon Gold 6548N",
-      [("fastsimdjson", "minify", 18.49, True),
-       ("fastsimdjson", "dumpb(loads(s))", 0.53, True),
+      "fastsimdjson 1.0.0  ·  orjson 3.13  ·  Python 3.14.10  ·  GCC 16.2  ·  Intel Xeon Gold 6548N",
+      [("fastsimdjson", "minify", 18.64, True),
+       ("fastsimdjson", "dumpb(loads(s))", 0.54, True),
        ("orjson", "dumps(loads(s))", 0.44, False),
        ("json", "dumps(loads(s))", 0.11, False)],
       "Speed", "GB/s of input", " GB/s", kind="minify", left=0.25)
