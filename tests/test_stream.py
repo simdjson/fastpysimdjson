@@ -303,17 +303,19 @@ def test_threads_delimiter_at_slice_edge(fmt, shift):
     # The delimiter falls on the last byte of a 256 KB slice, on the first
     # byte of the next, or near them; long records span whole slices too.
     slice_size = 256 << 10
-    pad = 0 if fmt == "lines" else 1  # the leading record separator
-    parts, pos = [], pad
+    pos = 0 if fmt == "lines" else 1  # the leading record separator
+    parts, edge, targets = [], 0, []
     for k in range(1, 9):
-        target = k * slice_size + shift  # where this record's delimiter goes
-        if k % 3 == 0:
-            target += 2 * slice_size  # a record longer than a slice
+        edge += 3 if k % 3 == 0 else 1  # a record longer than two slices
+        target = edge * slice_size + shift  # where this record's newline goes
         doc = json.dumps({"k": k, "s": ""}).encode()
-        doc = doc[:-2] + b"x" * (target - pos - len(doc)) + doc[-2:]
-        parts.append(doc)
-        pos += len(doc) + (1 if fmt == "lines" else 2)  # "\n" or "\n\x1e"
+        fill = target - pos - len(doc)
+        assert fill > 0
+        parts.append(doc[:-2] + b"x" * fill + doc[-2:])
+        targets.append(target)
+        pos = target + (1 if fmt == "lines" else 2)  # past "\n" or "\n\x1e"
     data = _framed(parts, fmt)
+    assert [i for i, c in enumerate(data) if c == 0x0A] == targets[:-1]  # none after the last
     expected = list(fastsimdjson.loads_many(data, format=fmt))
     assert [d["k"] for d in expected] == list(range(1, 9))
     for threads in (2, 5):
