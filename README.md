@@ -38,6 +38,8 @@ Against the standard `json` module, `loads` is 3.5 times faster and `parse`
   to Arrow tables and back, for pyarrow, polars or DuckDB, without a copy.
 * **MessagePack without Python objects.** `json_to_msgpack` and
   `msgpack_to_json` convert directly, without building Python objects.
+* **Minify without parsing.** `minify` strips insignificant whitespace
+  and returns `bytes`, without building Python objects.
 * **Everywhere.** No dependencies; wheels for Linux (x64 and ARM), macOS
   (Intel and Apple silicon) and Windows, Python 3.10 to 3.15, including
   free-threaded Python.
@@ -236,6 +238,20 @@ serialize dataclasses, `datetime`, `date`, `time`, `UUID`, numpy arrays or
 `OPT_PASSTHROUGH_DATACLASS` and `OPT_PASSTHROUGH_DATETIME` were set, and the
 options that concern only these types are accepted and have no effect.
 
+### `minify`: strip whitespace without parsing
+
+```python
+fastsimdjson.minify(b'{ "a" : [1, 2] }')    # b'{"a":[1,2]}'
+```
+
+`minify(data)` removes insignificant whitespace (spaces, tabs, newlines and
+carriage returns outside of strings) and returns `bytes`. It accepts `bytes`,
+`bytearray`, `memoryview` and `str`. It does not parse the document and does
+not validate it: numbers, escapes, duplicate keys and key order are left as
+they are, and input that is not valid JSON is minified the same way. An
+unterminated string raises `JSONDecodeError` (the minifier does not report
+where the string started, so the position is 0). The call releases the GIL.
+
 ### `dumpb_many`: NDJSON, on several threads
 
 ```python
@@ -396,7 +412,7 @@ once the batches are taken). fastsimdjson does not depend on pyarrow.
 
 * The schema is a `pyarrow.Schema` (or any object with `__arrow_c_schema__`)
   whose fields are booleans, 64-bit integers, unsigned 64-bit integers,
-  doubles, strings, structs and lists of these, or null. A field absent from a
+  doubles, strings, timestamps, structs and lists of these, or null. A field absent from a
   record is null; a key absent from the schema is skipped, or an error with
   `error_on_unknown_fields=True`. Skipped values are checked to be valid
   JSON, unless `validate_skipped=False` (then only their structure is).
@@ -407,6 +423,19 @@ once the batches are taken). fastsimdjson does not depend on pyarrow.
   type of its other values and integers become doubles next to other
   numbers; other mixes of types raise `ValueError`. Strings stay strings (no
   timestamps).
+* A timestamp field (`pa.timestamp("us", tz="UTC")`, any unit, with or
+  without a time zone) reads ISO 8601 strings, such as the `created_at` of
+  GH Archive events (`"2015-01-01T15:00:00Z"`): a date (a four-digit year), then optionally a
+  time (`T` or a space, then `15`, `15:00`, `15:00:00` or
+  `15:00:00.123456`), then optionally `Z` or an offset (`+05:00`). A time
+  without `Z` or an offset is UTC. An integer is a count of units since 1970.
+  As with `pyarrow.json.read_json` (which returns the same table from the
+  strings it accepts; a lowercase `t` or `z` and a comma before the fraction
+  are accepted here too), a fraction
+  with more digits than the unit raises `ValueError`, as does an invalid
+  date. Reading the timestamps costs next to nothing: GH Archive with
+  `created_at` as `timestamp[us, UTC]` reads at 2.11 GB/s on one core, as
+  with strings, against 0.45 GB/s for pyarrow and 0.21 GB/s for polars.
 * A new batch starts every `block_size` bytes of input. With `threads=N`
   (`threads=0` or `None`: one per processor), N threads read blocks of
   `block_size` bytes, cut at line ends: a record must then fit on one line.
@@ -420,11 +449,17 @@ NDJSON `bytes`, one object per row: a `pyarrow.Table`, `RecordBatch`,
 relation, an `ArrowStream`, or any object with `__arrow_c_stream__` or
 `__arrow_c_array__`. It writes integers of 8 to 64 bits, floats and doubles
 (as `dumpb` writes them, NaN and infinities as `null`), booleans, strings
-(including large strings and string views), structs and lists (including
-large and fixed-size lists); other types raise `ValueError`. With
+(including large strings and string views), timestamps (ISO 8601 in UTC,
+`"2015-01-01T15:00:00.250000Z"`, with `Z` when the timestamp has a time zone
+and the fraction when it is not zero), dates (`"2015-01-01"`), structs and
+lists (including large and fixed-size lists); other types raise
+`ValueError`. With
 `write_nulls=False`, null fields are omitted. With `threads=N`, N threads
 write ranges of rows into the result. The output reads back with
-`loads_arrow`, and with `loads_many(data, format="lines")`.
+`loads_arrow`, and with `loads_many(data, format="lines")`, except for
+timestamps and dates outside the years 0000 to 9999: their year is written
+with more digits or a minus sign, which `loads_arrow` does not read (nor
+does pyarrow).
 
 These functions release the GIL and run their threads outside Python, with
 or without free threading. They are built on
@@ -502,7 +537,7 @@ calling thread. Views returned by `parse` remain valid.
 ## Build and test
 
 Python 3.10 or newer, and a C++17 compiler (clang, GCC or MSVC). The simdjson
-5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.4 (NDJSON to Arrow
+5.1.1 and simdutf 9.2.1 amalgamations, simdjson_arrow 0.1.5 (NDJSON to Arrow
 and back: `simdjson_arrow.h` and `simdjson_arrow.cpp`) and simdjson_msgpack
 0.1.1 (JSON to MessagePack and back: `simdjson_msgpack.h` and
 `simdjson_msgpack.cpp`), both under the Apache-2.0 license, are already in
@@ -558,7 +593,8 @@ order; `tests/test_lazy.py` checks the views returned by `parse` the same way,
 `tests/test_dumps.py` compares `dumps` with `json.dumps` and `dumpb` with
 orjson (output and exceptions; the orjson comparisons are skipped when orjson
 is not installed, and recorded orjson results are checked either way), and
-`tests/test_stream.py` and `tests/test_files.py` cover streams and files. It
+`tests/test_stream.py` and `tests/test_files.py` cover streams and files, and
+`tests/test_minify.py` covers `minify`. The suite
 covers scalars, integers past 64 bits, UTF-8 strings at every length from 0 to
 199, the key cache, random documents, rejected input, deep
 nesting, padding at a page boundary, a saturated array count, reference
@@ -578,7 +614,8 @@ The benchmark scripts need simdjson-data and the `bench` extra (orjson,
 jiter, msgspec, pysimdjson, cysimdjson). `bench.py` times `loads` against
 `json.loads`, orjson and jiter, `bench_lazy.py` times `parse` against pysimdjson and
 cysimdjson, `bench_dumps.py` times `dumps` against `json.dumps` and `dumpb`
-against orjson and msgspec, and `bench_many.py` times `loads_many`.
+against orjson and msgspec, `bench_many.py` times `loads_many`, and
+`bench_minify.py` times `minify` against parsing and serializing again.
 
 pip:
 
@@ -588,6 +625,7 @@ python bench.py
 python bench_lazy.py
 python bench_dumps.py
 python bench_many.py
+python bench_minify.py
 ```
 
 uv:
@@ -598,6 +636,7 @@ python bench.py
 python bench_lazy.py
 python bench_dumps.py
 python bench_many.py
+python bench_minify.py
 ```
 
 ## Benchmarks
@@ -759,6 +798,28 @@ full of numbers. Both are 1.7
 times faster than msgspec and 10 times faster than `json`. The comparison was
 run on a processor with AVX-512, which `dumpb` and orjson both use to escape
 strings; other x64 processors use SSE2 and ARM processors NEON.
+
+### `minify`
+
+`minify` only removes whitespace. The other columns parse the document and
+serialize it again, which also validates it and rewrites numbers. Geometric
+mean over the 22 files, one core of an Intel Xeon Gold 6548N, Python 3.14.10,
+GCC 16.2, orjson 3.13.0 (`bench_minify.py`):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_minify_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_minify.png" width="80%" alt="Minifying JSON in Python: fastsimdjson minify 18.49 GB/s, fastsimdjson dumpb(loads(s)) 0.53, orjson dumps(loads(s)) 0.44, json dumps(loads(s)) 0.11">
+</picture>
+
+| method | GB/s |
+|---|---:|
+| **fastsimdjson `minify`** | **18.49** |
+| `loads` + `dumpb` | 0.53 |
+| orjson `loads` + `dumps` | 0.44 |
+| `json.loads` + `json.dumps` | 0.11 |
+
+Per file, `minify` runs from 15.5 GB/s (`gsoc-2018.json`) to 21.4 GB/s
+(`numbers.json`).
 
 ### Writing NDJSON with `dumpb_many`
 

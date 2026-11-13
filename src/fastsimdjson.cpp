@@ -2745,6 +2745,67 @@ enum : unsigned long {
 constexpr int ORJSON_MAX_DEPTH = 254;
 PyObject *EnumType = nullptr; // enum.Enum
 
+// The most UTF-8 bytes the text of the str s (not ASCII) can take.
+inline size_t utf8_max_length(PyObject *s) {
+  int kind = PyUnicode_KIND(s);
+  return size_t(PyUnicode_GET_LENGTH(s)) *
+         (kind == PyUnicode_1BYTE_KIND ? 2 : kind == PyUnicode_2BYTE_KIND ? 3 : 4);
+}
+
+// Writes the text of the str s (not ASCII) to dst as UTF-8, with simdutf;
+// dst has room for utf8_max_length(s) bytes. Returns the length, or -1 when
+// s holds a surrogate (as PyUnicode_AsUTF8AndSize, which fails then; no
+// exception is set). Unlike PyUnicode_AsUTF8AndSize, it leaves no UTF-8 copy
+// on the str: a str built for one serialization would carry it for nothing.
+FSJ_NOINLINE Py_ssize_t str_to_utf8(PyObject *s, char *dst) {
+  size_t len = size_t(PyUnicode_GET_LENGTH(s));
+  const void *data = PyUnicode_DATA(s);
+  size_t n;
+  switch (PyUnicode_KIND(s)) {
+  case PyUnicode_1BYTE_KIND:
+    return Py_ssize_t(simdutf::convert_latin1_to_utf8(static_cast<const char *>(data), len, dst));
+  case PyUnicode_2BYTE_KIND: {
+    // simdutf would join a high and a low surrogate (two code points in a
+    // str) into one character: any surrogate is an error.
+    const uint16_t *u = static_cast<const uint16_t *>(data);
+    bool surrogate = false;
+    for (size_t i = 0; i < len; i++) {
+      surrogate |= (u[i] & 0xF800) == 0xD800;
+    }
+    if (surrogate) {
+      return -1;
+    }
+    n = simdutf::convert_utf16_to_utf8(static_cast<const char16_t *>(data), len, dst);
+    break;
+  }
+  default:
+    n = simdutf::convert_utf32_to_utf8(static_cast<const char32_t *>(data), len, dst);
+    break;
+  }
+  return n == 0 && len != 0 ? -1 : Py_ssize_t(n); // simdutf rejects surrogates in UTF-32
+}
+
+// The index of the first byte of s[0, n) that needs an escape (no DEL), or n.
+inline size_t first_escape(const char *s, size_t n) {
+  size_t i = 0;
+#if FSJ_SSE2 || FSJ_NEON
+  for (; i + 16 <= n; i += 16) {
+    auto mask = escape_mask16(s + i, false);
+    if (mask != 0) {
+#if FSJ_SSE2
+      return i + size_t(ctz64(mask));
+#else
+      return i + size_t(ctz64(mask)) / 4;
+#endif
+    }
+  }
+#endif
+  while (i < n && !byte_needs_escape(uint8_t(s[i]), false)) {
+    i++;
+  }
+  return i;
+}
+
 struct OrjsonEncoder {
   OutBuf out{true};
   EncodedKey *keys = g_thread_parser.encoded_keys; // fetched once: TLS is slow
@@ -2787,6 +2848,35 @@ struct OrjsonEncoder {
     out.len += n;
   }
 
+  // A str that is not compact ASCII: transcoded to UTF-8 in place in the
+  // output, then escaped from the first byte that needs it (if any).
+  FSJ_NOINLINE int encode_non_ascii_str(PyObject *s) {
+    size_t max = utf8_max_length(s);
+    char *w = out.reserve(max + 2);
+    *w = '"';
+    Py_ssize_t r = str_to_utf8(s, w + 1);
+    if (r < 0) {
+      return fail("str is not valid UTF-8: surrogates not allowed");
+    }
+    size_t n = size_t(r);
+    size_t i = first_escape(w + 1, n);
+    if (i == n) {
+      w[n + 1] = '"';
+      out.len += n + 2;
+      return 0;
+    }
+    // Escape the rest, s[i, n), moved past the room its escapes need.
+    size_t start = out.len + 1 + i; // where the escaped rest goes
+    size_t rest = n - i;
+    char *b = out.reserve(1 + i + 7 * rest + 34) - out.len; // keeps the bytes past len
+    char *src = b + start + 6 * rest + 32;
+    memmove(src, b + start, rest);
+    char *e = escape_into_wide(b + start, src, rest, false);
+    *e++ = '"';
+    out.len = size_t(e - out.buf);
+    return 0;
+  }
+
   int encode_str(PyObject *s) {
     Py_ssize_t n;
     const char *p;
@@ -2809,11 +2899,7 @@ struct OrjsonEncoder {
       }
 #endif
     } else {
-      p = PyUnicode_AsUTF8AndSize(s, &n); // cached on the str, as orjson does
-      if (p == nullptr) {
-        PyErr_Clear();
-        return fail("str is not valid UTF-8: surrogates not allowed");
-      }
+      return encode_non_ascii_str(s);
     }
     char *w = out.reserve(6 * size_t(n) + 34);
     *w++ = '"';
@@ -2917,14 +3003,17 @@ struct OrjsonEncoder {
   }
 
   static int utf8_of(PyObject *s, std::string &text) {
-    Py_ssize_t n;
-    const char *u = PyUnicode_AsUTF8AndSize(s, &n);
-    if (u == nullptr) {
-      PyErr_Clear();
+    if (PyUnicode_IS_COMPACT_ASCII(s)) {
+      text.assign(static_cast<const char *>(PyUnicode_DATA(s)), size_t(PyUnicode_GET_LENGTH(s)));
+      return 0;
+    }
+    text.resize(utf8_max_length(s));
+    Py_ssize_t n = str_to_utf8(s, &text[0]);
+    if (n < 0) {
       PyErr_SetString(PyExc_TypeError, "str is not valid UTF-8: surrogates not allowed");
       return -1;
     }
-    text.assign(u, size_t(n));
+    text.resize(size_t(n));
     return 0;
   }
 
@@ -5615,6 +5704,98 @@ PyObject *msgpack_to_json(PyObject *, PyObject *args, PyObject *kwargs) {
   return msgpack_result(st, released, bytes, size);
 }
 
+// ---------------------------------------------------------------------------
+// minify(data): strip insignificant whitespace without parsing. simdjson's
+// minifier copies every byte that is not ASCII whitespace outside a string.
+// It does not validate the document. The one error it reports is an
+// unterminated string. The output is at most as long as the input.
+// ---------------------------------------------------------------------------
+
+// JSONDecodeError for an unterminated string. The minifier does not report
+// where the string started, so the position is the start of the document.
+void raise_minify_error(PyObject *original, PyObject *copy, const char *msg) {
+  PyObject *doc = nullptr;
+  if (PyUnicode_Check(original)) {
+    doc = Py_NewRef(original);
+  } else {
+    const char *s = nullptr;
+    Py_ssize_t n = 0;
+    PyObject *bytes = copy != nullptr ? copy : (PyBytes_Check(original) ? original : nullptr);
+    if (bytes != nullptr) {
+      s = PyBytes_AS_STRING(bytes);
+      n = PyBytes_GET_SIZE(bytes);
+    }
+    doc = PyUnicode_DecodeUTF8(s, n, "replace");
+  }
+  if (doc == nullptr) {
+    return;
+  }
+  PyObject *exc = PyObject_CallFunction(JSONDecodeError, "sOn", msg, doc, Py_ssize_t(0));
+  Py_DECREF(doc);
+  if (exc != nullptr) {
+    PyErr_SetObject(JSONDecodeError, exc);
+    Py_DECREF(exc);
+  }
+}
+
+// bytes and str are immutable, so minify reads them in place. A bytearray or
+// memoryview can be written by another thread once the GIL is released, so
+// those are copied first.
+PyObject *minify(PyObject *, PyObject *arg) {
+  const char *buf = nullptr;
+  Py_ssize_t len = 0;
+  PyObject *copy = nullptr;
+  if (PyBytes_Check(arg)) {
+    buf = PyBytes_AS_STRING(arg);
+    len = PyBytes_GET_SIZE(arg);
+  } else if (PyUnicode_Check(arg)) {
+    buf = PyUnicode_AsUTF8AndSize(arg, &len);
+    if (buf == nullptr) {
+      return nullptr;
+    }
+  } else if (PyByteArray_Check(arg) || PyMemoryView_Check(arg)) {
+    // As loads: a strided view is rejected before anything is copied.
+    if (PyMemoryView_Check(arg) && !PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(arg), 'C')) {
+      PyErr_SetString(PyExc_TypeError, "memoryview must be contiguous");
+      return nullptr;
+    }
+    copy = PyBytes_FromObject(arg);
+    if (copy == nullptr) {
+      return nullptr;
+    }
+  } else {
+    PyErr_Format(PyExc_TypeError,
+                 "Input must be bytes, bytearray, memoryview, or str, not %.200s",
+                 Py_TYPE(arg)->tp_name);
+    return nullptr;
+  }
+  if (copy != nullptr) {
+    buf = PyBytes_AS_STRING(copy);
+    len = PyBytes_GET_SIZE(copy);
+  }
+  PyObject *out = PyBytes_FromStringAndSize(nullptr, len);
+  if (out == nullptr) {
+    Py_XDECREF(copy);
+    return nullptr;
+  }
+  size_t dst_len = 0;
+  simdjson::error_code err;
+  Py_BEGIN_ALLOW_THREADS
+  err = simdjson::minify(buf, size_t(len), PyBytes_AS_STRING(out), dst_len);
+  Py_END_ALLOW_THREADS
+  if (err) {
+    Py_DECREF(out);
+    raise_minify_error(arg, copy, simdjson::error_message(err));
+    Py_XDECREF(copy);
+    return nullptr;
+  }
+  Py_XDECREF(copy);
+  if (dst_len != size_t(len) && _PyBytes_Resize(&out, Py_ssize_t(dst_len)) < 0) {
+    return nullptr;
+  }
+  return out;
+}
+
 // Benchmarking helper: run simdjson without building Python objects.
 PyObject *parse_only(PyObject *, PyObject *arg) {
   if (!PyBytes_Check(arg)) {
@@ -5644,6 +5825,10 @@ PyMethodDef methods[] = {
      "Deserialize JSON to Python objects. With type (a dataclass, TypedDict, NamedTuple, "
      "enum, container, union, literal or scalar type), the document as an instance of the "
      "type, checked: ValidationError otherwise."},
+    {"minify", minify, METH_O,
+     "minify(data)\n--\n\n"
+     "Remove insignificant whitespace from JSON and return bytes. "
+     "Does not parse or validate the document. An unterminated string raises JSONDecodeError."},
     {"dumps", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumps)),
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj to a JSON str. Same arguments and output as json.dumps."},

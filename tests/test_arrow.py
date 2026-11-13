@@ -1,4 +1,5 @@
 """Tests of loads_arrow, load_arrow_file and dumpb_arrow, against pyarrow."""
+import datetime
 import io
 import json
 import math
@@ -133,7 +134,7 @@ def test_schema_argument():
     with pytest.raises(TypeError, match="__arrow_c_schema__"):
         fastsimdjson.loads_arrow(data, {"a": "int64"})
     with pytest.raises(ValueError, match="unsupported schema"):
-        fastsimdjson.loads_arrow(data, pa.schema([("a", pa.timestamp("s"))]))
+        fastsimdjson.loads_arrow(data, pa.schema([("a", pa.binary())]))
 
 
 def test_errors():
@@ -204,7 +205,7 @@ def test_dumpb_errors():
     with pytest.raises(TypeError, match="__arrow_c_stream__"):
         fastsimdjson.dumpb_arrow([{"a": 1}])
     with pytest.raises(ValueError, match="not supported|unsupported"):
-        fastsimdjson.dumpb_arrow(pa.table({"t": pa.array([1], pa.timestamp("s"))}))
+        fastsimdjson.dumpb_arrow(pa.table({"t": pa.array([b"x"], pa.binary())}))
     with pytest.raises(TypeError):
         fastsimdjson.dumpb_arrow(pa.table({"a": [1]}), True)  # write_nulls is keyword-only
 
@@ -221,3 +222,74 @@ def test_polars():
 def test_keyword_only():
     with pytest.raises(TypeError):
         fastsimdjson.loads_arrow(b"", None, 1024)  # block_size is keyword-only
+
+
+def random_timestamps(n, seed=2, digits=9):
+    """Timestamps with fractions of up to `digits` digits."""
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        date = f"{rng.randint(1700, 2200):04d}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}"
+        kind = rng.randrange(4)
+        if kind == 0:
+            out.append({"t": date})
+            continue
+        time = f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}"
+        if rng.random() < 0.5 and digits > 0:
+            time += "." + "".join(rng.choice("0123456789") for _ in range(rng.randint(1, digits)))
+        zone = rng.choice(["", "Z", "+05:30", "-08:00"])
+        out.append({"t": date + rng.choice("T ") + time + zone})
+    return out
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+@pytest.mark.parametrize("tz", [None, "UTC"])
+def test_timestamps_like_pyarrow(unit, tz):
+    schema = pa.schema([("t", pa.timestamp(unit, tz=tz))])
+    digits = {"s": 0, "ms": 3, "us": 6, "ns": 9}[unit]
+    data = ndjson(random_timestamps(2000, digits=digits) + [{"t": None}, {}])
+    table = ours(data, schema)
+    assert table.schema == schema
+    assert table.equals(pyarrow_read(data, schema))
+
+
+def test_timestamps():
+    schema = pa.schema([("t", pa.timestamp("us", tz="UTC"))])
+    data = b'{"t": "2015-01-01T15:00:00.25Z"}\n{"t": 1420124400000000}\n{"t": null}\n'
+    assert ours(data, schema)["t"].to_pylist() == [
+        datetime.datetime(2015, 1, 1, 15, 0, 0, 250000, tzinfo=datetime.timezone.utc),
+        datetime.datetime(2015, 1, 1, 15, tzinfo=datetime.timezone.utc), None]
+    for bad in (b'{"t": "2015-02-29"}', b'{"t": "yesterday"}', b'{"t": "2015-01-01T24:00:00"}',
+                b'{"t": "2015-01-01T00:00:00.1234567"}'):  # more digits than microseconds
+        with pytest.raises(ValueError, match="invalid timestamp"):
+            ours(bad, schema)
+        with pytest.raises(pa.ArrowInvalid):
+            pyarrow_read(bad, schema)
+    with pytest.raises(ValueError, match="expected a timestamp, found a number"):
+        ours(b'{"t": 1.5}', schema)
+    # Out of the range of nanoseconds (1677 to 2262).
+    with pytest.raises(ValueError, match="invalid timestamp"):
+        ours(b'{"t": "2300-01-01"}', pa.schema([("t", pa.timestamp("ns"))]))
+    # Inference never makes timestamps.
+    assert ours(b'{"t": "2015-01-01T15:00:00Z"}').schema.field("t").type == pa.string()
+
+
+def test_dumpb_timestamps_and_dates():
+    table = pa.table({
+        "naive": pa.array([datetime.datetime(2015, 1, 1, 15, 0, 0, 250000), None], pa.timestamp("us")),
+        "utc": pa.array([0, -1], pa.timestamp("ns", tz="America/Montreal")),
+        "s": pa.array([1420124400, -1], pa.timestamp("s")),
+        "d": pa.array([datetime.date(2015, 1, 1), datetime.date(1969, 12, 31)], pa.date32()),
+        "d64": pa.array([datetime.date(2015, 1, 1), None], pa.date64()),
+    })
+    assert fastsimdjson.dumpb_arrow(table) == (
+        b'{"naive":"2015-01-01T15:00:00.250000","utc":"1970-01-01T00:00:00Z",'
+        b'"s":"2015-01-01T15:00:00","d":"2015-01-01","d64":"2015-01-01"}\n'
+        b'{"naive":null,"utc":"1969-12-31T23:59:59.999999999Z","s":"1969-12-31T23:59:59",'
+        b'"d":"1969-12-31","d64":null}\n')
+    # Back and forth.
+    schema = pa.schema([("t", pa.timestamp("ms", tz="UTC"))])
+    data = ndjson(random_timestamps(1000, digits=3))
+    table = ours(data, schema)
+    assert ours(fastsimdjson.dumpb_arrow(table), schema).equals(table)
+    assert ours(fastsimdjson.dumpb_arrow(table, threads=4), schema).equals(table)
