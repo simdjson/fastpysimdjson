@@ -328,11 +328,13 @@ once the batches are taken). fastsimdjson does not depend on pyarrow.
   timestamps).
 * A timestamp field (`pa.timestamp("us", tz="UTC")`, any unit, with or
   without a time zone) reads ISO 8601 strings, such as the `created_at` of
-  GH Archive events (`"2015-01-01T15:00:00Z"`): a date, then optionally a
+  GH Archive events (`"2015-01-01T15:00:00Z"`): a date (a four-digit year), then optionally a
   time (`T` or a space, then `15`, `15:00`, `15:00:00` or
   `15:00:00.123456`), then optionally `Z` or an offset (`+05:00`). A time
   without `Z` or an offset is UTC. An integer is a count of units since 1970.
-  As with `pyarrow.json.read_json` (which returns the same table), a fraction
+  As with `pyarrow.json.read_json` (which returns the same table from the
+  strings it accepts; a lowercase `t` or `z` and a comma before the fraction
+  are accepted here too), a fraction
   with more digits than the unit raises `ValueError`, as does an invalid
   date. Reading the timestamps costs next to nothing: GH Archive with
   `created_at` as `timestamp[us, UTC]` reads at 2.11 GB/s on one core, as
@@ -357,7 +359,10 @@ lists (including large and fixed-size lists); other types raise
 `ValueError`. With
 `write_nulls=False`, null fields are omitted. With `threads=N`, N threads
 write ranges of rows into the result. The output reads back with
-`loads_arrow`, and with `loads_many(data, format="lines")`.
+`loads_arrow`, and with `loads_many(data, format="lines")`, except for
+timestamps and dates outside the years 0000 to 9999: their year is written
+with more digits or a minus sign, which `loads_arrow` does not read (nor
+does pyarrow).
 
 These functions release the GIL and run their threads outside Python, with
 or without free threading. They are built on
