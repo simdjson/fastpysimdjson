@@ -34,8 +34,8 @@ Repository = "https://github.com/simdjson/fastpysimdjson"
 Issues = "https://github.com/simdjson/fastpysimdjson/issues"
 
 [project.optional-dependencies]
-test = ["pytest", "msgpack"]
-bench = ["orjson", "jiter", "msgspec", "pysimdjson", "cysimdjson", "pyarrow", "polars", "duckdb", "msgpack", "ormsgpack"]
+test = ["pytest", "msgpack", "typing_extensions"]
+bench = ["orjson", "jiter", "msgspec", "pydantic", "cattrs", "pysimdjson", "cysimdjson", "pyarrow", "polars", "duckdb", "msgpack", "ormsgpack"]
 
 [tool.cibuildwheel]
 skip = ["pp*"]

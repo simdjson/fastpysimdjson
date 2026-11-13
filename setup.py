@@ -15,7 +15,7 @@ ext = Extension(
     # too (SIMDJSON_MSGPACK_EXTERNAL_ZMIJ).
     sources=["src/fastsimdjson.cpp", "vendor/simdutf.cpp", "vendor/simdjson_arrow.cpp",
              "vendor/simdjson_msgpack.cpp"],
-    depends=["vendor/simdjson.cpp", "vendor/simdjson.h", "vendor/simdutf.h",
+    depends=["src/typed.h", "vendor/simdjson.cpp", "vendor/simdjson.h", "vendor/simdutf.h",
              "vendor/zmij.h", "vendor/simdjson_arrow.h", "vendor/simdjson_msgpack.h"],
     include_dirs=["vendor"],
     language="c++",

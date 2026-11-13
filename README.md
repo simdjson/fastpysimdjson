@@ -23,6 +23,9 @@ Against the standard `json` module, `loads` is 3.5 times faster and `parse`
 * **Same results.** `loads` returns what `json.loads` returns, `dumps` the
   same `str` as `json.dumps`, character for character, and `dumpb` the same
   bytes as `orjson.dumps`. Switching changes the speed, not the output.
+* **Typed.** `loads(data, type=T)` builds dataclasses, TypedDicts and
+  other typed values straight from the parser, with the types checked: 1.5
+  to 2.2 times as fast as msgspec, 3.8 to 5.3 times as fast as pydantic.
 * **Only what you need.** `parse` gives lazy views and builds only the
   values you read; `fields=` extracts only some fields from each document of
   a stream.
@@ -109,6 +112,84 @@ doc["search_metadata"].as_dict()          # convert a subtree, like loads
 * Errors are handled as in `loads`. A document that simdjson rejects but
   `json.loads` accepts (an overflowing number, an unpaired surrogate) is
   returned as plain Python objects, as `loads` would return it.
+
+### `type=`: typed decoding
+
+`loads(data, type=T)` returns the document as an instance of `T`, checked
+on the way. It builds dataclasses straight from the simdjson tape, without
+an intermediate dict, and is 1.5 to 2.2 times as fast as msgspec on one core
+(see [Typed decoding](#typed-decoding)).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed.png" width="80%" alt="JSON to dataclasses on one core, GB/s. twitter.json, a few fields: fastsimdjson 2.65, msgspec Struct 1.54, msgspec dataclasses 1.42, pydantic 0.68, orjson with cattrs 0.56. citm_catalog.json typed in full: fastsimdjson 1.03, msgspec Struct 0.64, msgspec dataclasses 0.47, pydantic 0.19, orjson with cattrs 0.19. GH Archive NDJSON, 6 fields: fastsimdjson 1.93, msgspec Struct 1.30, msgspec dataclasses 1.16, pydantic 0.51, orjson with cattrs 0.43">
+</picture>
+
+```python
+from dataclasses import dataclass, field
+from typing import Literal, Optional
+
+@dataclass
+class User:
+    id: int
+    login: str
+    followers: int = 0
+
+@dataclass
+class Repo:
+    id: int
+    name: str
+    owner: User
+    topics: list[str] = field(default_factory=list)
+    visibility: Literal["public", "private"] = "public"
+    license: Optional[str] = None
+
+repo = fastsimdjson.loads(data, type=Repo)
+repos = fastsimdjson.loads(data, type=list[Repo])
+events = list(fastsimdjson.loads_many(ndjson, type=Repo))
+```
+
+`type` accepts:
+
+* `int`, `float` (an integer becomes a float), `str`, `bool`, `type(None)`
+  (JSON `null`; `None` too inside a type, as in `list[None]`), and `Any` or
+  `object` (no check: the value as `loads` returns it). `type=None`, the
+  default, means no type;
+* `list`, `tuple` (fixed length or `tuple[T, ...]`), `set`, `frozenset`,
+  `dict` with `str` keys, and their abstract counterparts (`Sequence`,
+  `Mapping`, ...);
+* `Optional[T]`, unions (`int | str`, at most one type per JSON kind; an
+  integer goes to `int` rather than to `float`) and `Literal` (of `str`,
+  `int`, `bool` and `None`: JSON `1` is not `True`);
+* enums (by value: `str`, `int`, `bool` or `None`), dataclasses (including
+  frozen ones and those with `__slots__`), `TypedDict` (from `typing` or
+  `typing_extensions`) and `NamedTuple` (from an array);
+* `Annotated`, `NewType` and `type` aliases, and recursive types.
+
+Dataclass fields take their defaults (and default factories) when the key
+is missing, keys that are not fields are ignored, `__post_init__` runs, and
+`init=False` fields get their default. The fields are set as the generated
+`__init__` sets them: an `__init__` of your own is not called. A `TypedDict` becomes a `dict` with
+its keys only. A value of the wrong type raises
+`fastsimdjson.ValidationError` (a `ValueError`) with its path:
+
+```
+ValidationError: Expected `int`, got `str` - at `$.owner.id`
+```
+
+A `ValueError` or `TypeError` raised by `__post_init__` becomes a
+`ValidationError` too, with the path. Invalid JSON raises
+`JSONDecodeError`, and the documents that only `json` accepts (`NaN`, a
+number that overflows a double) are converted the same way, from what
+`json` returns; past what Python's stack allows, those raise
+`RecursionError`, as `json` does. A set of values that cannot be hashed
+(`set[list[int]]`) or a union that contains itself is a `TypeError`. The
+description of each type is computed once and cached (the cache starts over
+past 1024 types, so that types made on the fly do not pile up). `load`,
+`load_file`, `loads_many` and `map_many` accept `type=` too; a
+`ValidationError` ends the iteration of `loads_many`, as any error does. With
+`threads=N` on free-threaded Python, the instances are built on N threads
+(not with `fields=` or `lazy=True`).
 
 ### `dumps` and `dump`: like `json.dumps`
 
@@ -635,6 +716,47 @@ and the screen name of the 100 statuses of `twitter.json`:
 
 Here `parse` is about 25 times faster than `json.loads` and 5.5 times faster
 than `loads`. Most of its time is the simdjson parse itself.
+
+### Typed decoding
+
+`loads(data, type=T)` against msgspec (`msgspec.json.Decoder(T)` with the
+same dataclasses, and with the equivalent `msgspec.Struct` classes), pydantic
+(`TypeAdapter(...).validate_json`, with the equivalent models) and
+`cattrs.structure(orjson.loads(data), T)`. Three cases:
+
+* **twitter:** `twitter.json` as a dataclass of 100 statuses, six fields of
+  each status and four of its user, the rest skipped.
+* **citm:** `citm_catalog.json` typed in full (dicts of dataclasses, lists of
+  nested dataclasses).
+* **gh:** 64 MB of GH Archive events (NDJSON), six fields of each event
+  (`loads_many(data, type=T)`, one call per line for the others).
+
+MB/s, one core of an Intel Xeon Gold 6548N, Python 3.14, the manylinux
+wheels, best of 3 runs of 7 (`python bench_typed.py simdjson-data/jsonexamples
+gharchive.ndjson`):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_typed.png" width="80%" alt="JSON to dataclasses on one core, GB/s. twitter.json, a few fields: fastsimdjson 2.65, msgspec Struct 1.54, msgspec dataclasses 1.42, pydantic 0.68, orjson with cattrs 0.56. citm_catalog.json typed in full: fastsimdjson 1.03, msgspec Struct 0.64, msgspec dataclasses 0.47, pydantic 0.19, orjson with cattrs 0.19. GH Archive NDJSON, 6 fields: fastsimdjson 1.93, msgspec Struct 1.30, msgspec dataclasses 1.16, pydantic 0.51, orjson with cattrs 0.43">
+</picture>
+
+| | twitter | citm | gh |
+|---|---:|---:|---:|
+| **fastsimdjson `loads(type=)`** | **2649** | **1031** | **1926** |
+| msgspec (Struct) | 1544 | 637 | 1295 |
+| msgspec (dataclass) | 1421 | 473 | 1162 |
+| pydantic 2.14 | 681 | 195 | 510 |
+| orjson + cattrs | 561 | 188 | 426 |
+| fastsimdjson `loads` (dicts, untyped) | 966 | 1112 | 439 |
+
+fastsimdjson is 1.5 to 1.7 times as fast as msgspec with Structs, 1.7 to 2.2
+times as fast with the same dataclasses, and 3.8 to 5.3 times as fast as
+pydantic. When most of the document is not needed (twitter, gh), typed
+decoding is also 2.7 to 4.4 times as fast as building the dicts.
+
+On free-threaded Python 3.15t, `loads_many(data, type=T, threads=N)` read the
+886 MB GH Archive file into dataclasses at 1.67 GB/s on one thread, 7.6 GB/s
+on 8 and 12.2 GB/s on 32.
 
 ### `dumps` against `json.dumps`
 

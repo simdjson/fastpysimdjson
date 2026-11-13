@@ -595,6 +595,45 @@ struct Builder {
   }
 };
 
+// Tape index of the value that follows the one at i.
+inline size_t skip(const uint64_t *tape, size_t i) {
+  uint64_t word = tape[i];
+  switch (uint8_t(word >> 56)) {
+  case '[':
+  case '{':
+    return size_t(word & 0xFFFFFFFF);
+  case 'l':
+  case 'u':
+  case 'd':
+    return i + 2;
+  default:
+    return i + 1;
+  }
+}
+
+// Tape index of the closing bracket of the container at start.
+inline size_t close_of(const uint64_t *tape, size_t start) {
+  return size_t(tape[start] & 0xFFFFFFFF) - 1;
+}
+
+size_t count_of(const uint64_t *tape, size_t start) {
+  uint64_t word = tape[start];
+  size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
+  if (count < simdjson::internal::JSON_COUNT_MASK) {
+    return count;
+  }
+  // Saturated count: walk the container.
+  bool is_object = uint8_t(word >> 56) == '{';
+  size_t end = close_of(tape, start);
+  size_t n = 0;
+  for (size_t i = start + 1; i < end; n++) {
+    i = skip(tape, is_object ? i + 1 : i);
+  }
+  return n;
+}
+
+#include "typed.h"
+
 // Replaces a pending json.JSONDecodeError with our subclass, with the same
 // message, document and position. Other exceptions are left as they are.
 void reraise_decode_error() {
@@ -729,8 +768,8 @@ PyObject *parse_buffer(const char *buf, size_t len, PyObject *original) {
 }
 
 // Calls Parse on the bytes of arg (bytes, str, bytearray or memoryview).
-template <PyObject *(*Parse)(const char *, size_t, PyObject *)>
-PyObject *with_input(PyObject *arg) {
+template <class F>
+PyObject *with_input_f(PyObject *arg, F &&Parse) {
   if (PyBytes_Check(arg)) {
     return Parse(PyBytes_AS_STRING(arg), size_t(PyBytes_GET_SIZE(arg)), arg);
   }
@@ -772,8 +811,95 @@ PyObject *with_input(PyObject *arg) {
   return nullptr;
 }
 
-PyObject *loads(PyObject *, PyObject *arg) {
-  return with_input<parse_buffer>(arg);
+template <PyObject *(*Parse)(const char *, size_t, PyObject *)>
+PyObject *with_input(PyObject *arg) {
+  return with_input_f(arg, Parse);
+}
+
+// loads(data, type=T): the document as an instance of T.
+PyObject *parse_typed(const char *buf, size_t len, PyObject *original, PyObject *plan) {
+  if (!ensure_parser()) {
+    return nullptr;
+  }
+  if (parse_into(g_thread_parser.ptr->doc, buf, len)) {
+    release_large_parser();
+    PyObject *value = fallback_loads(original);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    PyObject *r = typed_convert(value, plan);
+    Py_DECREF(value);
+    return r;
+  }
+  // The decoding runs the user's code (__post_init__, an enum's _missing_,
+  // default factories), which may call loads on this thread: that call must
+  // not parse into the document being read, nor free it (release()). So the
+  // parser is taken from the thread while it is read; such a call makes a
+  // parser of its own, and the smaller of the two is kept.
+  parser *p = g_thread_parser.ptr;
+  g_thread_parser.ptr = nullptr;
+  PyObject *res = typed_build(p->doc, plan);
+  if (g_thread_parser.ptr == nullptr) {
+    g_thread_parser.ptr = p;
+  } else if (g_thread_parser.ptr->capacity() > p->capacity()) {
+    std::swap(g_thread_parser.ptr, p);
+    delete p;
+  } else {
+    delete p;
+  }
+  release_large_parser();
+  return res;
+}
+
+// The type= keyword of a function that takes one positional argument: a
+// new reference to the plan of the type, Py_None for type=None or no
+// type, nullptr after an error.
+PyObject *take_type(const char *fname, Py_ssize_t nargs, PyObject *const *args,
+                    PyObject *kwnames) {
+  if (nargs != 1) {
+    PyErr_Format(PyExc_TypeError, "%s() takes exactly one positional argument (%zd given)",
+                 fname, nargs);
+    return nullptr;
+  }
+  PyObject *type = Py_None;
+  if (kwnames != nullptr) {
+    for (Py_ssize_t k = 0; k < PyTuple_GET_SIZE(kwnames); k++) {
+      PyObject *name = PyTuple_GET_ITEM(kwnames, k);
+      if (PyUnicode_CompareWithASCIIString(name, "type") != 0) {
+        PyErr_Format(PyExc_TypeError, "%s() got an unexpected keyword argument '%U'", fname,
+                     name);
+        return nullptr;
+      }
+      type = args[nargs + k];
+    }
+  }
+  return type == Py_None ? Py_NewRef(Py_None) : get_plan(type);
+}
+
+// Parses data (a new reference, or nullptr after an error) with the plan
+// (Py_None: no type), then releases both.
+PyObject *typed_parse_and_release(PyObject *data, PyObject *plan) {
+  PyObject *r = nullptr;
+  if (data != nullptr) {
+    r = plan == Py_None ? with_input_f(data, parse_buffer)
+                        : with_input_f(data, [plan](const char *b, size_t n, PyObject *o) {
+                            return parse_typed(b, n, o, plan);
+                          });
+  }
+  Py_XDECREF(data);
+  Py_DECREF(plan);
+  return r;
+}
+
+PyObject *loads(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
+  if (nargs == 1 && kwnames == nullptr) {
+    return with_input<parse_buffer>(args[0]);
+  }
+  PyObject *plan = take_type("loads", nargs, args, kwnames);
+  if (plan == nullptr) {
+    return nullptr;
+  }
+  return typed_parse_and_release(Py_NewRef(args[0]), plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -831,43 +957,6 @@ void give_back(document *d) {
 
 inline const uint64_t *tape_of(DocumentObject *owner) {
   return owner->doc->tape.get();
-}
-
-// Tape index of the value that follows the one at i.
-inline size_t skip(const uint64_t *tape, size_t i) {
-  uint64_t word = tape[i];
-  switch (uint8_t(word >> 56)) {
-  case '[':
-  case '{':
-    return size_t(word & 0xFFFFFFFF);
-  case 'l':
-  case 'u':
-  case 'd':
-    return i + 2;
-  default:
-    return i + 1;
-  }
-}
-
-// Tape index of the closing bracket of the container at start.
-inline size_t close_of(const uint64_t *tape, size_t start) {
-  return size_t(tape[start] & 0xFFFFFFFF) - 1;
-}
-
-size_t count_of(const uint64_t *tape, size_t start) {
-  uint64_t word = tape[start];
-  size_t count = size_t((word >> 32) & simdjson::internal::JSON_COUNT_MASK);
-  if (count < simdjson::internal::JSON_COUNT_MASK) {
-    return count;
-  }
-  // Saturated count: walk the container.
-  bool is_object = uint8_t(word >> 56) == '{';
-  size_t end = close_of(tape, start);
-  size_t n = 0;
-  for (size_t i = start + 1; i < end; n++) {
-    i = skip(tape, is_object ? i + 1 : i);
-  }
-  return n;
 }
 
 PyObject *new_proxy(PyTypeObject *type, DocumentObject *owner, size_t start) {
@@ -3495,12 +3584,20 @@ PyObject *parse_and_release(PyObject *data) {
   return r;
 }
 
-PyObject *load(PyObject *, PyObject *fp) {
-  return parse_and_release<parse_buffer>(PyObject_CallMethod(fp, "read", nullptr));
+PyObject *load(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
+  PyObject *plan = take_type("load", nargs, args, kwnames);
+  if (plan == nullptr) {
+    return nullptr;
+  }
+  return typed_parse_and_release(PyObject_CallMethod(args[0], "read", nullptr), plan);
 }
 
-PyObject *load_file(PyObject *, PyObject *path) {
-  return parse_and_release<parse_buffer>(read_file(path));
+PyObject *load_file(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
+  PyObject *plan = take_type("load_file", nargs, args, kwnames);
+  if (plan == nullptr) {
+    return nullptr;
+  }
+  return typed_parse_and_release(read_file(args[0]), plan);
 }
 
 PyObject *parse_file(PyObject *, PyObject *path) {
@@ -3528,6 +3625,7 @@ struct StreamObject {
   simdjson::stream_format format;
   bool lazy;
   bool done;
+  bool running; // in stream_next: the user's code (type=) may call next again
   bool active;     // a simdjson stream is running from `base`
   size_t base;     // offset of the running stream in buf
   size_t last_end; // offset just past the last document returned
@@ -3541,6 +3639,7 @@ struct StreamObject {
   bool borrowed_parser; // p is this thread's chunk parser (not deleted)
   Fields *fields;       // fields=: the values at these pointers, not the documents
   bool owns_fields;     // false in the chunks of a parallel run
+  PyObject *plan;       // type=: the capsule of the type's plan (owned by the whole stream)
   parser *p;
   document_stream *stream;
   document_stream::iterator it;
@@ -3708,6 +3807,9 @@ PyObject *stream_value(StreamObject *s) {
   if (s->fields != nullptr) {
     return extract_fields_gc_paused(s->p->doc, *s->fields);
   }
+  if (s->plan != nullptr) {
+    return typed_build(s->p->doc, s->plan);
+  }
   if (!s->lazy) {
     return build_with_gc_paused(s->p->doc, 1);
   }
@@ -3757,6 +3859,11 @@ PyObject *stream_fallback(StreamObject *s) {
   s->active = false; // resume with simdjson after this document
   if (s->fields != nullptr) {
     PyObject *v = extract_fields_py(value, *s->fields);
+    Py_DECREF(value);
+    return v;
+  }
+  if (s->plan != nullptr) {
+    PyObject *v = typed_convert(value, s->plan);
     Py_DECREF(value);
     return v;
   }
@@ -3816,8 +3923,13 @@ PyObject *stream_next(PyObject *self) {
   StreamObject *s = reinterpret_cast<StreamObject *>(self);
   PyObject *r = nullptr;
   Py_BEGIN_CRITICAL_SECTION(self);
-  if (!s->done) {
+  if (s->running) {
+    // From __post_init__ (or the like) while this stream builds a document.
+    PyErr_SetString(PyExc_RuntimeError, "stream already executing");
+  } else if (!s->done) {
+    s->running = true;
     r = stream_next_locked(s);
+    s->running = false;
     s->done = r == nullptr; // the end, or an error: the stream is over
   }
   Py_END_CRITICAL_SECTION();
@@ -3836,6 +3948,7 @@ void stream_dealloc(PyObject *self) {
   }
   if (s->owns_fields) {
     delete s->fields;
+    Py_XDECREF(s->plan);
   }
   delete s->copy;
   Py_XDECREF(s->source);
@@ -3923,9 +4036,10 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   s->active = false;
   s->base = 0;
   s->last_end = 0;
-  s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  s->no_fallback = s->need_fallback = s->borrowed_parser = s->running = false;
   s->fields = nullptr;
   s->owns_fields = false;
+  s->plan = nullptr;
   PyObject *self = reinterpret_cast<PyObject *>(s);
   if (must_copy) {
     PyObject *b = PyBytes_FromObject(data);
@@ -4033,9 +4147,10 @@ StreamObject *stream_over(StreamObject *whole, size_t from, size_t to, bool chun
   s->prefix = whole->prefix;
   s->open = whole->open;
   s->close = whole->close;
-  s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  s->no_fallback = s->need_fallback = s->borrowed_parser = s->running = false;
   s->fields = whole->fields; // whole outlives its chunks
   s->owns_fields = false;
+  s->plan = whole->plan;
   if (chunk && !g_thread_parser.chunk_parser_busy) {
     if (g_thread_parser.chunk_parser == nullptr) {
       register_thread_cleanup();
@@ -4550,9 +4665,21 @@ PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *
     return nullptr;
   }
   Fields *fields = nullptr;
+  PyObject *plan = nullptr;
   if (allow_fields) {
     PyObject *spec = pop_keyword(rest, "fields");
     PyObject *dflt = PyErr_Occurred() ? nullptr : pop_keyword(rest, "default");
+    PyObject *type = PyErr_Occurred() ? nullptr : pop_keyword(rest, "type");
+    if (!PyErr_Occurred() && type != nullptr && type != Py_None) {
+      if (lazy) {
+        PyErr_SetString(PyExc_ValueError, "type cannot be combined with lazy=True");
+      } else if (spec != nullptr && spec != Py_None) {
+        PyErr_SetString(PyExc_ValueError, "type cannot be combined with fields");
+      } else {
+        plan = get_plan(type);
+      }
+    }
+    Py_XDECREF(type);
     if (PyErr_Occurred()) {
       // reported below
     } else if (spec != nullptr && spec != Py_None) {
@@ -4568,6 +4695,8 @@ PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *
     Py_XDECREF(dflt);
     if (PyErr_Occurred()) {
       Py_XDECREF(rest);
+      delete fields;
+      Py_XDECREF(plan);
       return nullptr;
     }
   }
@@ -4575,12 +4704,12 @@ PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *
   Py_XDECREF(rest);
   if (self == nullptr) {
     delete fields;
+    Py_XDECREF(plan);
     return nullptr;
   }
-  if (fields != nullptr) {
-    reinterpret_cast<StreamObject *>(self)->fields = fields;
-    reinterpret_cast<StreamObject *>(self)->owns_fields = true;
-  }
+  reinterpret_cast<StreamObject *>(self)->fields = fields;
+  reinterpret_cast<StreamObject *>(self)->plan = plan;
+  reinterpret_cast<StreamObject *>(self)->owns_fields = true;
   if (!given && !force_list) {
     return self;
   }
@@ -5731,7 +5860,12 @@ PyObject *release(PyObject *, PyObject *) {
 
 PyMethodDef methods[] = {
     {"_parse_only", parse_only, METH_O, "Parse without building objects."},
-    {"loads", loads, METH_O, "Deserialize JSON to Python objects."},
+    {"loads", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(loads)),
+     METH_FASTCALL | METH_KEYWORDS,
+     "loads(data, /, *, type=None)\n--\n\n"
+     "Deserialize JSON to Python objects. With type (a dataclass, TypedDict, NamedTuple, "
+     "enum, container, union, literal or scalar type), the document as an instance of the "
+     "type, checked: ValidationError otherwise."},
     {"minify", minify, METH_O,
      "minify(data)\n--\n\n"
      "Remove insignificant whitespace from JSON and return bytes. "
@@ -5745,13 +5879,19 @@ PyMethodDef methods[] = {
     {"dump", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dump)),
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj as JSON to fp (a file with a write method), like json.dump."},
-    {"load", load, METH_O, "Deserialize JSON from fp (a file with a read method), like json.load."},
-    {"load_file", load_file, METH_O, "Deserialize the JSON file at path, like loads."},
+    {"load", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(load)),
+     METH_FASTCALL | METH_KEYWORDS,
+     "load(fp, /, *, type=None)\n--\n\n"
+     "Deserialize JSON from fp (a file with a read method), like json.load; type as in loads."},
+    {"load_file", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(load_file)),
+     METH_FASTCALL | METH_KEYWORDS,
+     "load_file(path, /, *, type=None)\n--\n\nDeserialize the JSON file at path, like loads."},
     {"parse_file", parse_file, METH_O, "Parse the JSON file at path lazily, like parse."},
     {"loads_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(loads_many)),
      METH_VARARGS | METH_KEYWORDS,
      "Iterate over the JSON documents of data (NDJSON, JSON Lines, ...), like loads; "
-     "with threads=N, the list of the documents, built by N threads."},
+     "with threads=N, the list of the documents, built by N threads; with type=T, "
+     "the documents as instances of T (see loads)."},
     {"parse_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(parse_many)),
      METH_VARARGS | METH_KEYWORDS,
      "Iterate over the JSON documents of data lazily, like parse."},
@@ -5793,9 +5933,8 @@ PyMethodDef methods[] = {
      "values of the input becomes one line of NDJSON."},
     {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
      METH_VARARGS | METH_KEYWORDS,
-     "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default): the list of "
-     "fn(doc) for the "
-     "documents of data, with fn called in the threads."},
+     "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default, type): the "
+     "list of fn(doc) for the documents of data, with fn called in the threads."},
     {"parse", parse, METH_O,
      "Parse JSON lazily: objects and arrays are returned as read-only views "
      "(Object, Array) whose values are converted on access."},
@@ -5916,6 +6055,18 @@ int exec_fastsimdjson(PyObject *module) {
     }
   }
   if (PyModule_AddObjectRef(module, "JSONDecodeError", JSONDecodeError) < 0) {
+    return -1;
+  }
+  if (ValidationError == nullptr) {
+    ValidationError = PyErr_NewExceptionWithDoc(
+        "fastsimdjson.ValidationError",
+        "The JSON is valid but does not match the type given to loads(type=...).",
+        PyExc_ValueError, nullptr);
+    if (ValidationError == nullptr) {
+      return -1;
+    }
+  }
+  if (PyModule_AddObjectRef(module, "ValidationError", ValidationError) < 0) {
     return -1;
   }
   struct {
