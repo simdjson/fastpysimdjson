@@ -737,6 +737,19 @@ void release_large_parser() {
   }
 }
 
+// The same for the parser of the slices of parallel streams, after a run: a
+// long record would otherwise keep a large parser in every thread that met
+// one, including the pool's workers, which live as long as the process.
+#ifdef Py_GIL_DISABLED
+void release_large_chunk_parser() {
+  parser *p = g_thread_parser.chunk_parser;
+  if (p != nullptr && !g_thread_parser.chunk_parser_busy && p->capacity() > MAX_RETAINED_CAPACITY) {
+    delete p;
+    g_thread_parser.chunk_parser = nullptr;
+  }
+}
+#endif
+
 // Suspend the cyclic GC while building: the new containers cannot form
 // cycles, and collections triggered by the many allocations are wasted work.
 // PyGC_Disable is process-global, so free-threaded builds leave GC alone.
@@ -4344,32 +4357,63 @@ struct WorkerPool {
   size_t ready = 0; // workers with a thread state, waiting for tasks
   size_t exited = 0;
   bool stopping = false;
+  // release(): each worker frees its parsers and caches (they are
+  // thread-local) when it sees a new generation, and counts itself in
+  // `released`.
+  size_t release_gen = 0;
+  size_t released = 0;
 };
 WorkerPool *g_pool = nullptr; // never freed: its threads may outlive anything
 std::mutex g_pool_mu;
+// Inside a run of the pool (a worker, or a caller doing its share): release()
+// must not wait for the workers there, since it may be one of them.
+thread_local int t_in_run = 0;
 
 void pool_worker(WorkerPool *pool) {
   PyThreadState *ts = PyThreadState_New(pool->interp);
+  size_t seen; // the release generation this worker has handled
   {
     std::lock_guard<std::mutex> lk(pool->mu);
     pool->ready++;
+    seen = pool->release_gen;
   }
   pool->done.notify_all();
   for (;;) {
-    PoolTask *run;
+    PoolTask *run = nullptr;
     {
       std::unique_lock<std::mutex> lk(pool->mu);
-      pool->wake.wait(lk, [pool] { return pool->stopping || !pool->tasks.empty(); });
-      if (pool->tasks.empty()) {
+      pool->wake.wait(lk, [pool, &seen] {
+        return pool->stopping || !pool->tasks.empty() || seen != pool->release_gen;
+      });
+      if (seen != pool->release_gen) {
+        seen = pool->release_gen;
+      } else if (pool->tasks.empty()) {
         break; // stopping
+      } else {
+        run = pool->tasks.front();
+        pool->tasks.pop_front();
+        run->active++;
       }
-      run = pool->tasks.front();
-      pool->tasks.pop_front();
-      run->active++;
+    }
+    if (run == nullptr) { // release()
+      if (ts != nullptr) {
+        PyEval_RestoreThread(ts);
+        release_thread_state();
+        PyEval_SaveThread();
+      }
+      {
+        std::lock_guard<std::mutex> lk(pool->mu);
+        pool->released++;
+      }
+      pool->done.notify_all();
+      continue;
     }
     if (ts != nullptr) {
       PyEval_RestoreThread(ts);
+      t_in_run++;
       run->work();
+      t_in_run--;
+      release_large_chunk_parser();
       PyEval_SaveThread();
     }
     {
@@ -4470,7 +4514,10 @@ void run_on_pool(PoolTask *task, size_t nthreads) {
     }
     pool->wake.notify_all();
   }
+  t_in_run++;
   task->work(); // the calling thread too
+  t_in_run--;
+  release_large_chunk_parser();
   if (pool != nullptr) {
     Py_BEGIN_ALLOW_THREADS
     std::unique_lock<std::mutex> lk(pool->mu);
@@ -4480,6 +4527,41 @@ void run_on_pool(PoolTask *task, size_t nthreads) {
     pool->done.wait(lk, [task] { return task->active == 0; });
     Py_END_ALLOW_THREADS
   }
+}
+
+// release(): the idle workers free their parsers and caches; the calling
+// thread waits for them (detached), unless it is inside a run, where it may
+// be a worker itself, or the workers may be waiting for its run. A worker
+// busy with another thread's run does its part when that run is done.
+void release_pool() {
+  WorkerPool *pool;
+  {
+    std::lock_guard<std::mutex> g(g_pool_mu);
+    pool = g_pool;
+  }
+  if (pool == nullptr) {
+    return;
+  }
+  size_t gen, target;
+  {
+    std::lock_guard<std::mutex> lk(pool->mu);
+    if (pool->stopping || pool->interp != PyInterpreterState_Get()) {
+      return;
+    }
+    gen = ++pool->release_gen;
+    pool->released = 0;
+    target = pool->ready;
+  }
+  pool->wake.notify_all();
+  if (t_in_run > 0) {
+    return;
+  }
+  Py_BEGIN_ALLOW_THREADS
+  std::unique_lock<std::mutex> lk(pool->mu);
+  pool->done.wait(lk, [pool, gen, target] {
+    return pool->released >= target || pool->release_gen != gen || pool->stopping;
+  });
+  Py_END_ALLOW_THREADS
 }
 
 #ifndef _WIN32
@@ -5855,6 +5937,9 @@ PyObject *parse_only(PyObject *, PyObject *arg) {
 
 PyObject *release(PyObject *, PyObject *) {
   release_thread_state();
+#ifdef Py_GIL_DISABLED
+  release_pool();
+#endif
   Py_RETURN_NONE;
 }
 

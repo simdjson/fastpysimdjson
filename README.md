@@ -534,7 +534,10 @@ references to the items of the containers they serialize.
 ### `release`
 
 `release()` frees the simdjson parser and the string caches kept by the
-calling thread. Views returned by `parse` remain valid.
+calling thread. On free-threaded Python, it also has the idle worker threads
+of the parallel streams (`threads=N`) free theirs; a worker busy with a
+stream of another thread does so when it is done. Views returned by `parse`
+remain valid.
 
 ## Build and test
 
@@ -989,7 +992,17 @@ just created, which takes about 0.1 s here, with or without threads.
 
 * The simdjson parser and the key and string caches are thread-local.
   `release()` frees the parser and the cached strings retained by the calling
-  thread, and they are freed when a Python thread exits. A parser that grows
-  past 64 MB is freed on its own at the end of that call; its caches stay.
+  thread and by the worker threads of the parallel streams, and they are
+  freed when a Python thread exits. A parser that grows past 64 MB is freed
+  on its own at the end of that call; its caches stay.
+* On free-threaded Python, the worker threads of the parallel streams
+  (`threads=N`) are started at the first call that needs them and kept until
+  the interpreter exits: starting threads costs about as much as the parsing.
+  Idle workers wait without using the processor. Each one keeps a parser
+  (about a megabyte) and its caches until `release()`. Free-threaded CPython
+  also keeps the memory of freed objects for reuse, in the thread that
+  allocated it, rather than returning it to the system (the standard `json`
+  module shows the same): after a large threaded call, the process stays
+  larger, and the next calls reuse that memory.
 * Subinterpreters are not supported: the module keeps per-process state (its
   types, and per-thread parsers and string caches).
