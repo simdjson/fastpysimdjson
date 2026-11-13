@@ -5536,13 +5536,13 @@ PyObject *minify(PyObject *, PyObject *arg) {
       return nullptr;
     }
   } else if (PyByteArray_Check(arg) || PyMemoryView_Check(arg)) {
-    copy = PyBytes_FromObject(arg);
-    if (copy == nullptr) {
+    // As loads: a strided view is rejected before anything is copied.
+    if (PyMemoryView_Check(arg) && !PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(arg), 'C')) {
+      PyErr_SetString(PyExc_TypeError, "memoryview must be contiguous");
       return nullptr;
     }
-    if (PyMemoryView_Check(arg) && !PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(arg), 'C')) {
-      Py_DECREF(copy);
-      PyErr_SetString(PyExc_TypeError, "memoryview must be contiguous");
+    copy = PyBytes_FromObject(arg);
+    if (copy == nullptr) {
       return nullptr;
     }
   } else {
