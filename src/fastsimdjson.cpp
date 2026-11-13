@@ -5575,6 +5575,98 @@ PyObject *msgpack_to_json(PyObject *, PyObject *args, PyObject *kwargs) {
   return msgpack_result(st, released, bytes, size);
 }
 
+// ---------------------------------------------------------------------------
+// minify(data): strip insignificant whitespace without parsing. simdjson's
+// minifier copies every byte that is not ASCII whitespace outside a string.
+// It does not validate the document. The one error it reports is an
+// unterminated string. The output is at most as long as the input.
+// ---------------------------------------------------------------------------
+
+// JSONDecodeError for an unterminated string. The minifier does not report
+// where the string started, so the position is the start of the document.
+void raise_minify_error(PyObject *original, PyObject *copy, const char *msg) {
+  PyObject *doc = nullptr;
+  if (PyUnicode_Check(original)) {
+    doc = Py_NewRef(original);
+  } else {
+    const char *s = nullptr;
+    Py_ssize_t n = 0;
+    PyObject *bytes = copy != nullptr ? copy : (PyBytes_Check(original) ? original : nullptr);
+    if (bytes != nullptr) {
+      s = PyBytes_AS_STRING(bytes);
+      n = PyBytes_GET_SIZE(bytes);
+    }
+    doc = PyUnicode_DecodeUTF8(s, n, "replace");
+  }
+  if (doc == nullptr) {
+    return;
+  }
+  PyObject *exc = PyObject_CallFunction(JSONDecodeError, "sOn", msg, doc, Py_ssize_t(0));
+  Py_DECREF(doc);
+  if (exc != nullptr) {
+    PyErr_SetObject(JSONDecodeError, exc);
+    Py_DECREF(exc);
+  }
+}
+
+// bytes and str are immutable, so minify reads them in place. A bytearray or
+// memoryview can be written by another thread once the GIL is released, so
+// those are copied first.
+PyObject *minify(PyObject *, PyObject *arg) {
+  const char *buf = nullptr;
+  Py_ssize_t len = 0;
+  PyObject *copy = nullptr;
+  if (PyBytes_Check(arg)) {
+    buf = PyBytes_AS_STRING(arg);
+    len = PyBytes_GET_SIZE(arg);
+  } else if (PyUnicode_Check(arg)) {
+    buf = PyUnicode_AsUTF8AndSize(arg, &len);
+    if (buf == nullptr) {
+      return nullptr;
+    }
+  } else if (PyByteArray_Check(arg) || PyMemoryView_Check(arg)) {
+    // As loads: a strided view is rejected before anything is copied.
+    if (PyMemoryView_Check(arg) && !PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(arg), 'C')) {
+      PyErr_SetString(PyExc_TypeError, "memoryview must be contiguous");
+      return nullptr;
+    }
+    copy = PyBytes_FromObject(arg);
+    if (copy == nullptr) {
+      return nullptr;
+    }
+  } else {
+    PyErr_Format(PyExc_TypeError,
+                 "Input must be bytes, bytearray, memoryview, or str, not %.200s",
+                 Py_TYPE(arg)->tp_name);
+    return nullptr;
+  }
+  if (copy != nullptr) {
+    buf = PyBytes_AS_STRING(copy);
+    len = PyBytes_GET_SIZE(copy);
+  }
+  PyObject *out = PyBytes_FromStringAndSize(nullptr, len);
+  if (out == nullptr) {
+    Py_XDECREF(copy);
+    return nullptr;
+  }
+  size_t dst_len = 0;
+  simdjson::error_code err;
+  Py_BEGIN_ALLOW_THREADS
+  err = simdjson::minify(buf, size_t(len), PyBytes_AS_STRING(out), dst_len);
+  Py_END_ALLOW_THREADS
+  if (err) {
+    Py_DECREF(out);
+    raise_minify_error(arg, copy, simdjson::error_message(err));
+    Py_XDECREF(copy);
+    return nullptr;
+  }
+  Py_XDECREF(copy);
+  if (dst_len != size_t(len) && _PyBytes_Resize(&out, Py_ssize_t(dst_len)) < 0) {
+    return nullptr;
+  }
+  return out;
+}
+
 // Benchmarking helper: run simdjson without building Python objects.
 PyObject *parse_only(PyObject *, PyObject *arg) {
   if (!PyBytes_Check(arg)) {
@@ -5599,6 +5691,10 @@ PyObject *release(PyObject *, PyObject *) {
 PyMethodDef methods[] = {
     {"_parse_only", parse_only, METH_O, "Parse without building objects."},
     {"loads", loads, METH_O, "Deserialize JSON to Python objects."},
+    {"minify", minify, METH_O,
+     "minify(data)\n--\n\n"
+     "Remove insignificant whitespace from JSON and return bytes. "
+     "Does not parse or validate the document. An unterminated string raises JSONDecodeError."},
     {"dumps", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumps)),
      METH_VARARGS | METH_KEYWORDS,
      "Serialize obj to a JSON str. Same arguments and output as json.dumps."},

@@ -35,6 +35,8 @@ Against the standard `json` module, `loads` is 3.5 times faster and `parse`
   to Arrow tables and back, for pyarrow, polars or DuckDB, without a copy.
 * **MessagePack without Python objects.** `json_to_msgpack` and
   `msgpack_to_json` convert directly, without building Python objects.
+* **Minify without parsing.** `minify` strips insignificant whitespace
+  and returns `bytes`, without building Python objects.
 * **Everywhere.** No dependencies; wheels for Linux (x64 and ARM), macOS
   (Intel and Apple silicon) and Windows, Python 3.10 to 3.15, including
   free-threaded Python.
@@ -154,6 +156,20 @@ serialize dataclasses, `datetime`, `date`, `time`, `UUID`, numpy arrays or
 `orjson.Fragment` itself: they go to `default`, as if
 `OPT_PASSTHROUGH_DATACLASS` and `OPT_PASSTHROUGH_DATETIME` were set, and the
 options that concern only these types are accepted and have no effect.
+
+### `minify`: strip whitespace without parsing
+
+```python
+fastsimdjson.minify(b'{ "a" : [1, 2] }')    # b'{"a":[1,2]}'
+```
+
+`minify(data)` removes insignificant whitespace (spaces, tabs, newlines and
+carriage returns outside of strings) and returns `bytes`. It accepts `bytes`,
+`bytearray`, `memoryview` and `str`. It does not parse the document and does
+not validate it: numbers, escapes, duplicate keys and key order are left as
+they are, and input that is not valid JSON is minified the same way. An
+unterminated string raises `JSONDecodeError` (the minifier does not report
+where the string started, so the position is 0). The call releases the GIL.
 
 ### `dumpb_many`: NDJSON, on several threads
 
@@ -496,7 +512,8 @@ order; `tests/test_lazy.py` checks the views returned by `parse` the same way,
 `tests/test_dumps.py` compares `dumps` with `json.dumps` and `dumpb` with
 orjson (output and exceptions; the orjson comparisons are skipped when orjson
 is not installed, and recorded orjson results are checked either way), and
-`tests/test_stream.py` and `tests/test_files.py` cover streams and files. It
+`tests/test_stream.py` and `tests/test_files.py` cover streams and files, and
+`tests/test_minify.py` covers `minify`. The suite
 covers scalars, integers past 64 bits, UTF-8 strings at every length from 0 to
 199, the key cache, random documents, rejected input, deep
 nesting, padding at a page boundary, a saturated array count, reference
@@ -516,7 +533,8 @@ The benchmark scripts need simdjson-data and the `bench` extra (orjson,
 jiter, msgspec, pysimdjson, cysimdjson). `bench.py` times `loads` against
 `json.loads`, orjson and jiter, `bench_lazy.py` times `parse` against pysimdjson and
 cysimdjson, `bench_dumps.py` times `dumps` against `json.dumps` and `dumpb`
-against orjson and msgspec, and `bench_many.py` times `loads_many`.
+against orjson and msgspec, `bench_many.py` times `loads_many`, and
+`bench_minify.py` times `minify` against parsing and serializing again.
 
 pip:
 
@@ -526,6 +544,7 @@ python bench.py
 python bench_lazy.py
 python bench_dumps.py
 python bench_many.py
+python bench_minify.py
 ```
 
 uv:
@@ -536,6 +555,7 @@ python bench.py
 python bench_lazy.py
 python bench_dumps.py
 python bench_many.py
+python bench_minify.py
 ```
 
 ## Benchmarks
@@ -656,6 +676,28 @@ full of numbers. Both are 1.7
 times faster than msgspec and 10 times faster than `json`. The comparison was
 run on a processor with AVX-512, which `dumpb` and orjson both use to escape
 strings; other x64 processors use SSE2 and ARM processors NEON.
+
+### `minify`
+
+`minify` only removes whitespace. The other columns parse the document and
+serialize it again, which also validates it and rewrites numbers. Geometric
+mean over the 22 files, one core of an Intel Xeon Gold 6548N, Python 3.14.10,
+GCC 16.2, orjson 3.13.0 (`bench_minify.py`):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_minify_dark.png">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_minify.png" width="80%" alt="Minifying JSON in Python: fastsimdjson minify 18.49 GB/s, fastsimdjson dumpb(loads(s)) 0.53, orjson dumps(loads(s)) 0.44, json dumps(loads(s)) 0.11">
+</picture>
+
+| method | GB/s |
+|---|---:|
+| **fastsimdjson `minify`** | **18.49** |
+| `loads` + `dumpb` | 0.53 |
+| orjson `loads` + `dumps` | 0.44 |
+| `json.loads` + `json.dumps` | 0.11 |
+
+Per file, `minify` runs from 15.5 GB/s (`gsoc-2018.json`) to 21.4 GB/s
+(`numbers.json`).
 
 ### Writing NDJSON with `dumpb_many`
 

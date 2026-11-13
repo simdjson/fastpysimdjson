@@ -16,7 +16,7 @@ import matplotlib.ticker
 from matplotlib import font_manager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ONLY = sys.argv[1] if len(sys.argv) > 1 else None  # "arrow", "msgpack" or None
+ONLY = sys.argv[1] if len(sys.argv) > 1 else None  # "arrow", "msgpack", "minify" or None
 MACHINE = "Intel Xeon Gold 6548N (Emerald Rapids)"
 PYTHON = "Python 3.14.6"
 
@@ -348,3 +348,14 @@ summary_chart("perf_summary",
                ("Arrow to NDJSON", "dumpb_arrow, GH Archive", 2.4, "polars"),
                ("A few fields of a document", "parse (lazy)", 2.1, "msgspec, typed Struct"),
                ("JSON to Python objects", "loads", 1.3, "orjson")])
+
+# minify against parsing and serializing again: bench_minify.py, one core.
+chart("perf_minify",
+      "Minifying JSON in Python",
+      "the 22 files of simdjson-data, from JSON bytes to compact JSON bytes (geometric mean)",
+      "orjson 3.13  ·  Python 3.14.10  ·  GCC 16.2  ·  Intel Xeon Gold 6548N",
+      [("fastsimdjson", "minify", 18.49, True),
+       ("fastsimdjson", "dumpb(loads(s))", 0.53, True),
+       ("orjson", "dumps(loads(s))", 0.44, False),
+       ("json", "dumps(loads(s))", 0.11, False)],
+      "Speed", "GB/s of input", " GB/s", kind="minify", left=0.25)
