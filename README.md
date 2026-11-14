@@ -350,7 +350,11 @@ other threads, and it must be safe to call from several threads at once.
 The worker threads are started by the first call that needs them and kept
 for later calls (they wait, detached from the interpreter, between calls,
 and stop at exit). `map_many` scales best: each document is built, used and
-freed in the same thread, and only `fn`'s results come back.
+freed in the same thread, and only `fn`'s results come back. `loads_many` must return every
+document, and the Python objects of all of them, to the calling thread.
+With the GIL (the default build of Python), the calling thread does all the
+work: `threads` has no effect on speed.
+
 With `drop_none=True`, `map_many` leaves out the results that are `None`:
 when `fn` keeps only a few documents, the threads do not build a list
 entry for each of the others, and the calling thread has fewer to collect.
@@ -362,10 +366,7 @@ def starred(event):
 
 names = fastsimdjson.map_many(starred, data, threads=64, drop_none=True,
                               fields=["/type", "/repo/name"])
-``` `loads_many` must return every
-document, and the Python objects of all of them, to the calling thread.
-With the GIL (the default build of Python), the calling thread does all the
-work: `threads` has no effect on speed.
+```
 
 ### Only some fields: `fields=`
 
