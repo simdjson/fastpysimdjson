@@ -130,7 +130,7 @@ def test_deep_nesting():
     # error, on 5000 levels.)
     if sys.platform == "emscripten":
         return
-    deep ="[" * 5000 + "]" * 5000
+    deep = "[" * 5000 + "]" * 5000
     try:
         expected = json.loads(deep)
     except json.JSONDecodeError as err:

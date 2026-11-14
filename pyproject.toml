@@ -60,3 +60,11 @@ test-command = "python -m pytest {project}/tests -q"
 [tool.cibuildwheel.windows]
 # Build for 64-bit Windows (32-bit is rarely needed nowadays)
 archs = ["AMD64"]
+
+[tool.pyodide.build]
+# Pyodide's default flags, but -O3 where they end with -Oz (size): dumps and
+# dumpb are up to twice as fast, loads up to 15%. ($(...) variables are not
+# expanded here, so the flags are spelled out.)
+cflags = "-g0 -fPIC -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -O3"
+cxxflags = "-g0 -fPIC -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -O3"
+ldflags = "-g0 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -s SIDE_MODULE=1 -O3"

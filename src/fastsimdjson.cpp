@@ -2840,6 +2840,11 @@ inline size_t first_escape(const char *s, size_t n) {
 #endif
     }
   }
+#else
+  // No SIMD: skip 8 bytes at a time; the byte loop below finds the exact one.
+  while (i + 8 <= n && !word_needs_escape(load_u64(s + i), false)) {
+    i += 8;
+  }
 #endif
   while (i < n && !byte_needs_escape(uint8_t(s[i]), false)) {
     i++;
