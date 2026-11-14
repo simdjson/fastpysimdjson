@@ -230,6 +230,7 @@ def test_release():
     assert fastsimdjson.parse(b"[3]").as_list() == [3]
 
 
+@pytest.mark.requires_threads
 def test_threads():
     docs = [json.dumps({"t": t, "v": list(range(t * 10))}) for t in range(8)]
     made = [fastsimdjson.parse(t) for t in docs]

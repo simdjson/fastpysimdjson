@@ -143,6 +143,7 @@ def test_large():
         assert json.loads(fastsimdjson.msgpack_to_json(packed)) == value
 
 
+@pytest.mark.requires_threads
 def test_concurrent():
     # Python threads at once (the GIL is released while we convert).
     rng = random.Random(5)

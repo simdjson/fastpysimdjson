@@ -349,6 +349,7 @@ def test_threads_api():
 _POOL_DATA = b"\n".join(b'{"n": %d, "s": "%s"}' % (i, b"x" * (i % 50)) for i in range(40000))
 
 
+@pytest.mark.requires_threads
 def test_threads_concurrent_callers():
     import threading
 
@@ -368,6 +369,7 @@ def test_threads_concurrent_callers():
     assert errors == []
 
 
+@pytest.mark.requires_processes
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork")
 def test_threads_after_fork():
     import subprocess
@@ -389,6 +391,7 @@ def test_threads_after_fork():
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
 
 
+@pytest.mark.requires_processes
 def test_threads_exit_cleanly():
     import subprocess
     import sys
@@ -575,6 +578,7 @@ def test_release_after_threads():
     assert fastsimdjson.map_many(len, data, threads=8) == [len(o) for o in objs]
 
 
+@pytest.mark.requires_threads
 def test_release_inside_map_many():
     data, objs = _pool_input()
 
@@ -589,6 +593,7 @@ def test_release_inside_map_many():
     _no_hang(body)
 
 
+@pytest.mark.requires_threads
 def test_release_during_threaded_runs():
     import threading
 

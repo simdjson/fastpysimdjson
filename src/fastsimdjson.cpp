@@ -2,6 +2,13 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+// Pyodide's pyconfig.h defines _REENTRANT, which enables threads in simdjson:
+// parse_many would then start a thread, which fails without pthreads, in a
+// noexcept function (a crash).
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#undef _REENTRANT
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -2176,6 +2183,26 @@ inline char *escape_into(char *p, const char *s, size_t len, bool escape_del) {
     i += k;
     p = write_escaped_ascii(p, uint8_t(s[i]));
     i++;
+  }
+#else
+  // No SIMD (WebAssembly, other targets): 8 bytes at a time, so that under
+  // 16 bytes are left for the tail.
+  while (i + 16 <= len) {
+    uint64_t w = load_u64(s + i);
+    if (!word_needs_escape(w, escape_del)) {
+      memcpy(p, &w, 8);
+      p += 8;
+      i += 8;
+      continue;
+    }
+    for (size_t end = i + 8; i < end; i++) {
+      uint8_t c = uint8_t(s[i]);
+      if (byte_needs_escape(c, escape_del)) {
+        p = write_escaped_ascii(p, c);
+      } else {
+        *p++ = char(c);
+      }
+    }
   }
 #endif
   // The tail (under 16 bytes) as two overlapping words: fixed-size loads and
