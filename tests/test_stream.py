@@ -742,6 +742,29 @@ def test_long_record_then_threads():
     assert fastsimdjson.loads_many(data, threads=4) == objs
 
 
+@pytest.mark.parametrize("threads", [None, 1, 4])
+def test_map_many_drop_none(threads):
+    objs = [{"i": i, "keep": i % 7 == 0} for i in range(30000)]
+    data = ndjson(objs).encode()
+    pick = lambda d: d["i"] if d["keep"] else None
+    want = [o["i"] for o in objs if o["keep"]]
+    assert fastsimdjson.map_many(pick, data, threads=threads, drop_none=True) == want
+    assert fastsimdjson.map_many(pick, data, threads=threads, drop_none=False) == \
+        [pick(o) for o in objs]
+    assert fastsimdjson.map_many(lambda t: t[0] if t[1] else None, data, threads=threads,
+                                 fields=["/i", "/keep"], drop_none=True) == want
+    assert fastsimdjson.map_many(lambda d: None, data, threads=threads, drop_none=True) == []
+    # Falsy results other than None are kept.
+    assert fastsimdjson.map_many(lambda d: d["i"] % 2 and 0, data, threads=threads,
+                                 drop_none=True) == [0] * len(objs)
+    # An exception from fn still propagates; json's fallback still applies.
+    with pytest.raises(ZeroDivisionError):
+        fastsimdjson.map_many(lambda d: 1 // (d["i"] - 20000), data, threads=threads,
+                              drop_none=True)
+    tail = data + b'{"i": 1e400, "keep": true}\n'
+    assert fastsimdjson.map_many(pick, tail, threads=threads, drop_none=True)[-1] == float("inf")
+
+
 def test_readonly_memoryview_in_place(tmp_path):
     import mmap
     objs = [{"id": i, "name": f"n{i}", "tags": ["a", "b"][: i % 3]} for i in range(20000)]

@@ -367,6 +367,19 @@ document, and the Python objects of all of them, to the calling thread.
 With the GIL (the default build of Python), the calling thread does all the
 work: `threads` has no effect on speed.
 
+With `drop_none=True`, `map_many` leaves out the results that are `None`:
+when `fn` keeps only a few documents, the threads do not build a list
+entry for each of the others, and the calling thread has fewer to collect.
+
+```python
+def starred(event):
+    kind, repo = event
+    return repo if kind == "WatchEvent" else None
+
+names = fastsimdjson.map_many(starred, data, threads=64, drop_none=True,
+                              fields=["/type", "/repo/name"])
+```
+
 ### Only some fields: `fields=`
 
 When you need a few values from each document, `fields` extracts them
