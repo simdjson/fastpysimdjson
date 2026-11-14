@@ -4112,19 +4112,52 @@ bool od_found(sjod::value v, const FieldNode &node, OdWalk &w) {
   return true;
 }
 
-template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w);
+template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w, bool root);
 
 // Visits the kid of `node` reached by the value v.
 inline bool od_step(sjod::value v, const FieldNode &kid, OdWalk &w) {
-  return kid.ends.empty() ? od_walk(v, kid, w) : od_found(v, kid, w);
+  return kid.ends.empty() ? od_walk(v, kid, w, false) : od_found(v, kid, w);
+}
+
+// A scalar that the walk reaches (a document, or a step of a pointer):
+// read, so that an invalid one goes to the DOM path. type() only looks at
+// its first byte.
+template <typename V> bool od_check_scalar(V &&v, sjod::json_type t) {
+  switch (t) {
+  case sjod::json_type::string: {
+    std::string_view str;
+    return !v.get_string().get(str);
+  }
+  case sjod::json_type::number: {
+    sjod::number n;
+    return !v.get_number().get(n);
+  }
+  case sjod::json_type::boolean: {
+    bool b;
+    return !v.get_bool().get(b);
+  }
+  case sjod::json_type::null: {
+    bool is_null;
+    return !v.is_null().get(is_null) && is_null;
+  }
+  default:
+    return false;
+  }
 }
 
 // Walks the value v (a document or a value) towards the kids of `node`. A
-// key that appears twice: its first occurrence, as on the DOM path.
-template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w) {
+// key that appears twice: its first occurrence, as on the DOM path. The
+// document itself (root) is read to its end: its own structure (closing
+// bracket, separators, completeness) is checked, so that a malformed or
+// incomplete document cannot move where the next one starts. The values
+// that no pointer reaches are skipped without being checked.
+template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w, bool root) {
   sjod::json_type t;
   if (v.type().get(t)) {
     return false;
+  }
+  if (t != sjod::json_type::object && t != sjod::json_type::array) {
+    return od_check_scalar(v, t);
   }
   size_t n = node.kids.size();
   bool small[64];
@@ -4167,11 +4200,11 @@ template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w) {
           break;
         }
       }
-      if (left == 0) {
+      if (left == 0 && !root) {
         break; // the rest of the object is skipped
       }
     }
-  } else if (t == sjod::json_type::array && node.index_kids > 0) {
+  } else if (t == sjod::json_type::array && (node.index_kids > 0 || root)) {
     sjod::array a;
     if (v.get_array().get(a)) {
       return false;
@@ -4194,7 +4227,7 @@ template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w) {
         }
       }
       i++;
-      if (left == 0) {
+      if (left == 0 && !root) {
         break;
       }
     }
@@ -4260,7 +4293,7 @@ OdStep od_next(StreamObject *s, PyObject **out) {
 #ifndef Py_GIL_DISABLED
   int gc_was_enabled = PyGC_Disable();
 #endif
-  bool ok = od_walk(doc, f.root, w);
+  bool ok = od_walk(doc, f.root, w, true);
 #ifndef Py_GIL_DISABLED
   if (gc_was_enabled) {
     PyGC_Enable();

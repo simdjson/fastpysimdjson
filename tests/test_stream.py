@@ -569,6 +569,55 @@ def test_fields_on_demand_validates_what_it_reads():
         == [(3, 1), (None, None), (None, None), (None, 5)]
 
 
+@pytest.mark.parametrize("fmt", ["whitespace", "lines"])
+@pytest.mark.parametrize("pointer", ["/a", "/a/b", "/0"])
+@pytest.mark.parametrize("text", [
+    b'{"a": 1}\n{"a": 2, "b": [',     # incomplete last document
+    b'{"a":1,"b":[1}{"a":2}}',         # mismatched brackets: one document, not two
+    b'{"a":1,"b":[1}\n{"a":2}}\n',
+    b'{"a": 1} {"a": 2}}',             # a stray closing bracket
+    b'tru {"a": 1}',                   # an invalid scalar document
+    b'{"a": 1} 12x',
+    b'{"a": tru}',                     # an invalid value on the pointer's path
+    b'{"a": [1, 2,]}',
+    b'{"a": 1 "b": 2}',                # separators of the document itself
+    b'{"a": 1,}',
+    b'[1, 2',
+    b'{"a": {"b": 1}, "c": 2',
+])
+def test_fields_on_demand_document_structure(text, pointer, fmt):
+    # The document itself, the scalars and the steps that a pointer reaches
+    # are checked: the outcome is that of the whole documents.
+    def outcome(fields):
+        try:
+            return "ok", list(fastsimdjson.loads_many(text, format=fmt, fields=fields))
+        except fastsimdjson.JSONDecodeError as e:
+            return "error", e.pos
+    if (text, pointer) in ((b'{"a": tru}', "/0"), (b'{"a": [1, 2,]}', "/0"),
+                           (b'{"a": [1, 2,]}', "/a/b")):
+        # An invalid value that no pointer reaches is not checked (/a/b
+        # cannot be in an array: its elements are not read).
+        assert outcome(pointer) == ("ok", [None])
+        return
+    expected = outcome(None)
+    got = outcome(pointer)
+    if expected[0] == "ok":
+        assert got == ("ok", [_pointer_get(d, pointer) for d in expected[1]])
+    else:
+        assert got[0] == "error"
+    # Iterating by hand: the same values, up to the same error (no value is
+    # returned for a document that turns out to be invalid).
+    def until_error(fields):
+        seen = []
+        try:
+            for v in fastsimdjson.loads_many(text, format=fmt, fields=fields):
+                seen.append(v)
+        except fastsimdjson.JSONDecodeError:
+            pass
+        return seen
+    assert until_error(pointer) == [_pointer_get(d, pointer) for d in until_error(None)]
+
+
 @pytest.mark.parametrize("seed", range(10))
 def test_fields_on_demand_matches_whole_documents(seed):
     # Pointers none of which leads into another (the On-Demand walk), on
