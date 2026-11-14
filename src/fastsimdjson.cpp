@@ -3983,6 +3983,32 @@ PyType_Spec stream_spec = {
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION, stream_slots,
 };
 
+// The object under the read-only memoryview mv cannot change: bytes, or an
+// mmap that refuses a writable buffer (opened with ACCESS_READ). A read-only
+// view says nothing of its exporter: memoryview(bytearray).toreadonly(), or a
+// read-only view of a writable mmap, can still be written through another
+// reference, while simdjson reads the buffer from another thread.
+bool immutable_exporter(PyObject *mv) {
+  const Py_buffer *b = PyMemoryView_GET_BUFFER(mv);
+  PyObject *obj = b->obj;
+  if (!b->readonly || obj == nullptr || !PyBuffer_IsContiguous(b, 'C')) {
+    return false;
+  }
+  if (PyBytes_CheckExact(obj)) {
+    return true;
+  }
+  if (strcmp(Py_TYPE(obj)->tp_name, "mmap.mmap") != 0) {
+    return false;
+  }
+  Py_buffer w;
+  if (PyObject_GetBuffer(obj, &w, PyBUF_WRITABLE) == 0) {
+    PyBuffer_Release(&w);
+    return false;
+  }
+  PyErr_Clear();
+  return true;
+}
+
 PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   static const char *kwlist[] = {"data", "format", "batch_size", nullptr};
   PyObject *data;
@@ -4017,6 +4043,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   const char *buf = nullptr;
   Py_ssize_t len = 0;
   bool must_copy = false;
+  PyObject *view = nullptr; // our view of a read-only memoryview
   if (PyBytes_Check(data)) {
     buf = PyBytes_AS_STRING(data);
     len = PyBytes_GET_SIZE(data);
@@ -4025,6 +4052,16 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
     if (buf == nullptr) {
       return nullptr;
     }
+  } else if (PyMemoryView_Check(data) && immutable_exporter(data)) {
+    // A view of bytes, or of an mmap opened with ACCESS_READ: parsed in place.
+    // We parse through a view of our own, so the buffer stays exported (an
+    // mmap cannot be closed) even if the caller releases its memoryview.
+    view = PyMemoryView_FromObject(data);
+    if (view == nullptr) {
+      return nullptr;
+    }
+    buf = static_cast<const char *>(PyMemoryView_GET_BUFFER(view)->buf);
+    len = PyMemoryView_GET_BUFFER(view)->len;
   } else if (PyByteArray_Check(data) || PyMemoryView_Check(data)) {
     must_copy = true; // mutable: parse a copy
   } else {
@@ -4035,6 +4072,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   }
   StreamObject *s = PyObject_New(StreamObject, StreamType);
   if (s == nullptr) {
+    Py_XDECREF(view);
     return nullptr;
   }
   s->source = nullptr;
@@ -4064,6 +4102,8 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
     s->source = b;
     buf = PyBytes_AS_STRING(b);
     len = PyBytes_GET_SIZE(b);
+  } else if (view != nullptr) {
+    s->source = view;
   } else {
     s->source = Py_NewRef(data);
   }
