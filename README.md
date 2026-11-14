@@ -383,9 +383,10 @@ As with `at_pointer`, a key that appears twice in an object refers to its
 first occurrence. `fields` cannot be combined with `lazy=True`.
 
 With the formats `"whitespace"` and `"lines"`, `fields` reads the documents
-with simdjson's On-Demand API: only the keys on the way to the pointers and
-the values found there are read, and only they are validated. The rest of
-each document is skipped without being checked, so an invalid value
+with simdjson's On-Demand API: the top level of each document, the keys on
+the way to the pointers and the values found there are read and validated,
+so a malformed or incomplete document is still an error. The values that no
+pointer reaches are skipped without being checked, so an invalid value
 elsewhere in a document (`{"a": 1, "b": tru}` with `fields="/a"`) goes
 unnoticed. A value that is read is handled as without `fields`: an error
 raises `JSONDecodeError`, and a document that only `json` accepts is decoded
