@@ -4216,6 +4216,7 @@ struct ParallelRun : PoolTask {
 
   StreamObject *whole;
   PyObject *fn; // borrowed, or nullptr
+  bool drop_none = false; // map_many(drop_none=True): fn's None results are not kept
   char delimiter = '\n';
   bool snap_after = true; // false: the next slice starts on the delimiter
   struct Chunk {
@@ -4340,6 +4341,10 @@ struct ParallelRun : PoolTask {
             break;
           }
           v = r;
+          if (drop_none && v == Py_None) {
+            Py_DECREF(v);
+            continue;
+          }
         }
         try {
           c.items.push_back(v);
@@ -4617,7 +4622,7 @@ void pool_after_fork() {
 
 // All the results (documents, or fn of each) of the stream `whole`, as a
 // list, using up to `threads` threads.
-PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
+PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads, bool drop_none) {
   PyObject *result = PyList_New(0);
   if (result == nullptr) {
     return nullptr;
@@ -4628,6 +4633,7 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     ParallelRun run;
     run.whole = whole;
     run.fn = fn;
+    run.drop_none = drop_none;
     // json_seq snaps onto the record separator so the next slice starts with
     // it. Stage 1 finds a scalar value from that separator; a slice that
     // started after it would drop the separator and mis-parse the scalar.
@@ -4708,6 +4714,10 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
         break;
       }
       v = r;
+      if (drop_none && v == Py_None) {
+        Py_DECREF(v);
+        continue;
+      }
     }
     int rc = PyList_Append(result, v);
     Py_DECREF(v);
@@ -4785,7 +4795,7 @@ PyObject *pop_keyword(PyObject *kwargs, const char *name) {
 // all results instead. With fields (not for parse_many), the values at the
 // fields' pointers come instead of the documents.
 PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *fn,
-                         bool force_list, bool allow_fields) {
+                         bool force_list, bool allow_fields, bool drop_none = false) {
   Py_ssize_t threads;
   bool given;
   PyObject *rest = take_threads(kwargs, &threads, &given);
@@ -4851,7 +4861,7 @@ PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *
                     "threads requires the format 'whitespace', 'lines' or 'json_seq'");
     return nullptr;
   }
-  PyObject *r = run_stream(whole, fn, given ? size_t(threads) : 1);
+  PyObject *r = run_stream(whole, fn, given ? size_t(threads) : 1, drop_none);
   Py_DECREF(self);
   return r;
 }
@@ -4865,8 +4875,9 @@ PyObject *parse_many(PyObject *, PyObject *args, PyObject *kwargs) {
 }
 
 // map_many(fn, data, *, format, batch_size, threads, lazy=False, fields,
-// default): [fn(doc) for doc in loads_many(data)] (parse_many with
-// lazy=True), with fn called in the threads.
+// default, drop_none=False): [fn(doc) for doc in loads_many(data)]
+// (parse_many with lazy=True), with fn called in the threads; with
+// drop_none, the results that are None are left out.
 PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
   if (PyTuple_GET_SIZE(args) < 1) {
     PyErr_SetString(PyExc_TypeError, "map_many() missing required argument 'fn'");
@@ -4877,20 +4888,23 @@ PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
     PyErr_SetString(PyExc_TypeError, "map_many() fn must be callable");
     return nullptr;
   }
-  bool lazy = false;
+  bool lazy = false, drop_none = false;
   PyObject *rest = kwargs ? PyDict_Copy(kwargs) : nullptr;
   if (kwargs != nullptr && rest == nullptr) {
     return nullptr;
   }
   if (rest != nullptr) {
-    PyObject *l = PyDict_GetItemString(rest, "lazy"); // borrowed
-    if (l != nullptr) {
-      int t = PyObject_IsTrue(l);
-      if (t < 0 || PyDict_DelItemString(rest, "lazy") < 0) {
-        Py_DECREF(rest);
-        return nullptr;
+    for (auto [name, flag] : {std::pair<const char *, bool *>{"lazy", &lazy},
+                              std::pair<const char *, bool *>{"drop_none", &drop_none}}) {
+      PyObject *l = PyDict_GetItemString(rest, name); // borrowed
+      if (l != nullptr) {
+        int t = PyObject_IsTrue(l);
+        if (t < 0 || PyDict_DelItemString(rest, name) < 0) {
+          Py_DECREF(rest);
+          return nullptr;
+        }
+        *flag = t != 0;
       }
-      lazy = t != 0;
     }
   }
   PyObject *tail = PyTuple_GetSlice(args, 1, PyTuple_GET_SIZE(args));
@@ -4898,7 +4912,7 @@ PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
     Py_XDECREF(rest);
     return nullptr;
   }
-  PyObject *r = stream_or_list(tail, rest, lazy, fn, true, true);
+  PyObject *r = stream_or_list(tail, rest, lazy, fn, true, true, drop_none);
   Py_DECREF(tail);
   Py_XDECREF(rest);
   return r;
@@ -6064,8 +6078,9 @@ PyMethodDef methods[] = {
      "values of the input becomes one line of NDJSON."},
     {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
      METH_VARARGS | METH_KEYWORDS,
-     "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default, type): the "
-     "list of fn(doc) for the documents of data, with fn called in the threads."},
+     "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default, type, "
+     "drop_none=False): the list of fn(doc) for the documents of data, with fn called in "
+     "the threads; with drop_none, the results that are None are left out."},
     {"parse", parse, METH_O,
      "Parse JSON lazily: objects and arrays are returned as read-only views "
      "(Object, Array) whose values are converted on access."},
