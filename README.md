@@ -310,6 +310,18 @@ separated:
 | `"comma"` | documents separated by commas: `{...}, {...}` (simdjson also accepts white space between them) |
 | `"array"` | the elements of one array: `[{...}, {...}]` |
 
+To read a file without copying it, map it in memory:
+
+```python
+import mmap
+with open("log.ndjson", "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+    names = fastsimdjson.map_many(fn, memoryview(m), threads=64)
+```
+
+A read-only `memoryview` (here, of a file mapped with `mmap.ACCESS_READ`) is
+read in place, and the mapped file must not change meanwhile; a `bytearray`
+or a writable `memoryview` is copied first.
+
 simdjson parses the input in batches (`batch_size`, 1 MB by default); a
 larger document is handled automatically. In every format, documents that
 simdjson rejects are handled as in `loads`: a document that `json` accepts is
@@ -529,7 +541,9 @@ could be changed by another thread while we read it, so it is copied first:
 always by `loads_many`, `parse_many` and `map_many` (the iterator outlives
 the call) and by `loads_arrow`, `json_to_msgpack` and `msgpack_to_json`
 (which release the GIL), and only on a free-threaded build by `loads` and
-`parse`. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
+`parse`. The exception: `loads_many`, `parse_many` and `map_many` read a
+read-only, contiguous `memoryview` in place (of `bytes`, or of a file mapped
+with `mmap.ACCESS_READ`); its contents must not change meanwhile. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
 references to the items of the containers they serialize.
 
 ### `release`

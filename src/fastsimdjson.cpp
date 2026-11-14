@@ -4017,6 +4017,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   const char *buf = nullptr;
   Py_ssize_t len = 0;
   bool must_copy = false;
+  PyObject *view = nullptr; // our view of a read-only memoryview
   if (PyBytes_Check(data)) {
     buf = PyBytes_AS_STRING(data);
     len = PyBytes_GET_SIZE(data);
@@ -4025,6 +4026,18 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
     if (buf == nullptr) {
       return nullptr;
     }
+  } else if (PyMemoryView_Check(data) &&
+             PyMemoryView_GET_BUFFER(data)->readonly &&
+             PyBuffer_IsContiguous(PyMemoryView_GET_BUFFER(data), 'C')) {
+    // Read-only (bytes, an mmap opened with ACCESS_READ): parsed in place.
+    // We parse through a view of our own, so the buffer stays exported (an
+    // mmap cannot be closed) even if the caller releases its memoryview.
+    view = PyMemoryView_FromObject(data);
+    if (view == nullptr) {
+      return nullptr;
+    }
+    buf = static_cast<const char *>(PyMemoryView_GET_BUFFER(view)->buf);
+    len = PyMemoryView_GET_BUFFER(view)->len;
   } else if (PyByteArray_Check(data) || PyMemoryView_Check(data)) {
     must_copy = true; // mutable: parse a copy
   } else {
@@ -4035,6 +4048,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   }
   StreamObject *s = PyObject_New(StreamObject, StreamType);
   if (s == nullptr) {
+    Py_XDECREF(view);
     return nullptr;
   }
   s->source = nullptr;
@@ -4064,6 +4078,8 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
     s->source = b;
     buf = PyBytes_AS_STRING(b);
     len = PyBytes_GET_SIZE(b);
+  } else if (view != nullptr) {
+    s->source = view;
   } else {
     s->source = Py_NewRef(data);
   }

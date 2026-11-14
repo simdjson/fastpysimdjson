@@ -622,3 +622,43 @@ def test_long_record_then_threads():
     assert len(out) == 2 * len(objs) + 1 and out[len(objs)] == big
     del out
     assert fastsimdjson.loads_many(data, threads=4) == objs
+
+
+def test_readonly_memoryview_in_place(tmp_path):
+    import mmap
+    objs = [{"id": i, "name": f"n{i}", "tags": ["a", "b"][: i % 3]} for i in range(20000)]
+    data = ndjson(objs).encode()
+    path = tmp_path / "events.ndjson"
+    path.write_bytes(data)
+    pick = lambda d: d["id"]
+    want = [o["id"] for o in objs]
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        view = memoryview(m)
+        assert view.readonly
+        assert list(fastsimdjson.loads_many(view)) == objs
+        assert [to_py(v) for v in fastsimdjson.parse_many(view)] == objs
+        assert fastsimdjson.map_many(pick, view, threads=4) == want
+        assert fastsimdjson.map_many(pick, view, threads=4, format="lines") == want
+        assert list(fastsimdjson.loads_many(view, fields="/name")) == [o["name"] for o in objs]
+        # The stream keeps the mapping exported: the caller may release its
+        # view, and the mmap cannot be closed under the stream.
+        it = fastsimdjson.loads_many(view)
+        assert next(it) == objs[0]
+        view.release()
+        with pytest.raises(BufferError):
+            m.close()
+        assert list(it) == objs[1:]
+        del it
+    # A read-only view of bytes, sliced, is read in place too.
+    part = memoryview(data)[: len(ndjson(objs[:10]))]
+    assert list(fastsimdjson.loads_many(part)) == objs[:10]
+
+
+def test_writable_buffers_are_copied():
+    objs = [{"x": i} for i in range(100)]
+    for view in (False, True):
+        data = bytearray(ndjson(objs).encode())
+        it = fastsimdjson.loads_many(memoryview(data) if view else data)
+        assert next(it) == objs[0]
+        data[:] = data.replace(b'"x"', b'"y"')   # same length
+        assert list(it) == objs[1:]
