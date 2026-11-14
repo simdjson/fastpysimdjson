@@ -654,6 +654,29 @@ def test_readonly_memoryview_in_place(tmp_path):
     assert list(fastsimdjson.loads_many(part)) == objs[:10]
 
 
+def test_mutable_exporters_are_copied(tmp_path):
+    # A read-only view of something writable is copied: the exporter can
+    # still change while the stream reads it.
+    import mmap
+    objs = [{"x": i} for i in range(100)]
+    text = ndjson(objs).encode()
+    path = tmp_path / "x.ndjson"
+    path.write_bytes(text)
+    ba = bytearray(text)
+    with open(path, "r+b") as f, mmap.mmap(f.fileno(), 0) as writable:
+        for owner, view in ((ba, memoryview(ba).toreadonly()),
+                            (writable, memoryview(writable).toreadonly())):
+            it = fastsimdjson.loads_many(view)
+            assert next(it) == objs[0]
+            owner[:] = bytes(owner).replace(b'"x"', b'"y"')   # same length
+            assert list(it) == objs[1:]
+            del it, view
+    # bytes, through any number of read-only views, is read in place.
+    first = len(ndjson(objs[:1]))
+    view = memoryview(memoryview(text)[1:]).toreadonly()
+    assert list(fastsimdjson.loads_many(view[first - 1:])) == objs[1:]
+
+
 def test_writable_buffers_are_copied():
     objs = [{"x": i} for i in range(100)]
     for view in (False, True):

@@ -318,9 +318,9 @@ with open("log.ndjson", "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_
     names = fastsimdjson.map_many(fn, memoryview(m), threads=64)
 ```
 
-A read-only `memoryview` (here, of a file mapped with `mmap.ACCESS_READ`) is
-read in place, and the mapped file must not change meanwhile; a `bytearray`
-or a writable `memoryview` is copied first.
+A `memoryview` of `bytes`, or of a file mapped with `mmap.ACCESS_READ` (as
+here), is read in place, and the mapped file must not change meanwhile;
+other buffers (a `bytearray`, a view of a writable mmap) are copied first.
 
 simdjson parses the input in batches (`batch_size`, 1 MB by default); a
 larger document is handled automatically. In every format, documents that
@@ -542,8 +542,10 @@ always by `loads_many`, `parse_many` and `map_many` (the iterator outlives
 the call) and by `loads_arrow`, `json_to_msgpack` and `msgpack_to_json`
 (which release the GIL), and only on a free-threaded build by `loads` and
 `parse`. The exception: `loads_many`, `parse_many` and `map_many` read a
-read-only, contiguous `memoryview` in place (of `bytes`, or of a file mapped
-with `mmap.ACCESS_READ`); its contents must not change meanwhile. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
+read-only, contiguous `memoryview` of `bytes`, or of a file mapped with
+`mmap.ACCESS_READ`, in place (the file must not change meanwhile). Other
+read-only views (`memoryview(bytearray).toreadonly()`, a read-only view of a
+writable mmap) are copied, since what they show can still change. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
 references to the items of the containers they serialize.
 
 ### `release`
