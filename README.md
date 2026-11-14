@@ -61,6 +61,17 @@ uv pip install fastsimdjson      # in a uv project: uv add fastsimdjson
 Wheels are available for Linux, macOS and Windows, for Python 3.10 to 3.15,
 including free-threaded Python 3.14 and 3.15.
 
+Wheels are also available for Pyodide (WebAssembly, in the browser or in
+Node), for Python 3.13 to 3.15:
+
+```python
+import micropip
+await micropip.install("fastsimdjson")
+```
+
+Under Pyodide, Python cannot start threads: `threads=` runs on the calling
+thread.
+
 ## Usage
 
 ### `loads`: the whole document
