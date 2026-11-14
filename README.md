@@ -394,6 +394,18 @@ missing key, an index past the end, or a step into a scalar) gives
 As with `at_pointer`, a key that appears twice in an object refers to its
 first occurrence. `fields` cannot be combined with `lazy=True`.
 
+With the formats `"whitespace"` and `"lines"`, `fields` reads the documents
+with simdjson's On-Demand API: the top level of each document, the keys on
+the way to the pointers and the values found there are read and validated,
+so a malformed or incomplete document is still an error. The values that no
+pointer reaches are skipped without being checked, so an invalid value
+elsewhere in a document (`{"a": 1, "b": tru}` with `fields="/a"`) goes
+unnoticed. A value that is read is handled as without `fields`: an error
+raises `JSONDecodeError`, and a document that only `json` accepts is decoded
+by `json`. The whole documents are parsed (and validated) with the other
+formats, and when a pointer is `""` or leads into the value of another
+pointer (`["/a", "/a/b"]`).
+
 On 7.6 GB of GitHub events, `map_many` with three fields ran at 2.2 GB/s on
 one core of an Intel Xeon Gold 6548N, against 1.8 GB/s with lazy views
 (`lazy=True`). With 64 threads (free-threaded Python 3.14.10t), it ran at

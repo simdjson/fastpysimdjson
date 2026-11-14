@@ -177,6 +177,11 @@ struct ThreadParser {
   bool cleanup_registered = false;    // see register_thread_cleanup
   parser *chunk_parser = nullptr;     // for the chunks of parallel streams
   bool chunk_parser_busy = false;
+  // fields= through On-Demand: the parser of the chunks of parallel streams,
+  // and a DOM parser for the objects and arrays found at the pointers.
+  simdjson::ondemand::parser *od_chunk_parser = nullptr;
+  bool od_chunk_parser_busy = false;
+  parser *snippet_parser = nullptr;
   void clear_encoded_keys() {
     if (encoded_keys != nullptr) {
       for (size_t i = 0; i < ENCODED_KEY_CACHE_SIZE; i++) {
@@ -193,6 +198,12 @@ struct ThreadParser {
       delete chunk_parser;
       chunk_parser = nullptr;
     }
+    if (!od_chunk_parser_busy) {
+      delete od_chunk_parser;
+      od_chunk_parser = nullptr;
+    }
+    delete snippet_parser;
+    snippet_parser = nullptr;
     delete spare;
     spare = nullptr;
     if (caches_can_decref()) {
@@ -212,6 +223,12 @@ void release_thread_state() {
     delete g_thread_parser.chunk_parser;
     g_thread_parser.chunk_parser = nullptr;
   }
+  if (!g_thread_parser.od_chunk_parser_busy) {
+    delete g_thread_parser.od_chunk_parser;
+    g_thread_parser.od_chunk_parser = nullptr;
+  }
+  delete g_thread_parser.snippet_parser;
+  g_thread_parser.snippet_parser = nullptr;
   delete g_thread_parser.spare;
   g_thread_parser.spare = nullptr;
   clear_cache(g_thread_parser.key_cache);
@@ -748,6 +765,17 @@ void release_large_chunk_parser() {
     delete p;
     g_thread_parser.chunk_parser = nullptr;
   }
+  simdjson::ondemand::parser *q = g_thread_parser.od_chunk_parser;
+  if (q != nullptr && !g_thread_parser.od_chunk_parser_busy &&
+      q->capacity() > MAX_RETAINED_CAPACITY) {
+    delete q;
+    g_thread_parser.od_chunk_parser = nullptr;
+  }
+  parser *r = g_thread_parser.snippet_parser;
+  if (r != nullptr && r->capacity() > MAX_RETAINED_CAPACITY) {
+    delete r;
+    g_thread_parser.snippet_parser = nullptr;
+  }
 }
 #endif
 
@@ -1123,12 +1151,26 @@ struct FieldStep {
   PyObject *name;  // the token as a str (documents that json decoded)
 };
 
+// The pointers as a tree, for the On-Demand walk (see od_walk): a node per
+// step, its children the next steps, and the fields that end there.
+struct FieldNode {
+  std::string key;
+  size_t index = SIZE_MAX;     // the step as an array index, or SIZE_MAX
+  std::vector<size_t> ends;    // the fields whose pointer ends here
+  std::vector<FieldNode> kids;
+  size_t index_kids = 0;       // kids whose step is an array index
+};
+
 struct Fields {
   std::vector<std::vector<FieldStep>> paths;
   std::vector<size_t> shared; // leading steps in common with the previous path
   size_t depth = 0;           // steps of the longest path
   bool single = false;        // fields was one str: the value, not a tuple
   PyObject *dflt = nullptr;   // the value of a missing field
+  FieldNode root;
+  // The On-Demand walk applies: no pointer is the whole document or leads
+  // into the value of another (a node is either an end or has kids).
+  bool on_demand = true;
 
   ~Fields() {
     for (auto &p : paths) {
@@ -1228,8 +1270,39 @@ Fields *compile_fields(PyObject *spec, PyObject *dflt) {
     }
     f->shared.push_back(common);
     f->depth = std::max(f->depth, path.size());
+    FieldNode *node = &f->root;
+    for (const FieldStep &step : path) {
+      FieldNode *next = nullptr;
+      for (FieldNode &k : node->kids) {
+        if (k.key == step.key) {
+          next = &k;
+          break;
+        }
+      }
+      if (next == nullptr) {
+        node->kids.emplace_back();
+        next = &node->kids.back();
+        next->key = step.key;
+        next->index = step.index;
+        node->index_kids += step.index != SIZE_MAX;
+      }
+      node = next;
+    }
+    node->ends.push_back(size_t(n));
   }
   Py_DECREF(seq);
+  // Checked once the tree is complete (kids move while it grows).
+  std::vector<const FieldNode *> todo{&f->root};
+  while (!todo.empty()) {
+    const FieldNode *node = todo.back();
+    todo.pop_back();
+    if (!node->ends.empty() && (!node->kids.empty() || node == &f->root)) {
+      f->on_demand = false;
+    }
+    for (const FieldNode &k : node->kids) {
+      todo.push_back(&k);
+    }
+  }
   return f;
 }
 
@@ -3653,6 +3726,9 @@ struct StreamObject {
   bool borrowed_parser; // p is this thread's chunk parser (not deleted)
   Fields *fields;       // fields=: the values at these pointers, not the documents
   bool owns_fields;     // false in the chunks of a parallel run
+  bool on_demand;       // fields= read with On-Demand (see od_next), until a switch
+  bool chunk;           // a chunk of a parallel run
+  struct OnDemand *od;  // the On-Demand stream, once started
   PyObject *plan;       // type=: the capsule of the type's plan (owned by the whole stream)
   parser *p;
   document_stream *stream;
@@ -3896,8 +3972,401 @@ PyObject *stream_fallback_or_stop(StreamObject *s) {
   return stream_fallback(s);
 }
 
+// --- fields= with On-Demand ---------------------------------------------------
+// With fields=, the documents are read with simdjson's On-Demand API: only
+// the keys on the way to the pointers and the values found there are read,
+// the rest of each document is skipped (and not validated). Any error, or
+// anything this path does not handle (a big integer, a document larger than
+// a batch, an incomplete last document), switches the stream to the DOM path
+// from the document where it happened: that path then decides as before
+// (json's fallback, JSONDecodeError).
+namespace sjod = simdjson::ondemand;
+
+struct OnDemand {
+  sjod::parser *p = nullptr;
+  bool borrowed = false; // p is this thread's od_chunk_parser
+  sjod::document_stream stream;
+  sjod::document_stream::iterator it;
+  size_t base = 0;     // offset of the stream in buf
+  bool active = false; // stream runs
+};
+
+void od_free(StreamObject *s) {
+  OnDemand *o = s->od;
+  if (o == nullptr) {
+    return;
+  }
+  sjod::parser *p = o->p;
+  bool borrowed = o->borrowed;
+  delete o; // the stream first: it refers to the parser
+  if (borrowed) {
+    g_thread_parser.od_chunk_parser_busy = false;
+  } else {
+    delete p;
+  }
+  s->od = nullptr;
+}
+
+struct OdWalk {
+  PyObject **out;     // a new reference per field found
+  bool py_error = false;
+};
+
+// An object or array at a pointer: built by the DOM from its text, as the
+// DOM path would have built it.
+PyObject *od_build_text(std::string_view text) {
+  parser *&p = g_thread_parser.snippet_parser;
+  if (p == nullptr) {
+    register_thread_cleanup();
+    p = new (std::nothrow) parser();
+    if (p == nullptr) {
+      return PyErr_NoMemory();
+    }
+    p->number_as_string(true);
+  }
+  // The text is inside the stream's input, which is padded.
+  simdjson::dom::element e;
+  if (p->parse(reinterpret_cast<const uint8_t *>(text.data()), text.size(), false).get(e)) {
+    return nullptr; // without an exception: the caller switches to the DOM path
+  }
+  return build_with_gc_paused(p->doc, 1);
+}
+
+// The value at a pointer, or nullptr: with an exception (w.py_error), or
+// without one, for the DOM path to decide.
+PyObject *od_value(sjod::value v, OdWalk &w) {
+  sjod::json_type t;
+  if (v.type().get(t)) {
+    return nullptr;
+  }
+  PyObject *r = nullptr;
+  switch (t) {
+  case sjod::json_type::string: {
+    std::string_view str;
+    if (v.get_string().get(str)) {
+      return nullptr;
+    }
+    r = make_value_str(g_thread_parser.value_cache, str.data(), str.size());
+    break;
+  }
+  case sjod::json_type::number: {
+    sjod::number n;
+    if (v.get_number().get(n)) {
+      return nullptr; // a big integer, among others
+    }
+    switch (n.get_number_type()) {
+    case sjod::number_type::signed_integer:
+      r = PyLong_FromLongLong(n.get_int64());
+      break;
+    case sjod::number_type::unsigned_integer:
+      r = PyLong_FromUnsignedLongLong(n.get_uint64());
+      break;
+    case sjod::number_type::floating_point_number:
+      r = PyFloat_FromDouble(n.get_double());
+      break;
+    default:
+      return nullptr;
+    }
+    break;
+  }
+  case sjod::json_type::boolean: {
+    bool b;
+    if (v.get_bool().get(b)) {
+      return nullptr;
+    }
+    r = Py_NewRef(b ? Py_True : Py_False);
+    break;
+  }
+  case sjod::json_type::null: {
+    bool is_null;
+    if (v.is_null().get(is_null) || !is_null) {
+      return nullptr;
+    }
+    r = Py_NewRef(Py_None);
+    break;
+  }
+  default: { // object or array
+    std::string_view text;
+    if (v.raw_json().get(text)) {
+      return nullptr;
+    }
+    r = od_build_text(text);
+    break;
+  }
+  }
+  if (r == nullptr && PyErr_Occurred()) {
+    w.py_error = true;
+  }
+  return r;
+}
+
+// Stores the value v of the fields that end at `node`.
+bool od_found(sjod::value v, const FieldNode &node, OdWalk &w) {
+  PyObject *r = od_value(v, w);
+  if (r == nullptr) {
+    return false;
+  }
+  for (size_t k = 0; k < node.ends.size(); k++) {
+    w.out[node.ends[k]] = k == 0 ? r : Py_NewRef(r);
+  }
+  return true;
+}
+
+template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w, bool root);
+
+// Visits the kid of `node` reached by the value v.
+inline bool od_step(sjod::value v, const FieldNode &kid, OdWalk &w) {
+  return kid.ends.empty() ? od_walk(v, kid, w, false) : od_found(v, kid, w);
+}
+
+// A scalar that the walk reaches (a document, or a step of a pointer):
+// read, so that an invalid one goes to the DOM path. type() only looks at
+// its first byte.
+template <typename V> bool od_check_scalar(V &&v, sjod::json_type t) {
+  switch (t) {
+  case sjod::json_type::string: {
+    std::string_view str;
+    return !v.get_string().get(str);
+  }
+  case sjod::json_type::number: {
+    sjod::number n;
+    return !v.get_number().get(n);
+  }
+  case sjod::json_type::boolean: {
+    bool b;
+    return !v.get_bool().get(b);
+  }
+  case sjod::json_type::null: {
+    bool is_null;
+    return !v.is_null().get(is_null) && is_null;
+  }
+  default:
+    return false;
+  }
+}
+
+// Walks the value v (a document or a value) towards the kids of `node`. A
+// key that appears twice: its first occurrence, as on the DOM path. The
+// document itself (root) is read to its end: its own structure (closing
+// bracket, separators, completeness) is checked, so that a malformed or
+// incomplete document cannot move where the next one starts. The values
+// that no pointer reaches are skipped without being checked.
+template <typename V> bool od_walk(V &&v, const FieldNode &node, OdWalk &w, bool root) {
+  sjod::json_type t;
+  if (v.type().get(t)) {
+    return false;
+  }
+  if (t != sjod::json_type::object && t != sjod::json_type::array) {
+    return od_check_scalar(v, t);
+  }
+  size_t n = node.kids.size();
+  bool small[64];
+  std::vector<bool> big;
+  if (n > 64) {
+    big.assign(n, false);
+  } else {
+    std::fill(small, small + n, false);
+  }
+  auto taken = [&](size_t k) { return n > 64 ? bool(big[k]) : small[k]; };
+  auto take = [&](size_t k) {
+    if (n > 64) {
+      big[k] = true;
+    } else {
+      small[k] = true;
+    }
+  };
+  if (t == sjod::json_type::object) {
+    sjod::object o;
+    if (v.get_object().get(o)) {
+      return false;
+    }
+    size_t left = n;
+    for (auto item : o) {
+      sjod::field f;
+      if (std::move(item).get(f)) {
+        return false;
+      }
+      std::string_view key = f.escaped_key();
+      if (key.find('\\') != std::string_view::npos && f.unescaped_key().get(key)) {
+        return false;
+      }
+      for (size_t k = 0; k < n; k++) {
+        if (!taken(k) && node.kids[k].key == key) {
+          take(k);
+          if (!od_step(f.value(), node.kids[k], w)) {
+            return false;
+          }
+          left--;
+          break;
+        }
+      }
+      if (left == 0 && !root) {
+        break; // the rest of the object is skipped
+      }
+    }
+  } else if (t == sjod::json_type::array && (node.index_kids > 0 || root)) {
+    sjod::array a;
+    if (v.get_array().get(a)) {
+      return false;
+    }
+    size_t left = node.index_kids;
+    size_t i = 0;
+    for (auto item : a) {
+      sjod::value e;
+      if (std::move(item).get(e)) {
+        return false;
+      }
+      for (size_t k = 0; k < n; k++) {
+        if (node.kids[k].index == i && !taken(k)) {
+          take(k);
+          if (!od_step(e, node.kids[k], w)) {
+            return false;
+          }
+          left--;
+          break;
+        }
+      }
+      i++;
+      if (left == 0 && !root) {
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+enum class OdStep { value, end, error, dom };
+
+// The fields of the next document (*out), the end, a Python error, or dom:
+// continue on the DOM path from last_end.
+OdStep od_next(StreamObject *s, PyObject **out) {
+  if (s->od == nullptr) {
+    s->od = new (std::nothrow) OnDemand();
+    if (s->od == nullptr) {
+      return OdStep::dom;
+    }
+    if (s->chunk && !g_thread_parser.od_chunk_parser_busy) {
+      if (g_thread_parser.od_chunk_parser == nullptr) {
+        register_thread_cleanup();
+        g_thread_parser.od_chunk_parser = new (std::nothrow) sjod::parser();
+      }
+      if (g_thread_parser.od_chunk_parser != nullptr) {
+        s->od->p = g_thread_parser.od_chunk_parser;
+        s->od->borrowed = g_thread_parser.od_chunk_parser_busy = true;
+      }
+    }
+    if (s->od->p == nullptr) {
+      s->od->p = new (std::nothrow) sjod::parser();
+      if (s->od->p == nullptr) {
+        return OdStep::dom;
+      }
+    }
+#ifdef SIMDJSON_THREADS_ENABLED
+    s->od->p->threaded = !s->chunk;
+#endif
+  }
+  OnDemand &o = *s->od;
+  if (!o.active) {
+    size_t at = skip_separators(s, s->last_end);
+    if (at >= s->len) {
+      return OdStep::end;
+    }
+    if (o.p->iterate_many(s->buf + at, s->len - at, s->batch_size).get(o.stream)) {
+      return OdStep::dom;
+    }
+    o.it = o.stream.begin();
+    o.base = at;
+    o.active = true;
+  }
+  if (!(o.it != o.stream.end())) {
+    // An incomplete last document: the DOM path reports it.
+    return o.stream.truncated_bytes() > 0 ? OdStep::dom : OdStep::end;
+  }
+  sjod::document_reference doc;
+  if ((*o.it).get(doc)) {
+    return OdStep::dom;
+  }
+  const Fields &f = *s->fields;
+  size_t n = f.paths.size();
+  std::fill(out, out + n, nullptr);
+  OdWalk w{out};
+#ifndef Py_GIL_DISABLED
+  int gc_was_enabled = PyGC_Disable();
+#endif
+  bool ok = od_walk(doc, f.root, w, true);
+#ifndef Py_GIL_DISABLED
+  if (gc_was_enabled) {
+    PyGC_Enable();
+  }
+#endif
+  if (!ok) {
+    for (size_t k = 0; k < n; k++) {
+      Py_CLEAR(out[k]);
+    }
+    return w.py_error ? OdStep::error : OdStep::dom;
+  }
+  ++o.it;
+  // last_end: where the next document starts (only separators before it).
+  s->last_end = o.it != o.stream.end() ? o.base + o.it.current_index()
+                                       : s->len - o.stream.truncated_bytes();
+  return OdStep::value;
+}
+
+// The next document read with On-Demand, as stream_value builds it; or
+// nullptr with *dom set: continue on the DOM path.
+PyObject *od_stream_next(StreamObject *s, bool *dom) {
+  const Fields &f = *s->fields;
+  size_t n = f.paths.size();
+  PyObject *stack[16];
+  std::vector<PyObject *> heap;
+  PyObject **out = stack;
+  if (n > 16) {
+    heap.resize(n);
+    out = heap.data();
+  }
+  switch (od_next(s, out)) {
+  case OdStep::end:
+    return nullptr;
+  case OdStep::error:
+    return nullptr;
+  case OdStep::dom:
+    s->on_demand = false;
+    od_free(s);
+    *dom = true;
+    return nullptr;
+  case OdStep::value:
+    break;
+  }
+  for (size_t k = 0; k < n; k++) {
+    if (out[k] == nullptr) {
+      out[k] = Py_NewRef(f.dflt);
+    }
+  }
+  if (f.single) {
+    return out[0];
+  }
+  PyObject *tuple = PyTuple_New(Py_ssize_t(n));
+  if (tuple == nullptr) {
+    for (size_t k = 0; k < n; k++) {
+      Py_DECREF(out[k]);
+    }
+    return nullptr;
+  }
+  for (size_t k = 0; k < n; k++) {
+    PyTuple_SET_ITEM(tuple, Py_ssize_t(k), out[k]);
+  }
+  return tuple;
+}
+
 // The next document, or nullptr at the end or after an error.
 PyObject *stream_next_locked(StreamObject *s) {
+  if (s->on_demand && !s->active) {
+    bool dom = false;
+    PyObject *v = od_stream_next(s, &dom);
+    if (!dom) {
+      return v;
+    }
+  }
   for (;;) {
     if (!s->active) {
       if (skip_separators(s, s->last_end) >= s->len) {
@@ -3955,6 +4424,7 @@ void stream_dealloc(PyObject *self) {
   PyTypeObject *tp = Py_TYPE(self);
   s->it.~iterator();
   delete s->stream;
+  od_free(s);
   if (s->borrowed_parser) {
     g_thread_parser.chunk_parser_busy = false;
   } else {
@@ -4091,6 +4561,8 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   s->no_fallback = s->need_fallback = s->borrowed_parser = s->running = false;
   s->fields = nullptr;
   s->owns_fields = false;
+  s->on_demand = s->chunk = false;
+  s->od = nullptr;
   s->plan = nullptr;
   PyObject *self = reinterpret_cast<PyObject *>(s);
   if (must_copy) {
@@ -4214,6 +4686,9 @@ StreamObject *stream_over(StreamObject *whole, size_t from, size_t to, bool chun
   s->no_fallback = s->need_fallback = s->borrowed_parser = s->running = false;
   s->fields = whole->fields; // whole outlives its chunks
   s->owns_fields = false;
+  s->on_demand = whole->on_demand;
+  s->chunk = chunk;
+  s->od = nullptr;
   s->plan = whole->plan;
   if (chunk && !g_thread_parser.chunk_parser_busy) {
     if (g_thread_parser.chunk_parser == nullptr) {
@@ -4875,9 +5350,14 @@ PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *
     Py_XDECREF(plan);
     return nullptr;
   }
-  reinterpret_cast<StreamObject *>(self)->fields = fields;
-  reinterpret_cast<StreamObject *>(self)->plan = plan;
-  reinterpret_cast<StreamObject *>(self)->owns_fields = true;
+  StreamObject *st = reinterpret_cast<StreamObject *>(self);
+  st->fields = fields;
+  st->plan = plan;
+  st->owns_fields = true;
+  // On-Demand splits documents on white space, like these two formats.
+  st->on_demand = fields != nullptr && fields->on_demand &&
+                  (st->format == simdjson::stream_format::whitespace_delimited ||
+                   st->format == simdjson::stream_format::newline_delimited);
   if (!given && !force_list) {
     return self;
   }
