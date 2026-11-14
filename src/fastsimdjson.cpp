@@ -4219,7 +4219,10 @@ struct ParallelRun : PoolTask {
   char delimiter = '\n';
   bool snap_after = true; // false: the next slice starts on the delimiter
   struct Chunk {
-    PyObject *items = nullptr; // list of the chunk's results
+    // The chunk's results (owned references). A plain vector, not a list:
+    // the caller moves them into its list without touching their reference
+    // counts, which other threads own (each change would be atomic).
+    std::vector<PyObject *> items;
     bool failed = false;       // stopped before the end of the chunk
     PyObject *exc = nullptr;   // the exception fn raised, if it did
     size_t resume_at = 0;      // where the one-thread run goes on
@@ -4303,12 +4306,10 @@ struct ParallelRun : PoolTask {
       return; // inside a document longer than the slice: parsed with the previous one
     }
     StreamObject *st = stream_over(whole, range.begin, range.end, true);
-    c.items = st ? PyList_New(0) : nullptr;
-    if (c.items == nullptr) {
+    if (st == nullptr) {
       PyErr_Clear(); // the one-thread run will report it
       c.failed = true;
-    }
-    if (st != nullptr && c.items != nullptr) {
+    } else {
       st->no_fallback = true;
       while (first_failure.load(std::memory_order_relaxed) > i) {
         size_t before = st->last_end;
@@ -4340,10 +4341,10 @@ struct ParallelRun : PoolTask {
           }
           v = r;
         }
-        int rc = PyList_Append(c.items, v);
-        Py_DECREF(v);
-        if (rc < 0) {
-          PyErr_Clear();
+        try {
+          c.items.push_back(v);
+        } catch (...) {
+          Py_DECREF(v);
           c.failed = true;
           break;
         }
@@ -4641,7 +4642,7 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     size_t f = run.first_failure.load();
     size_t total = 0;
     for (size_t i = 0; i < run.chunks.size() && i <= f; i++) {
-      total += run.chunks[i].items ? size_t(PyList_GET_SIZE(run.chunks[i].items)) : 0;
+      total += run.chunks[i].items.size();
     }
     PyObject *exc = nullptr;
     int rc = 0;
@@ -4653,12 +4654,16 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     size_t k = 0;
     for (size_t i = 0; i < run.chunks.size(); i++) {
       ParallelRun::Chunk &c = run.chunks[i];
-      if (c.items != nullptr && i <= f && rc == 0) {
-        for (Py_ssize_t j = 0; j < PyList_GET_SIZE(c.items); j++) {
-          PyList_SET_ITEM(result, Py_ssize_t(k++), Py_NewRef(PyList_GET_ITEM(c.items, j)));
+      if (i <= f && rc == 0) {
+        for (PyObject *v : c.items) { // the list takes the references
+          PyList_SET_ITEM(result, Py_ssize_t(k++), v);
+        }
+      } else {
+        for (PyObject *v : c.items) {
+          Py_DECREF(v);
         }
       }
-      Py_XDECREF(c.items);
+      c.items.clear();
       if (i == f) {
         exc = c.exc;
         resume_at = c.resume_at;
