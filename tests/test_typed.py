@@ -326,6 +326,7 @@ def test_plan_is_cached():
     assert loads(b"1", type=t) == 1
 
 
+@pytest.mark.requires_threads
 def test_threads():
     # Threads that describe and use the same types at once (on free-threaded
     # Python, really at once).
@@ -544,7 +545,9 @@ def test_deep_nesting_does_not_crash():
             for _ in range(n - 1):
                 tree = tree.kids[0]
             assert tree.kids == []
-        for n in (20000, 200000):
+        # Under Pyodide, json.loads overflows the JavaScript stack (a fatal
+        # error) on these depths before any RecursionError.
+        for n in () if sys.platform == "emscripten" else (20000, 200000):
             data = b'{"kids":[' * n + b']}' * n
             try:
                 loads(data, type=Tree)

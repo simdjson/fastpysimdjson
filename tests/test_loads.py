@@ -126,6 +126,10 @@ def test_deep_nesting():
     assert v == []
     # simdjson's default depth is 1024. Past that, loads follows json.loads:
     # the value if Python accepts it, otherwise the same exception class.
+    # (Under Pyodide, json.loads overflows the JavaScript stack, a fatal
+    # error, on 5000 levels.)
+    if sys.platform == "emscripten":
+        return
     deep = "[" * 5000 + "]" * 5000
     try:
         expected = json.loads(deep)
@@ -306,6 +310,7 @@ def test_release_drops_key_cache():
     assert next(iter(a)) is not next(iter(c))
 
 
+@pytest.mark.requires_threads
 def test_release_is_per_thread():
     import threading
 

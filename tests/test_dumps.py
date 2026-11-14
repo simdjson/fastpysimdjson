@@ -174,7 +174,10 @@ def test_circular():
     d = {}
     d["self"] = [d]
     same_result(lambda m: m.dumps(d))
-    same_result(lambda m: m.dumps(d, check_circular=False))
+    # Unbounded recursion: under Pyodide, json too overflows the JavaScript
+    # stack (a fatal error) before any RecursionError.
+    if sys.platform != "emscripten":
+        same_result(lambda m: m.dumps(d, check_circular=False))
     # Repeated (not circular) references are fine.
     x = [1, 2]
     assert fastsimdjson.dumps([x, x, {"k": x}]) == json.dumps([x, x, {"k": x}])
@@ -227,7 +230,10 @@ def test_deep_nesting():
     # Where nesting runs out depends on the Python version (a counter before
     # 3.14, the stack size since) and on each encoder's frames: the output
     # must be correct, or the error a RecursionError, never a crash.
-    for depth in (1000, 10000, 100000, 1000000):
+    # Under Pyodide, the JavaScript stack runs out (a fatal error, for json
+    # too) before Python raises RecursionError: only the shallower depths.
+    depths = (1000,) if sys.platform == "emscripten" else (1000, 10000, 100000, 1000000)
+    for depth in depths:
         deep = []
         for _ in range(depth):
             deep = [deep]
@@ -417,6 +423,7 @@ def test_dumpb_matches_orjson_cases():
             orjson_outcome(orjson.dumps, obj, option=option), (obj, option)
 
 
+@pytest.mark.requires_threads
 def test_thread_exit_releases_caches():
     # A key that enters dumpb's key cache (seen twice) is referenced by the
     # cache; when the thread exits, its caches are released.
@@ -519,6 +526,7 @@ def test_dumpb_many_default_and_errors():
             _error(lambda: fastsimdjson.dumpb(bad[2]))
 
 
+@pytest.mark.requires_threads
 def test_dumpb_many_under_mutation():
     # Another thread changes the records while they are written: the output
     # is still one valid document per record (free-threaded Python).
