@@ -310,6 +310,18 @@ separated:
 | `"comma"` | documents separated by commas: `{...}, {...}` (simdjson also accepts white space between them) |
 | `"array"` | the elements of one array: `[{...}, {...}]` |
 
+To read a file without copying it, map it in memory:
+
+```python
+import mmap
+with open("log.ndjson", "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+    names = fastsimdjson.map_many(fn, memoryview(m), threads=64)
+```
+
+A `memoryview` of `bytes`, or of a file mapped with `mmap.ACCESS_READ` (as
+here), is read in place, and the mapped file must not change meanwhile;
+other buffers (a `bytearray`, a view of a writable mmap) are copied first.
+
 simdjson parses the input in batches (`batch_size`, 1 MB by default); a
 larger document is handled automatically. In every format, documents that
 simdjson rejects are handled as in `loads`: a document that `json` accepts is
@@ -394,6 +406,18 @@ missing key, an index past the end, or a step into a scalar) gives
 `default`, `None` unless you pass another value; a JSON `null` gives `None`.
 As with `at_pointer`, a key that appears twice in an object refers to its
 first occurrence. `fields` cannot be combined with `lazy=True`.
+
+With the formats `"whitespace"` and `"lines"`, `fields` reads the documents
+with simdjson's On-Demand API: the top level of each document, the keys on
+the way to the pointers and the values found there are read and validated,
+so a malformed or incomplete document is still an error. The values that no
+pointer reaches are skipped without being checked, so an invalid value
+elsewhere in a document (`{"a": 1, "b": tru}` with `fields="/a"`) goes
+unnoticed. A value that is read is handled as without `fields`: an error
+raises `JSONDecodeError`, and a document that only `json` accepts is decoded
+by `json`. The whole documents are parsed (and validated) with the other
+formats, and when a pointer is `""` or leads into the value of another
+pointer (`["/a", "/a/b"]`).
 
 On 7.6 GB of GitHub events, `map_many` with three fields ran at 2.2 GB/s on
 one core of an Intel Xeon Gold 6548N, against 1.8 GB/s with lazy views
@@ -542,7 +566,11 @@ could be changed by another thread while we read it, so it is copied first:
 always by `loads_many`, `parse_many` and `map_many` (the iterator outlives
 the call) and by `loads_arrow`, `json_to_msgpack` and `msgpack_to_json`
 (which release the GIL), and only on a free-threaded build by `loads` and
-`parse`. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
+`parse`. The exception: `loads_many`, `parse_many` and `map_many` read a
+read-only, contiguous `memoryview` of `bytes`, or of a file mapped with
+`mmap.ACCESS_READ`, in place (the file must not change meanwhile). Other
+read-only views (`memoryview(bytearray).toreadonly()`, a read-only view of a
+writable mmap) are copied, since what they show can still change. Likewise, on a free-threaded build, `dumps` and `dumpb` hold
 references to the items of the containers they serialize.
 
 ### `release`
